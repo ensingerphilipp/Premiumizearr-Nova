@@ -8,7 +8,7 @@ var (
 	ErrFailedToSaveConfig     = errors.New("failed to save config")
 )
 
-// ArrType enum for Sonarr/Radarr
+// ArrType enum for Sonarr/Radarr/Lidarr
 type ArrType string
 
 // AppCallback - Callback for the app to use
@@ -17,6 +17,7 @@ type AppCallback func(oldConfig Config, newConfig Config)
 const (
 	Sonarr ArrType = "Sonarr"
 	Radarr ArrType = "Radarr"
+	Lidarr ArrType = "Lidarr"
 )
 
 type ArrConfig struct {

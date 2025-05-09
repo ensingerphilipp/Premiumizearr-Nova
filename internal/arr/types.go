@@ -10,6 +10,7 @@ import (
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
 	"golift.io/starr/radarr"
 	"golift.io/starr/sonarr"
+	"golift.io/starr/lidarr"
 )
 
 func CompareFileNamesFuzzy(a, b string) bool {
@@ -64,6 +65,19 @@ type RadarrArr struct {
 	Client               *radarr.Radarr
 	HistoryMutex         sync.Mutex
 	History              *radarr.History
+	LastUpdateMutex      sync.Mutex
+	LastUpdate           time.Time
+	LastUpdateCount      int
+	LastUpdateCountMutex sync.Mutex
+	Config               *config.Config
+}
+
+type LidarrArr struct {
+	Name                 string
+	ClientMutex          sync.Mutex
+	Client               *lidarr.Lidarr
+	HistoryMutex         sync.Mutex
+	History              *lidarr.History
 	LastUpdateMutex      sync.Mutex
 	LastUpdate           time.Time
 	LastUpdateCount      int
