@@ -36,6 +36,7 @@ func (w *WatchDirectory) Watch() error {
 				if event.Op&fsnotify.Create == fsnotify.Create {
 					action = w.MatchFunction(event.Name)
 					if action == 1 {
+						w.CallbackFunction(event.Name)
 					} else if action == 2 {
 						w.Watcher.Add(event.Name)
 					}
