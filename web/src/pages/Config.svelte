@@ -224,6 +224,7 @@
                 items={[
                   { id: "Sonarr", text: "Sonarr" },
                   { id: "Radarr", text: "Radarr" },
+                  { id: "Lidarr", text: "Lidarr" }
                 ]}
                 disabled={inputDisabled}
               />

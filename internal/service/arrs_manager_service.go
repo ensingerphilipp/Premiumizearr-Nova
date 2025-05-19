@@ -9,6 +9,7 @@ import (
 	"golift.io/starr"
 	"golift.io/starr/radarr"
 	"golift.io/starr/sonarr"
+	"golift.io/starr/lidarr"
 )
 
 type ArrsManagerService struct {
@@ -52,6 +53,17 @@ func (am *ArrsManagerService) Start() {
 			}
 			am.arrs = append(am.arrs, &wrapper)
 			log.Tracef("Added Radarr arr: %s", arr_config.Name)
+		case config.Lidarr:
+			c := starr.New(arr_config.APIKey, arr_config.URL, 0)
+			wrapper := arr.LidarrArr{
+				Name:       arr_config.Name,
+				Client:     lidarr.New(c),
+				History:    nil,
+				LastUpdate: time.Now(),
+				Config:     am.config,
+			}
+			am.arrs = append(am.arrs, &wrapper)
+			log.Tracef("Added Lidarr arr: %s", arr_config.Name)
 		default:
 			log.Error("Unknown arr type: %s, not adding Arr %s", arr_config.Type, arr_config.Name)
 		}
@@ -91,6 +103,9 @@ func TestArrConnection(arr config.ArrConfig) error {
 		return err
 	case config.Radarr:
 		_, err := radarr.New(c).GetSystemStatus()
+		return err
+	case config.Lidarr:
+		_, err := lidarr.New(c).GetSystemStatus()
 		return err
 	default:
 		return nil

@@ -163,6 +163,7 @@ func defaultConfig() Config {
 		Arrs: []ArrConfig{
 			{Name: "Sonarr", URL: "http://127.0.0.1:8989", APIKey: "xxxxxxxxx", Type: Sonarr},
 			{Name: "Radarr", URL: "http://127.0.0.1:7878", APIKey: "xxxxxxxxx", Type: Radarr},
+			{Name: "Lidarr", URL: "http://127.0.0.1:8686", APIKey: "xxxxxxxxx", Type: Lidarr},
 		},
 		BlackholeDirectory:              "",
 		PollBlackholeDirectory:          false,
