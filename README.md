@@ -1,7 +1,9 @@
 # Premiumizearr-Nova
-## Build 1.4.5
+## Build 1.4.7
 
 [![Build](https://github.com/ensingerphilipp/premiumizearr-nova/actions/workflows/build.yml/badge.svg)](https://github.com/ensingerphilipp/premiumizearr-nova/actions/workflows/build.yml)
+
+*NEW: Add Lidarr support thx @FuJa0815*
 
 *NEW: Ability to Limit Download-Speed, Bugfixes for Single File Downloads*
 
@@ -18,9 +20,9 @@ The code has been reused with modifications to suit my own use case.
 * Added .torrent support, Add Support for Single Files, Switch from ZIP API to Direct Download
 * Fix Gui Row Ordering Bugs, Improve API
 * Updated base images and dependencies
+* Added Lidarr Support @FuJa0815
 
 Next Steps:
-* Add Lidarr Support
 * Fix Sonarr Connection Bugs
 
 ## Features
