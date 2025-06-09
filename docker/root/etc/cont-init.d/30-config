@@ -1,7 +1,7 @@
 #!/usr/bin/with-contenv bash
 
 # permissions
-chown -R 1000:1000 \
+chown -R $PUID:$PGID \
     /data \
     /downloads \
     /transfers \

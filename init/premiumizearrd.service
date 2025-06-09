@@ -2,8 +2,8 @@
 Description=Premiumizearr Daemon
 After=network.target
 [Service]
-User=1000
-Group=1000
+User=###USER###
+Group=###GROUP###
 UMask=0002
 Type=simple
 Environment=PREMIUMIZEARR_LOG_LEVEL=info
