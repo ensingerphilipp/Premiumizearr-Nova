@@ -1,9 +1,16 @@
 #!/usr/bin/with-contenv bash
 
-# permissions
-chown -R $PUID:$PGID \
+# Default UID/GID to 1000 if not set
+PUID=${PUID:-1000}
+PGID=${PGID:-1000}
+
+# Optional: log what's happening
+echo "[cont-init.d] Setting permissions to $PUID:$PGID"
+
+# Change ownership recursively
+chown -R "$PUID:$PGID" \
     /data \
     /downloads \
     /transfers \
     /blackhole \
-    /opt \
+    /opt
