@@ -1,5 +1,5 @@
 # Premiumizearr-Nova
-## Build 1.4.7
+## Build 1.4.8
 
 [![Build](https://github.com/ensingerphilipp/premiumizearr-nova/actions/workflows/build.yml/badge.svg)](https://github.com/ensingerphilipp/premiumizearr-nova/actions/workflows/build.yml)
 
