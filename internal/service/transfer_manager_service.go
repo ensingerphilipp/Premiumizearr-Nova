@@ -180,6 +180,11 @@ func (manager *TransferManagerService) TaskUpdateTransfersList() {
 func (manager *TransferManagerService) TaskCheckPremiumizeDownloadsFolder() {
 	log.Debug("Running Task CheckPremiumizeDownloadsFolder")
 
+	if manager.downloadsFolderID == "" {
+		log.Errorf("Premiumize-Download-Folder ID is empty, cannot check Folder - aborting (This could be due to a Premiumize or CDN Outage)")
+		return
+	}
+
 	items, err := manager.premiumizemeClient.ListFolder(manager.downloadsFolderID)
 	if err != nil {
 		log.Errorf("Error listing downloads folder: %s", err.Error())
@@ -294,6 +299,10 @@ func (manager *TransferManagerService) HandleFinishedItem(item premiumizeme.Item
 }
 
 func (manager *TransferManagerService) downloadFolderRecursively(item premiumizeme.Item, downloadDirectory string) error {
+	if item.ID == "" {
+		return fmt.Errorf("Premiumize-Download-Folder ID is empty, cannot check Folder - aborting (This could be due to a Premiumize Outage)")
+	}
+
 	items, err := manager.premiumizemeClient.ListFolder(item.ID)
 	if err != nil {
 		return fmt.Errorf("error listing folder items: %w", err)
