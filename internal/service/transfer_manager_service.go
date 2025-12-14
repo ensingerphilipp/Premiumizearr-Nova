@@ -5,7 +5,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"time"
 
@@ -322,8 +321,10 @@ func (manager *TransferManagerService) downloadFolderRecursively(item premiumize
 			}
 			var fileSavePath = path.Join(savePath, item.Name)
 			log.Trace("Downloading to: ", fileSavePath)
-			var ratelimit string = "--limit-rate=" + strconv.Itoa(manager.config.DownloadSpeedLimit) + "M"
-			err = progress_downloader.DownloadFile(ratelimit, link, fileSavePath, manager.downloadList[item.Name].ProgressDownloader)
+			// Add Option to Disable / Enable checking download certificate as certain CDNs have invalid / self-signed certificates
+			var checkcertificate bool = manager.config.EnableTlsCheck
+			var ratelimit int = manager.config.DownloadSpeedLimit
+			err = progress_downloader.DownloadFile(checkcertificate, ratelimit, link, fileSavePath, manager.downloadList[item.Name].ProgressDownloader)
 			if err != nil {
 				return fmt.Errorf("error downloading file %s: %w", item.Name, err)
 			}

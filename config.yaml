@@ -21,4 +21,5 @@ bindPort: "8182"
 WebRoot: ""
 SimultaneousDownloads: 5
 DownloadSpeedLimit: 100
+EnableTlsCheck: false
 ArrHistoryUpdateIntervalSeconds: 20

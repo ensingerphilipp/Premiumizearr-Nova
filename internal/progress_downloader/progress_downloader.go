@@ -41,20 +41,30 @@ func (wc *WriteCounter) GetProgress() string {
 }
 
 // DownloadFile uses wget for downloading and updates WriteCounter for progress tracking.
-func DownloadFile(ratelimit string, url string, filepath string, counter *WriteCounter) error {
-	// Prepare the wget command
-	cmd := exec.Command("stdbuf", "-oL", "wget", "-c", ratelimit, "--progress=dot:giga", "--no-use-server-timestamps", "-O", filepath, url)
+func DownloadFile(checkcertificate bool, ratelimit int, url string, filepath string, counter *WriteCounter) error {
+	// Prepare the wget command without passing empty args
+	args := []string{"-oL", "wget", "-c"}
+	if ratelimit != 0 {
+		args = append(args, "--limit-rate="+strconv.Itoa(ratelimit)+"M")
+	}
+	args = append(args, "--progress=dot:giga")
+	if checkcertificate == false {
+		args = append(args, "--no-check-certificate")
+	}
+	args = append(args, "--no-use-server-timestamps", "-O", filepath, url)
+	cmd := exec.Command("stdbuf", args...)
+
 	// Get a pipe for the command's output
 	stdout, err := cmd.StderrPipe()
 	if err != nil {
-		log.Errorf("failed to create stdout pipe: %w", err)
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
+		log.Errorf("failed to create stdout pipe: %v", err)
+		return fmt.Errorf("failed to create stdout pipe: %v", err)
 	}
 
 	// Start the command
 	if err := cmd.Start(); err != nil {
-		log.Errorf("failed to start wget: %w", err)
-		return fmt.Errorf("failed to start wget: %w", err)
+		log.Errorf("failed to start wget: %v", err)
+		return fmt.Errorf("failed to start wget: %v", err)
 	}
 	// Regex to parse output lines
 	progressRegex := regexp.MustCompile(`(\d+)([KMG]?) .* (\d+%) (\d+\.\d+[KMG]) (\d+[smh][0-9]*[smh]?)`)
@@ -93,14 +103,14 @@ func DownloadFile(ratelimit string, url string, filepath string, counter *WriteC
 
 	// Check for scanner errors
 	if err := scanner.Err(); err != nil {
-		log.Errorf("error reading wget output: %w", err)
-		return fmt.Errorf("error reading wget output: %w", err)
+		log.Errorf("error reading wget output: %v", err)
+		return fmt.Errorf("error reading wget output: %v", err)
 	}
 
 	// Wait for wget to finish
 	if err := cmd.Wait(); err != nil {
-		log.Errorf("wget command failed: %i", err)
-		return fmt.Errorf("wget command failed: %i", err)
+		log.Errorf("wget command failed: %v", err)
+		return fmt.Errorf("wget command failed: %v", err)
 	}
 
 	fmt.Println("\nDownload completed successfully.")

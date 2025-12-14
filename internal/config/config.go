@@ -125,6 +125,12 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 		updated = true
 	}
 
+	if configInterface["EnableTlsCheck"] == nil {
+		log.Info("EnableTlsCheck not set, setting to false")
+		config.EnableTlsCheck = false
+		updated = true
+	}
+
 	if configInterface["PollBlackholeIntervalMinutes"] == nil {
 		log.Info("PollBlackholeIntervalMinutes not set, setting to 10")
 		config.PollBlackholeIntervalMinutes = 10
@@ -174,6 +180,7 @@ func defaultConfig() Config {
 		WebRoot:                         "",
 		SimultaneousDownloads:           5,
 		DownloadSpeedLimit:              100,
+		EnableTlsCheck:                  false,
 		ArrHistoryUpdateIntervalSeconds: 20,
 	}
 }

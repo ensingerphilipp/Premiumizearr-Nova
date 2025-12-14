@@ -9,6 +9,7 @@
     Dropdown,
     Form,
     Checkbox,
+    Toggle,
   } from "carbon-components-svelte";
   import {
     Save,
@@ -31,6 +32,7 @@
     WebRoot: "",
     SimultaneousDownloads: 0,
     DownloadSpeedLimit: 100,
+    EnableTlsCheck: false,
     Arrs: [],
   };
   const ERR_SAVE = "Error Saving Config";
@@ -324,6 +326,11 @@
           disabled={inputDisabled}
           labelText="SpeedLimit per Download in Megabytes / s"
           bind:value={config.DownloadSpeedLimit}
+        />
+        <Toggle
+          disabled={inputDisabled}
+          bind:checked={config.EnableTlsCheck}
+          labelText="Check TLS-Certificate when downloading (beware: enabling can break certain CDNs)"
         />
       </FormGroup>
       <Button on:click={submit} icon={saveIcon} disabled={inputDisabled}
