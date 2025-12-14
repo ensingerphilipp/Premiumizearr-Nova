@@ -329,7 +329,7 @@
         />
         <Toggle
           disabled={inputDisabled}
-          bind:checked={config.EnableTlsCheck}
+          bind:toggled={config.EnableTlsCheck}
           labelText="Check TLS-Certificate when downloading (beware: enabling can break certain CDNs)"
         />
       </FormGroup>
