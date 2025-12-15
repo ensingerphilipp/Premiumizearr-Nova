@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
@@ -16,6 +17,7 @@ import (
 )
 
 type DirectoryWatcherService struct {
+	mu                 sync.RWMutex
 	premiumizemeClient *premiumizeme.Premiumizeme
 	config             *config.Config
 	Queue              *stringqueue.StringQueue
@@ -52,6 +54,11 @@ func (dw *DirectoryWatcherService) ConfigUpdatedCallback(currentConfig config.Co
 		dw.watchDirectory.UpdatePath(newConfig.BlackholeDirectory)
 	}
 
+	if currentConfig.TransferDirectory != newConfig.TransferDirectory {
+		log.Info("TransferDirectory directory changed, changing directory watcher...")
+		dw.setTransferDirectory(newConfig.TransferDirectory)
+	}
+
 	if currentConfig.PollBlackholeDirectory != newConfig.PollBlackholeDirectory {
 		log.Info("Poll blackhole directory changed, restarting directory watcher...")
 		dw.Start()
@@ -66,7 +73,7 @@ func (dw *DirectoryWatcherService) GetStatus() string {
 func (dw *DirectoryWatcherService) Start() {
 	log.Info("Starting directory watcher...")
 
-	dw.downloadsFolderID = utils.GetDownloadsFolderIDFromPremiumizeme(dw.premiumizemeClient)
+	dw.downloadsFolderID = utils.GetDownloadsFolderIDFromPremiumizeme(dw.premiumizemeClient, dw.config.TransferDirectory)
 
 	log.Info("Creating Queue...")
 	dw.Queue = stringqueue.NewStringQueue()
@@ -171,7 +178,10 @@ func (dw *DirectoryWatcherService) processUploads() {
 		sleepTimeSeconds := 2
 		if filePath != "" {
 			log.Debugf("Processing %s", filePath)
-			err := dw.premiumizemeClient.CreateTransfer(filePath, dw.downloadsFolderID)
+			dw.mu.RLock()
+			folderID := dw.downloadsFolderID
+			dw.mu.RUnlock()
+			err := dw.premiumizemeClient.CreateTransfer(filePath, folderID)
 			if err != nil {
 				switch err.Error() {
 				case ERROR_LIMIT_REACHED:
@@ -197,4 +207,14 @@ func (dw *DirectoryWatcherService) processUploads() {
 			log.Errorf("Received %s from blackhole Queue. Appears to be an empty path.")
 		}
 	}
+}
+
+func (dw *DirectoryWatcherService) setTransferDirectory(newDir string) {
+	newID := utils.GetDownloadsFolderIDFromPremiumizeme(dw.premiumizemeClient, newDir)
+
+	dw.mu.Lock()
+	defer dw.mu.Unlock()
+
+	dw.config.TransferDirectory = newDir
+	dw.downloadsFolderID = newID
 }

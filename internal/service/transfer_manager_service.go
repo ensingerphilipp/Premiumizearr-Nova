@@ -122,7 +122,7 @@ func (manager *TransferManagerService) ConfigUpdatedCallback(currentConfig confi
 }
 
 func (manager *TransferManagerService) Run(interval time.Duration) {
-	manager.downloadsFolderID = utils.GetDownloadsFolderIDFromPremiumizeme(manager.premiumizemeClient)
+	manager.downloadsFolderID = utils.GetDownloadsFolderIDFromPremiumizeme(manager.premiumizemeClient, manager.config.TransferDirectory)
 	for {
 		manager.runningTask = true
 		manager.TaskUpdateTransfersList()

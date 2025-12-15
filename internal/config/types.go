@@ -41,6 +41,7 @@ type Config struct {
 	PollBlackholeIntervalMinutes int    `yaml:"PollBlackholeIntervalMinutes" json:"PollBlackholeIntervalMinutes"`
 
 	DownloadsDirectory string `yaml:"DownloadsDirectory" json:"DownloadsDirectory"`
+	TransferDirectory  string `yaml:"TransferDirectory" json:"TransferDirectory"`
 
 	BindIP   string `yaml:"bindIP" json:"BindIP"`
 	BindPort string `yaml:"bindPort" json:"BindPort"`

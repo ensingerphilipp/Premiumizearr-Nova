@@ -175,6 +175,7 @@ func defaultConfig() Config {
 		PollBlackholeDirectory:          false,
 		PollBlackholeIntervalMinutes:    10,
 		DownloadsDirectory:              "",
+		TransferDirectory:               "",
 		BindIP:                          "0.0.0.0",
 		BindPort:                        "8182",
 		WebRoot:                         "",

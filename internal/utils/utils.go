@@ -91,7 +91,7 @@ func StringInSlice(a string, list []string) int {
 	return -1
 }
 
-func GetDownloadsFolderIDFromPremiumizeme(premiumizemeClient *premiumizeme.Premiumizeme) string {
+func GetDownloadsFolderIDFromPremiumizeme(premiumizemeClient *premiumizeme.Premiumizeme, transferFolderName string) string {
 	var downloadsFolderID string
 	folders, err := premiumizemeClient.GetFolders()
 	if err != nil {
@@ -100,17 +100,15 @@ func GetDownloadsFolderIDFromPremiumizeme(premiumizemeClient *premiumizeme.Premi
 		return ""
 	}
 
-	const folderName = "arrDownloads"
-
 	for _, folder := range folders {
-		if folder.Name == folderName {
+		if folder.Name == transferFolderName {
 			downloadsFolderID = folder.ID
 			log.Debugf("Found downloads folder with ID: %s", folder.ID)
 		}
 	}
 
 	if len(downloadsFolderID) == 0 {
-		id, err := premiumizemeClient.CreateFolder(folderName, nil)
+		id, err := premiumizemeClient.CreateFolder(transferFolderName, nil)
 		if err != nil {
 			log.Errorf("Cannot create downloads folder on premiumize.me, application will not run correctly! %+v", err)
 		}
