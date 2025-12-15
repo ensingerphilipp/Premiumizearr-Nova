@@ -274,6 +274,7 @@
             disabled={inputDisabled}
             labelText="API Key"
             bind:value={config.PremiumizemeAPIKey}
+            on:change={handleRestartRequiredToggle}
           />
           <TextInput
             disabled={inputDisabled}

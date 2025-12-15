@@ -20,7 +20,7 @@ const asciiArt = ".______   .______      _______ .___  ___.  __   __    __  .___
 	"                                                                                          |______|   |  . `  | |  |  |  |   \\      / /  /_\\  \\   \n" +
 	"                                                                                                     |  |\\   | |  '--'  |    \\    / /  _____  \\  \n" +
 	"                                                                                                     |__| \\__|  \\______/      \\__/ /__/     \\__\\ \n" +
-	"                                                                                                      Version: 1.4.9                      \n"
+	"                                                                                                      Version: 1.5.0                      \n"
 
 func main() {
 	//Flags
@@ -30,7 +30,7 @@ func main() {
 
 	//Parse flags
 	fmt.Println(asciiArt)
-	fmt.Println("Premiumizearr-Nova Version: 1.4.9")
+	fmt.Println("Premiumizearr-Nova Version: 1.5.0")
 	flag.StringVar(&logLevel, "log", utils.EnvOrDefault("PREMIUMIZEARR_LOG_LEVEL", "info"), "Logging level: \n \tinfo,debug,trace")
 	flag.StringVar(&configFile, "config", utils.EnvOrDefault("PREMIUMIZEARR_CONFIG_DIR_PATH", "./"), "The directory the config.yml is located in")
 	flag.StringVar(&loggingDirectory, "logging-dir", utils.EnvOrDefault("PREMIUMIZEARR_LOGGING_DIR_PATH", "./"), "The directory logs are to be written to")

@@ -1,13 +1,13 @@
 # Premiumizearr-Nova
-## Build 1.4.9
+## Build 1.5.0
 
 [![Build](https://github.com/ensingerphilipp/premiumizearr-nova/actions/workflows/build.yml/badge.svg)](https://github.com/ensingerphilipp/premiumizearr-nova/actions/workflows/build.yml)
 
-*NEW: Add Lidarr support thx @FuJa0815*
+*NEW: Added Transfer-Only-Mode*
 
-*NEW: Ability to Limit Download-Speed, Bugfixes for Single File Downloads*
+*NEW: Skip TLS-Certificate-Check to prevent failed 0B Downloads*
 
-*NEW: Fixed Gui Ordering and API Transforms*
+*NEW: Change transferfolder on Premiumize to a user-specified folder*
 
 ## Overview
 Continuation and Improvement of the Premiumizearr Arr* Bridge Download Client compatible with Sonarr and Radarr.
@@ -21,6 +21,8 @@ The code has been reused with modifications to suit my own use case.
 * Fix Gui Row Ordering Bugs, Improve API
 * Updated base images and dependencies
 * Added Lidarr Support @FuJa0815
+* Added Transfer-Only-Mode
+* Several minor improvements and fixes
 
 Next Steps:
 * Fix Sonarr Connection Bugs
