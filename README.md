@@ -3,16 +3,16 @@
 
 [![Build](https://github.com/ensingerphilipp/premiumizearr-nova/actions/workflows/build.yml/badge.svg)](https://github.com/ensingerphilipp/premiumizearr-nova/actions/workflows/build.yml)
 
-*NEW: Added Transfer-Only-Mode*
+*NEW: Added Transfer-Only-Mode* ✅
 
-*NEW: Skip TLS-Certificate-Check to prevent failed 0B Downloads*
+*NEW: Skip TLS-Certificate-Check to prevent failed 0B Downloads* ✅
 
-*NEW: Change transferfolder on Premiumize to a user-specified folder*
+*NEW: Change transferfolder on Premiumize to a user-specified folder* ✅
 
 ## Enjoying so far? Im running on ☕
 <a href="https://ko-fi.com/K3K819CODS"><img src="https://uploads-ssl.webflow.com/5c14e387dab576fe667689cf/5cbed8a4ae2b88347c06c923_BuyMeACoffee_blue-p-500.png" width="250px"></a>
 
-## Overview
+## Overview 📝
 Continuation and Improvement of the Premiumizearr Arr* Bridge Download Client compatible with Sonarr and Radarr.
 
 This project is based on code from [Jackdallas' Premiumizearr](https://github.com/jackdallas/premiumizearr). 
