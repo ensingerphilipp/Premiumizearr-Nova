@@ -269,18 +269,18 @@
     </Column>
     <Column>
       <h4>Premiumize.me Settings</h4>
-      <FormGroup>
-        <TextInput
-          disabled={inputDisabled}
-          labelText="API Key"
-          bind:value={config.PremiumizemeAPIKey}
-        />
-      </FormGroup>
-        <TextInput
-          disabled={inputDisabled}
-          labelText="Premiumize Transfer Directory"
-          bind:value={config.TransferDirectory}
-        />
+        <FormGroup>
+          <TextInput
+            disabled={inputDisabled}
+            labelText="API Key"
+            bind:value={config.PremiumizemeAPIKey}
+          />
+          <TextInput
+            disabled={inputDisabled}
+            labelText="Premiumize Transfer Directory"
+            bind:value={config.TransferDirectory}
+          />
+        </FormGroup>
       <h4>Directory Settings</h4>
       <FormGroup>
         <TextInput
