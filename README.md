@@ -9,6 +9,9 @@
 
 *NEW: Change transferfolder on Premiumize to a user-specified folder*
 
+## Enjoying so far? Im running on ☕
+<a href="https://ko-fi.com/K3K819CODS"><img src="https://uploads-ssl.webflow.com/5c14e387dab576fe667689cf/5cbed8a4ae2b88347c06c923_BuyMeACoffee_blue-p-500.png" width="250px"></a>
+
 ## Overview
 Continuation and Improvement of the Premiumizearr Arr* Bridge Download Client compatible with Sonarr and Radarr.
 
@@ -32,9 +35,6 @@ Next Steps:
 - Monitor blackhole directory to push `.magnet`, `.torrent`  and `.nzb` to Premiumize.me
 - Monitor and download Premiumize.me transfers (web ui on default port 8182)
 - Mark transfers as failed in Radarr & Sonarr
-
-## Enjoying so far? Im running on ☕
-<a href="https://ko-fi.com/K3K819CODS"><img src="https://uploads-ssl.webflow.com/5c14e387dab576fe667689cf/5cbed8a4ae2b88347c06c923_BuyMeACoffee_blue-p-500.png" width="250px"></a>
 
 ## Install
 
