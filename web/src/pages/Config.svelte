@@ -34,6 +34,7 @@
     SimultaneousDownloads: 0,
     DownloadSpeedLimit: 100,
     EnableTlsCheck: false,
+    TransferOnlyMode: false,
     Arrs: [],
   };
   const ERR_SAVE = "Error Saving Config";
@@ -319,24 +320,27 @@
       </FormGroup>
       <h4>Download Settings</h4>
       <FormGroup>
+        <Toggle
+          disabled={inputDisabled}
+          bind:toggled={config.TransferOnlyMode}
+          labelText="Transfer-Only-Mode (disables downloading from Cloud))"
+        />
+        <Toggle
+          disabled={inputDisabled}
+          bind:toggled={config.EnableTlsCheck}
+          labelText="Check TLS-Certificate when downloading (beware: enabling can break certain CDNs)"
+        />
         <TextInput
           type="number"
           disabled={inputDisabled}
           labelText="Simultaneous Downloads"
           bind:value={config.SimultaneousDownloads}
         />
-      </FormGroup>
-      <FormGroup>
         <TextInput
           type="number"
           disabled={inputDisabled}
           labelText="SpeedLimit per Download in Megabytes / s"
           bind:value={config.DownloadSpeedLimit}
-        />
-        <Toggle
-          disabled={inputDisabled}
-          bind:toggled={config.EnableTlsCheck}
-          labelText="Check TLS-Certificate when downloading (beware: enabling can break certain CDNs)"
         />
       </FormGroup>
       <Button on:click={submit} icon={saveIcon} disabled={inputDisabled}

@@ -51,6 +51,7 @@ type Config struct {
 	SimultaneousDownloads int  `yaml:"SimultaneousDownloads" json:"SimultaneousDownloads"`
 	DownloadSpeedLimit    int  `yaml:"DownloadSpeedLimit" json:"DownloadSpeedLimit"`
 	EnableTlsCheck        bool `yaml:"EnableTlsCheck" json:"EnableTlsCheck"`
+	TransferOnlyMode      bool `yaml:"TransferOnlyMode" json:"TransferOnlyMode"`
 
 	ArrHistoryUpdateIntervalSeconds int `yaml:"ArrHistoryUpdateIntervalSeconds" json:"ArrHistoryUpdateIntervalSeconds"`
 }

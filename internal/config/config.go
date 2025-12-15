@@ -131,6 +131,12 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 		updated = true
 	}
 
+	if configInterface["TransferOnlyMode"] == nil {
+		log.Info("TransferOnlyMode not set, setting to false")
+		config.TransferOnlyMode = false
+		updated = true
+	}
+
 	if configInterface["PollBlackholeIntervalMinutes"] == nil {
 		log.Info("PollBlackholeIntervalMinutes not set, setting to 10")
 		config.PollBlackholeIntervalMinutes = 10
@@ -175,13 +181,14 @@ func defaultConfig() Config {
 		PollBlackholeDirectory:          false,
 		PollBlackholeIntervalMinutes:    10,
 		DownloadsDirectory:              "",
-		TransferDirectory:               "",
+		TransferDirectory:               "arrDownloads",
 		BindIP:                          "0.0.0.0",
 		BindPort:                        "8182",
 		WebRoot:                         "",
 		SimultaneousDownloads:           5,
 		DownloadSpeedLimit:              100,
 		EnableTlsCheck:                  false,
+		TransferOnlyMode:                false,
 		ArrHistoryUpdateIntervalSeconds: 20,
 	}
 }

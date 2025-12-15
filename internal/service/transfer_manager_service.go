@@ -126,7 +126,9 @@ func (manager *TransferManagerService) Run(interval time.Duration) {
 	for {
 		manager.runningTask = true
 		manager.TaskUpdateTransfersList()
-		manager.TaskCheckPremiumizeDownloadsFolder()
+		if !manager.config.TransferOnlyMode {
+			manager.TaskCheckPremiumizeDownloadsFolder()
+		}
 		manager.runningTask = false
 		manager.lastUpdated = time.Now().Unix()
 		time.Sleep(interval)

@@ -215,6 +215,5 @@ func (dw *DirectoryWatcherService) setTransferDirectory(newDir string) {
 	dw.mu.Lock()
 	defer dw.mu.Unlock()
 
-	dw.config.TransferDirectory = newDir
 	dw.downloadsFolderID = newID
 }

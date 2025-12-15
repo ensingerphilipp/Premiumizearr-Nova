@@ -23,4 +23,5 @@ WebRoot: ""
 SimultaneousDownloads: 5
 DownloadSpeedLimit: 100
 EnableTlsCheck: false
+TransferOnlyMode: false
 ArrHistoryUpdateIntervalSeconds: 20
