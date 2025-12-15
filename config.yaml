@@ -16,7 +16,7 @@ BlackholeDirectory: ""
 PollBlackholeDirectory: false
 PollBlackholeIntervalMinutes: 10
 DownloadsDirectory: ""
-TransferDirectory: ""
+TransferDirectory: "arrDownloads"
 bindIP: 0.0.0.0
 bindPort: "8182"
 WebRoot: ""

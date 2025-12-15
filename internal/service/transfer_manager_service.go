@@ -119,6 +119,13 @@ func (manager *TransferManagerService) ConfigUpdatedCallback(currentConfig confi
 		log.Trace("Inside ConfigUpdatedCallback")
 		manager.CleanUpDownloadDir()
 	}
+
+	if currentConfig.TransferDirectory != newConfig.TransferDirectory {
+		log.Trace("Updating Transfer Directory in TransferManagerService")
+		newDir := newConfig.TransferDirectory
+		newID := utils.GetDownloadsFolderIDFromPremiumizeme(manager.premiumizemeClient, newDir)
+		manager.downloadsFolderID = newID
+	}
 }
 
 func (manager *TransferManagerService) Run(interval time.Duration) {
