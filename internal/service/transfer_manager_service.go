@@ -135,6 +135,8 @@ func (manager *TransferManagerService) Run(interval time.Duration) {
 		manager.TaskUpdateTransfersList()
 		if !manager.config.TransferOnlyMode {
 			manager.TaskCheckPremiumizeDownloadsFolder()
+		} else {
+			log.Info("TransferOnlyMode is enabled, skipping Download")
 		}
 		manager.runningTask = false
 		manager.lastUpdated = time.Now().Unix()
