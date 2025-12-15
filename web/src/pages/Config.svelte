@@ -281,10 +281,11 @@
           labelText="Blackhole Directory"
           bind:value={config.BlackholeDirectory}
         />
-        <Checkbox
+        <Toggle
           disabled={inputDisabled}
-          bind:checked={config.PollBlackholeDirectory}
+          bind:toggled={config.PollBlackholeDirectory}
           labelText="Poll Blackhole Directory"
+          style="margin-top: -0.5rem;"
         />
         <TextInput
           type="number"
@@ -323,12 +324,14 @@
         <Toggle
           disabled={inputDisabled}
           bind:toggled={config.TransferOnlyMode}
-          labelText="Transfer-Only-Mode (disables downloading from Cloud))"
+          labelText="Transfer-Only-Mode (disable downloading from Cloud)"
+          style="margin-top: -0.5rem;"
         />
         <Toggle
           disabled={inputDisabled}
           bind:toggled={config.EnableTlsCheck}
-          labelText="Check TLS-Certificate when downloading (beware: enabling can break certain CDNs)"
+          labelText="Check TLS-Certificate at Download (enabling can break certain CDNs)"
+          style="margin-top: -0.5rem;"
         />
         <TextInput
           type="number"
