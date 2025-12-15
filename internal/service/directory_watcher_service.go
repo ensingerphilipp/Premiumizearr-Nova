@@ -61,7 +61,6 @@ func (dw *DirectoryWatcherService) ConfigUpdatedCallback(currentConfig config.Co
 
 	if currentConfig.PollBlackholeDirectory != newConfig.PollBlackholeDirectory {
 		log.Info("Poll blackhole directory changed, restarting directory watcher...")
-		dw.Start()
 	}
 }
 

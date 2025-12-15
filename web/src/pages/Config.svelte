@@ -49,6 +49,8 @@
   let errorModal = false;
   let errorTitle = ERR_SAVE;
   let errorMessage = "";
+  let restartRequiredModal = false;
+  let restartRequiredMessage = "";
 
   let saveIcon = Save;
 
@@ -176,6 +178,11 @@
     }, 1000 * seconds);
   }
 
+  function handleRestartRequiredToggle() {
+    restartRequiredMessage = "The daemon needs to be restart for this change to take effect! "
+    restartRequiredModal = true;
+  }
+
   getConfig();
 </script>
 
@@ -285,13 +292,14 @@
           disabled={inputDisabled}
           bind:toggled={config.PollBlackholeDirectory}
           labelText="Poll Blackhole Directory"
-          style="margin-top: -0.5rem;"
+          on:change={handleRestartRequiredToggle}
         />
         <TextInput
           type="number"
           disabled={inputDisabled}
           labelText="Poll Blackhole Interval Minutes"
           bind:value={config.PollBlackholeIntervalMinutes}
+          on:change={handleRestartRequiredToggle}
         />
       </FormGroup>
       <FormGroup>
@@ -325,13 +333,11 @@
           disabled={inputDisabled}
           bind:toggled={config.TransferOnlyMode}
           labelText="Transfer-Only-Mode (disable downloading from Cloud)"
-          style="margin-top: -0.5rem;"
         />
         <Toggle
           disabled={inputDisabled}
           bind:toggled={config.EnableTlsCheck}
           labelText="Check TLS-Certificate at Download (enabling can break certain CDNs)"
-          style="margin-top: -0.5rem;"
         />
         <TextInput
           type="number"
@@ -363,6 +369,17 @@
   }}
 >
   <p>{errorMessage}</p>
+</Modal>
+
+<Modal
+  bind:open={restartRequiredModal}
+  passiveModal
+  modalHeading="Restart Required!"
+  on:close={() => {
+    restartRequiredModal = false;
+  }}
+>
+  <p>{restartRequiredMessage}</p>
 </Modal>
 <!-- 
 
