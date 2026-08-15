@@ -419,8 +419,9 @@ func createNZBRequest(file *os.File, url *url.URL, parentID string) (*http.Reque
 		return nil, err
 	}
 
-	io.Copy(part, file)
-	writer.Close()
+	if _, err := io.Copy(part, file); err != nil {
+		return nil, err
+	}
 
 	part, err = writer.CreateFormField("folder_id")
 
@@ -434,12 +435,17 @@ func createNZBRequest(file *os.File, url *url.URL, parentID string) (*http.Reque
 		return nil, err
 	}
 
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+
 	request, err := http.NewRequest("POST", url.String(), body)
-	request.Header.Add("Content-Type", writer.FormDataContentType())
 
 	if err != nil {
 		return nil, err
 	}
+
+	request.Header.Add("Content-Type", writer.FormDataContentType())
 
 	return request, nil
 }
@@ -453,8 +459,9 @@ func createMagnetRequest(file *os.File, url *url.URL, parentID string) (*http.Re
 		return nil, err
 	}
 
-	io.Copy(part, file)
-	writer.Close()
+	if _, err := io.Copy(part, file); err != nil {
+		return nil, err
+	}
 
 	part, err = writer.CreateFormField("folder_id")
 
@@ -468,12 +475,17 @@ func createMagnetRequest(file *os.File, url *url.URL, parentID string) (*http.Re
 		return nil, err
 	}
 
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+
 	request, err := http.NewRequest("POST", url.String(), body)
-	request.Header.Add("Content-Type", writer.FormDataContentType())
 
 	if err != nil {
 		return nil, err
 	}
+
+	request.Header.Add("Content-Type", writer.FormDataContentType())
 
 	return request, nil
 }
@@ -487,8 +499,9 @@ func createTorrentRequest(file *os.File, url *url.URL, parentID string) (*http.R
 		return nil, err
 	}
 
-	io.Copy(part, file)
-	writer.Close()
+	if _, err := io.Copy(part, file); err != nil {
+		return nil, err
+	}
 
 	part, err = writer.CreateFormField("folder_id")
 
@@ -502,12 +515,17 @@ func createTorrentRequest(file *os.File, url *url.URL, parentID string) (*http.R
 		return nil, err
 	}
 
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+
 	request, err := http.NewRequest("POST", url.String(), body)
-	request.Header.Add("Content-Type", writer.FormDataContentType())
 
 	if err != nil {
 		return nil, err
 	}
+
+	request.Header.Add("Content-Type", writer.FormDataContentType())
 
 	return request, nil
 }
