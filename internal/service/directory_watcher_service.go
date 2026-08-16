@@ -199,7 +199,13 @@ func (dw *DirectoryWatcherService) processUploadCycle() int {
 		}
 
 		processed++
-		dw.processUpload(filePath)
+		if dw.processUpload(filePath) {
+			// The account check and transfer submission are separate requests, so
+			// the limit can be reached between them. Put the file back in the
+			// queue and stop this batch so watcher mode retries it after backoff.
+			dw.Queue.Add(filePath)
+			return 0
+		}
 	}
 
 	return processed
@@ -235,7 +241,8 @@ func (dw *DirectoryWatcherService) submissionsAllowed() bool {
 	return !exhausted
 }
 
-func (dw *DirectoryWatcherService) processUpload(filePath string) {
+// processUpload returns true when the source should be queued for a later retry.
+func (dw *DirectoryWatcherService) processUpload(filePath string) bool {
 	log.Debugf("Processing %s", filePath)
 	dw.mu.RLock()
 	folderID := dw.downloadsFolderID
@@ -249,12 +256,16 @@ func (dw *DirectoryWatcherService) processUpload(filePath string) {
 			dw.status = "Limit of transfers reached!"
 			dw.mu.Unlock()
 			log.Trace("Transfer limit reached; the source file remains in the blackhole directory")
+			return true
 		case ERROR_ALREADY_UPLOADED:
-			log.Trace("File was already uploaded; the source file remains in the blackhole directory")
+			log.Trace("File already uploaded, removing from disk")
+			if err := os.Remove(filePath); err != nil {
+				log.Errorf("Could not delete %s: %+v", filePath, err)
+			}
 		default:
 			log.Errorf("Error creating transfer: %s", err)
 		}
-		return
+		return false
 	}
 
 	dw.mu.Lock()
@@ -262,9 +273,10 @@ func (dw *DirectoryWatcherService) processUpload(filePath string) {
 	dw.mu.Unlock()
 	if err := os.Remove(filePath); err != nil {
 		log.Errorf("Could not delete %s: %+v", filePath, err)
-		return
+		return false
 	}
 	log.Infof("Removed %s from blackhole queue. Queue size: %d", filePath, dw.Queue.Len())
+	return false
 }
 
 func (dw *DirectoryWatcherService) setTransferDirectory(newDir string) {

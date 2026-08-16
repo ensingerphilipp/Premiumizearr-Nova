@@ -202,6 +202,68 @@ func TestProcessUploadCycleChecksQuotaOnceForMultipleFiles(t *testing.T) {
 	}
 }
 
+func TestProcessUploadCycleRemovesAlreadyUploadedSource(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/account/info":
+			_, _ = response.Write([]byte(`{"status":"success","limit_used":0.25,"booster_points":0}`))
+		case "/api/transfer/create":
+			_, _ = response.Write([]byte(`{"status":"error","message":"You already added this job."}`))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	service, filePath := newQuotaTestService(t, server, "test-key", "duplicate.magnet")
+	service.processUploadCycle()
+
+	if !os.IsNotExist(fileExistsError(filePath)) {
+		t.Fatal("already-uploaded source file still exists")
+	}
+	if got := service.Queue.Len(); got != 0 {
+		t.Fatalf("queue length after already-uploaded response = %d, want 0", got)
+	}
+}
+
+func TestProcessUploadCycleRequeuesLimitRace(t *testing.T) {
+	var transferRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/account/info":
+			_, _ = response.Write([]byte(`{"status":"success","limit_used":0.99,"booster_points":0}`))
+		case "/api/transfer/create":
+			if transferRequests.Add(1) == 1 {
+				_, _ = response.Write([]byte(`{"status":"error","message":"Limit of transfers reached!"}`))
+				return
+			}
+			_, _ = response.Write([]byte(`{"status":"success"}`))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	service, filePath := newQuotaTestService(t, server, "test-key", "limit-race.magnet")
+	if got := service.processUploadCycle(); got != 0 {
+		t.Fatalf("processed count after retryable limit response = %d, want 0", got)
+	}
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("retryable source file was changed: %v", err)
+	}
+	if got := service.Queue.Len(); got != 1 {
+		t.Fatalf("queue length after retryable limit response = %d, want 1", got)
+	}
+
+	service.processUploadCycle()
+	if got := transferRequests.Load(); got != 2 {
+		t.Fatalf("transfer requests after retry = %d, want 2", got)
+	}
+	if !os.IsNotExist(fileExistsError(filePath)) {
+		t.Fatal("source file still exists after successful retry")
+	}
+}
+
 func newQuotaTestService(t *testing.T, server *httptest.Server, apiKey, fileName string) (*DirectoryWatcherService, string) {
 	t.Helper()
 	client := premiumizeme.NewPremiumizemeClient(apiKey)
