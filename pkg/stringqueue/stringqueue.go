@@ -15,6 +15,11 @@ func (UploadQueue *StringQueue) Len() int {
 func (UploadQueue *StringQueue) Add(path string) {
 	UploadQueue.mutex.Lock()
 	defer UploadQueue.mutex.Unlock()
+	for _, queuedPath := range UploadQueue.queue {
+		if queuedPath == path {
+			return
+		}
+	}
 	UploadQueue.queue = append(UploadQueue.queue, path)
 }
 
