@@ -1,11 +1,16 @@
 package config
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"regexp"
+)
 
 var (
 	ErrInvalidConfigFile      = errors.New("invalid Config File")
 	ErrFailedToFindConfigFile = errors.New("failed to find config file")
 	ErrFailedToSaveConfig     = errors.New("failed to save config")
+	ErrInvalidArrConfig       = errors.New("invalid arr config")
 )
 
 // ArrType enum for Sonarr/Radarr/Lidarr
@@ -21,10 +26,28 @@ const (
 )
 
 type ArrConfig struct {
+	// Name must be a slug (used as the download subfolder name locally and on pme)
 	Name   string  `yaml:"Name" json:"Name"`
 	URL    string  `yaml:"URL" json:"URL"`
 	APIKey string  `yaml:"APIKey" json:"APIKey"`
 	Type   ArrType `yaml:"Type" json:"Type"`
+}
+
+var arrNameSlugPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+// ValidateArrs checks that every Arr name is a valid, unique slug
+func ValidateArrs(arrs []ArrConfig) error {
+	seen := make(map[string]bool, len(arrs))
+	for _, arr := range arrs {
+		if !arrNameSlugPattern.MatchString(arr.Name) {
+			return fmt.Errorf("%w: %q is not a valid slug (only lowercase letters, digits and hyphens)", ErrInvalidArrConfig, arr.Name)
+		}
+		if seen[arr.Name] {
+			return fmt.Errorf("%w: name %q is used by more than one Arr", ErrInvalidArrConfig, arr.Name)
+		}
+		seen[arr.Name] = true
+	}
+	return nil
 }
 
 type Config struct {
@@ -52,6 +75,7 @@ type Config struct {
 	DownloadSpeedLimit    int  `yaml:"DownloadSpeedLimit" json:"DownloadSpeedLimit"`
 	EnableTlsCheck        bool `yaml:"EnableTlsCheck" json:"EnableTlsCheck"`
 	TransferOnlyMode      bool `yaml:"TransferOnlyMode" json:"TransferOnlyMode"`
+	EnableArrSubfolders   bool `yaml:"EnableArrSubfolders" json:"EnableArrSubfolders"`
 
 	ArrHistoryUpdateIntervalSeconds int `yaml:"ArrHistoryUpdateIntervalSeconds" json:"ArrHistoryUpdateIntervalSeconds"`
 }

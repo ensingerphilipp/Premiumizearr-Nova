@@ -118,6 +118,22 @@ func GetDownloadsFolderIDFromPremiumizeme(premiumizemeClient *premiumizeme.Premi
 	return downloadsFolderID
 }
 
+// GetOrCreateSubfolderID finds a folder by name directly under parentID, creating it if missing
+func GetOrCreateSubfolderID(premiumizemeClient *premiumizeme.Premiumizeme, parentID string, folderName string) (string, error) {
+	items, err := premiumizemeClient.ListFolder(parentID)
+	if err != nil {
+		return "", err
+	}
+
+	for _, item := range items {
+		if item.Type == "folder" && item.Name == folderName {
+			return item.ID, nil
+		}
+	}
+
+	return premiumizemeClient.CreateFolder(folderName, &parentID)
+}
+
 func EnvOrDefault(envName string, defaultValue string) string {
 	envValue := os.Getenv(envName)
 	if len(envValue) == 0 {

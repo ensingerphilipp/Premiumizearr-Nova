@@ -34,6 +34,13 @@ func (s *WebServerService) ConfigHandler(w http.ResponseWriter, r *http.Request)
 			})
 			return
 		}
+		if err := config.ValidateArrs(newConfig.Arrs); err != nil {
+			EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
+				Succeeded: false,
+				Status:    err.Error(),
+			})
+			return
+		}
 		s.config.UpdateConfig(newConfig)
 		EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
 			Succeeded: true,

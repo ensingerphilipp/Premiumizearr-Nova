@@ -171,6 +171,7 @@
           headers={[
             { key: "id", value: "Pos" },
             { key: "name", value: "Name", sort: false },
+            { key: "arr", value: "Arr", sort: false },
           ]}
           APIpath="api/blackhole"
           zebra={true}
