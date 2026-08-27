@@ -7,9 +7,9 @@ import (
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
 	log "github.com/sirupsen/logrus"
 	"golift.io/starr"
+	"golift.io/starr/lidarr"
 	"golift.io/starr/radarr"
 	"golift.io/starr/sonarr"
-	"golift.io/starr/lidarr"
 )
 
 type ArrsManagerService struct {
