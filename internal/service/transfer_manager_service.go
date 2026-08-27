@@ -397,7 +397,7 @@ func (manager *TransferManagerService) downloadFolderRecursively(item premiumize
 			if err != nil {
 				manager.removeDownload(item.Name)
 				manager.markDownloadFailed(item.Name)
-				log.Errorf("Error downloading file %s: %w, continuing with other files", item.Name, err)
+				log.Errorf("Error downloading file %s: %s, continuing with other files", item.Name, err)
 				folderHasErrors = true
 				continue // Continue with next file instead of aborting
 			}
@@ -406,7 +406,7 @@ func (manager *TransferManagerService) downloadFolderRecursively(item premiumize
 			err = manager.downloadFolderRecursively(item, savePath)
 			if err != nil {
 				manager.markDownloadFailed(item.Name)
-				log.Errorf("Error downloading folder %s: %w, continuing with other items", item.Name, err)
+				log.Errorf("Error downloading folder %s: %s, continuing with other items", item.Name, err)
 				folderHasErrors = true
 				continue // Continue with next item instead of aborting
 			}
