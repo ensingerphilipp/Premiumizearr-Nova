@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+#
+# scripts/verify — deterministic local verification gate for Premiumizearr-Nova.
+#
+# Single mandatory entry point; CI mirrors it in .github/workflows/verify.yml.
+# Contract: PROJECT.md / ARCHITECTURE.md ("scripts/verify (the gate)").
+#
+# Rules enforced here:
+#   - never skip a mandatory check;
+#   - never download/install toolchains (GOTOOLCHAIN=local; npm dependencies
+#     are the only downloads);
+#   - never modify go.mod or product source to satisfy a check;
+#   - fail with an actionable message on the first failing check.
+
+set -euo pipefail
+
+# --- Anchor to repository root (this script lives in <root>/scripts). -------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${ROOT_DIR}"
+
+fail() {
+  echo ""
+  echo "VERIFY: FAILED — $*"
+  echo "        Fix the failing check, then re-run: bash scripts/verify"
+  exit 1
+}
+
+step() {
+  echo ""
+  echo "=== verify: $*"
+}
+
+# --- Preflight: required tools and versions ---------------------------------
+
+step "Preflight: required tools"
+
+# Go: verification always runs on the locally provisioned toolchain and never
+# downloads one: GOTOOLCHAIN=local is exported before any go invocation.
+# go.mod is intentionally left as-is:
+#   go 1.23.0        (minimum project floor)
+#   toolchain go1.24.2 (project toolchain; dev/CI provision it explicitly)
+# so the gate requires the local go to be >= 1.24.2. We never edit go.mod to
+# make this pass.
+if ! command -v go >/dev/null 2>&1; then
+  fail "go command not found. Install Go >= 1.24.2 (verification uses the locally provisioned toolchain via GOTOOLCHAIN=local)."
+fi
+
+export GOTOOLCHAIN=local
+echo "go command on PATH:      $(go version)"
+echo "GOTOOLCHAIN:             local (pinned by this script)"
+
+LOCAL_GO="$(go env GOVERSION 2>/dev/null)" || fail \
+  "go could not report its version (go env GOVERSION failed)."
+if ! printf '%s\n%s\n' "1.24.2" "${LOCAL_GO#go}" | sort -V -C; then
+  fail "local Go ${LOCAL_GO} is older than 1.24.2. Verification uses the locally provisioned toolchain (GOTOOLCHAIN=local) and never downloads one; install Go >= 1.24.2 (go.mod 'go 1.23.0' / 'toolchain go1.24.2' stays as-is)."
+fi
+
+# Node: project standard is Node 22 (ARCHITECTURE.md, approved decision 1).
+if ! command -v node >/dev/null 2>&1; then
+  fail "node not found. The project standard is Node 22 (e.g. install via nvm: 'nvm install 22 && nvm use 22')."
+fi
+NODE_VERSION="$(node -p 'process.versions.node')"
+NODE_MAJOR="${NODE_VERSION%%.*}"
+echo "node:                    ${NODE_VERSION}"
+if [[ "${NODE_MAJOR}" != "22" ]]; then
+  fail "Node ${NODE_VERSION} found; the project standard is Node 22. Install/activate Node 22 (e.g. 'nvm install 22 && nvm use 22')."
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+  fail "npm not found. Install it together with Node 22."
+fi
+echo "npm:                     $(npm --version)"
+
+# C compiler: required by 'go test -race' (the race detector links via cgo).
+CC_BIN="$(command -v cc 2>/dev/null || command -v gcc 2>/dev/null || command -v clang 2>/dev/null || true)"
+if [[ -z "${CC_BIN}" ]]; then
+  fail "no C compiler found (cc/gcc/clang). 'go test -race' requires a C toolchain (e.g. 'apt-get install gcc')."
+fi
+echo "C compiler:              ${CC_BIN}"
+
+# --- Mandatory checks (the gate fails on the first failure) ------------------
+
+step "Check 1/6: gofmt clean (tracked Go files)"
+UNFORMATTED="$(git ls-files -z '*.go' | xargs -0 -r gofmt -l)"
+if [[ -n "${UNFORMATTED}" ]]; then
+  printf '%s\n' "${UNFORMATTED}" | sed 's/^/    /'
+  fail "tracked Go files are not gofmt-clean. Run 'gofmt -w' on them (baseline-cleanup task, see PROJECT.md)."
+fi
+echo "all tracked Go files gofmt-clean"
+
+step "Check 2/6: go vet"
+if ! go vet ./...; then
+  fail "go vet ./... reported findings. Fix them per their intended behavior; no suppressions or -vet=off (see PROJECT.md)."
+fi
+
+step "Check 3/6: production-style Go build"
+BUILD_DIR="$(mktemp -d)"
+trap 'rm -rf "${BUILD_DIR}"' EXIT
+if ! CGO_ENABLED=0 go build -tags 'netgo osusergo' -ldflags '-extldflags "-static"' -o "${BUILD_DIR}/premiumizearrd" ./cmd/premiumizearrd; then
+  fail "production-style build failed (CGO_ENABLED=0, tags 'netgo osusergo', static)."
+fi
+echo "built ${BUILD_DIR}/premiumizearrd"
+
+step "Check 4/6: go test -race"
+if ! go test -race ./...; then
+  fail "go test -race ./... failed."
+fi
+
+step "Check 5/6: web dependencies (npm ci, locked graph)"
+if ! (cd web && npm ci); then
+  fail "npm ci failed in web/ (package-lock.json must be in sync with package.json)."
+fi
+
+step "Check 6/6: web production build"
+if ! (cd web && npm run build); then
+  fail "web production build failed (npm run build)."
+fi
+
+echo ""
+echo "VERIFY: PASS — all checks green"
