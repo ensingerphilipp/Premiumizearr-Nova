@@ -154,7 +154,6 @@ reviewed. **Not part of this branch.**
 3. `HandleErrorTransfer` spawned as a fresh goroutine every 15s per errored,
    history-matched transfer (concurrent/repeated `Fail()` +
    `DeleteTransfer()`).
-4. `countDownloads()` `len/2` heuristic miscounts for multi-level trees.
 
 ## Deployment & operations notes
 

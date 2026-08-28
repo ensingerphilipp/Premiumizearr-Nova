@@ -1,6 +1,8 @@
 package service
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
@@ -43,5 +45,38 @@ func TestCountDownloadsActiveTopLevelJobs(t *testing.T) {
 	n.addDownload(&premiumizeme.Item{Name: "02.mkv"}, false)
 	if got := n.countDownloads(); got != 0 {
 		t.Fatalf("child-file entries only: countDownloads() = %d, want 0", got)
+	}
+}
+
+// TestTransferManagerServiceDownloadListConcurrency exercises
+// addDownload/removeDownload and countDownloads concurrently: all workers
+// are released by a single barrier (no sleeps), so `go test -race` covers
+// the downloadListMutex synchronization of the counting path.
+func TestTransferManagerServiceDownloadListConcurrency(t *testing.T) {
+	const workers = 8
+	const iterations = 50
+
+	m := TransferManagerService{}.New()
+
+	var wg sync.WaitGroup
+	release := make(chan struct{})
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			<-release
+			for i := 0; i < iterations; i++ {
+				name := fmt.Sprintf("worker%d-%d", w, i)
+				m.addDownload(&premiumizeme.Item{Name: name}, true)
+				m.countDownloads()
+				m.removeDownload(name)
+			}
+		}(w)
+	}
+	close(release)
+	wg.Wait()
+
+	if got := m.countDownloads(); got != 0 {
+		t.Fatalf("countDownloads() after all workers drained = %d, want 0", got)
 	}
 }

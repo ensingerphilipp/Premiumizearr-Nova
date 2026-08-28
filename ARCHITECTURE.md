@@ -70,8 +70,9 @@ serves the SPA from ./static + JSON API. No authentication by design.
 - Folders download recursively; each file via `wget -c` (resumable),
   `--limit-rate=<DownloadSpeedLimit>M`, `--no-check-certificate` when
   `EnableTlsCheck=false` (the default).
-- Concurrency capped by `SimultaneousDownloads` via the `countDownloads()`
-  heuristic (see Known risks).
+- Concurrency capped by `SimultaneousDownloads`: `countDownloads()` counts
+  active top-level folder jobs (from admission in `HandleFinishedItem` until
+  the job's deferred removal); transient child-file entries do not count.
 - Failed items get a 30-minute in-memory cooldown; on success the Premiumize
   folder is deleted.
 - `CleanUpDownloadDirPeriod` deletes files older than 4 days from the
@@ -219,8 +220,6 @@ gofmt/vet debt at check 1); do not weaken.
 3. `HandleErrorTransfer` goroutine storm: spawned every 15s per still-errored,
    history-matched transfer → concurrent/repeated `Fail()` +
    `DeleteTransfer()`.
-4. `countDownloads()` = `len(downloadList)/2` heuristic — miscounts for
-   multi-level folder trees.
 
 **Other risks:**
 
