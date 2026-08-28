@@ -31,7 +31,7 @@ const (
 	ERROR_ALREADY_UPLOADED = "You already added this job."
 )
 
-func (DirectoryWatcherService) New() DirectoryWatcherService {
+func NewDirectoryWatcherService() DirectoryWatcherService {
 	return DirectoryWatcherService{
 		premiumizemeClient: nil,
 		config:             nil,
@@ -191,7 +191,7 @@ func (dw *DirectoryWatcherService) processUploads() {
 					log.Trace("File already uploaded, removing from Disk")
 					os.Remove(filePath)
 				default:
-					log.Error("Error creating transfer: %s", err)
+					log.Errorf("Error creating transfer: %s", err)
 				}
 			} else {
 				dw.status = "Okay"
@@ -203,7 +203,7 @@ func (dw *DirectoryWatcherService) processUploads() {
 			}
 			time.Sleep(time.Second * time.Duration(sleepTimeSeconds))
 		} else {
-			log.Errorf("Received %s from blackhole Queue. Appears to be an empty path.")
+			log.Error("Received an empty path from blackhole Queue.")
 		}
 	}
 }
