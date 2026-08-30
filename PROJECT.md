@@ -102,36 +102,43 @@ point and is mirrored by CI (`.github/workflows/verify.yml`). Gate details:
 
 ### Current gate state
 
-`scripts/verify` is **red by design** on the `planning/project-contract`
-branch: pre-existing gofmt/vet debt fails check 1 (gofmt). This is intentional
-and must not be "fixed" by weakening the gate. The red state ends with the
-baseline-cleanup task below.
+`scripts/verify` is **green**: the baseline cleanup (completed — see the
+historical section below) removed the pre-existing gofmt/vet debt, and the
+gate has been passing locally and in CI since. The `verify (scripts/verify)`
+check is enforced as a **required merge check** on `main` (repo rule set
+`main-quality-gate`). Do not weaken the gate or edit product source files
+merely to keep it green.
 
-## Pilot acceptance criteria (this task: contract + verification setup)
+## Historical: pilot acceptance criteria (contract + verification setup, PR #70, merged 2026-08-27)
+
+The pilot task is complete; the criteria below are recorded as history, not
+current requirements. At the time, the gate was intentionally red on the
+contract branch to prove it caught the pre-existing gofmt/vet debt.
 
 1. All 6 paths in place: `PROJECT.md`, `ARCHITECTURE.md`, `QWEN.md`,
    `.qwen/review-rules.md`, `scripts/verify`, `.github/workflows/verify.yml`.
 2. `scripts/verify` implemented strictly per the gate spec and failing at the
-   gofmt stage on this branch (proof it catches the pre-existing debt).
+   gofmt stage on that branch (proof it caught the pre-existing debt).
 3. The PR verify job in place, running the same gate, red for the same
    expected reason.
-4. Zero modifications to existing product source files on this branch.
+4. Zero modifications to existing product source files on that branch.
 
-## Next explicit task: baseline cleanup
+## Historical: baseline cleanup (completed, PR #71, merged 2026-08-28)
 
-Defined here; executed later as its own task/PR after this contract setup is
-reviewed. **Not part of this branch.**
+The baseline-cleanup task is **complete**; this section is recorded as
+history, not a pending task. It ran as its own PR on its own branch after the
+contract setup was reviewed:
 
-- gofmt the 15 currently non-clean Go files (mechanical).
-- Triage and fix each `go vet ./...` finding **individually** per its intended
-  behavior — not blanket-mechanical.
-- Add regression tests where a finding reveals or fixes meaningful behavior.
-- Add minimal test infrastructure as needed (httptest fakes for
+- gofmt'd the then-non-clean Go files (mechanical).
+- Triaged and fixed each `go vet ./...` finding **individually** per its
+  intended behavior — not blanket-mechanical.
+- Added regression tests where a finding revealed or fixed meaningful
+  behavior, plus minimal test infrastructure as needed (httptest fakes for
   premiumize.me/*arr, `t.TempDir`, no network).
 - **No** suppressions, `-vet=off`, exclusions, or weakened checks.
-- Small reviewable commits.
-- Exit criterion: `scripts/verify` green locally and in CI. Once that PR makes
-  verify green, mark the verify check a **required merge check**.
+- Exit criteria met: `scripts/verify` green locally and in CI; the
+  `verify (scripts/verify)` check was then marked a **required merge check**
+  on `main` (rule set `main-quality-gate`).
 
 ## Follow-up backlog (priority selection deferred — needs explicit approval)
 
@@ -142,7 +149,8 @@ reviewed. **Not part of this branch.**
 - EOL action pins: `actions/checkout@v2`, `codeql-action@v2`,
   `github-script@v5`, `goreleaser-action@v2`.
 - ubuntu-24.x runner (open renovate branch).
-- Optional `push: main` trigger for the verify job (post-green).
+- Optional `push: main` trigger for the verify job (gate is green, so this
+  is no longer blocked on anything; still not added).
 
 **Verified bug inventory (details: `ARCHITECTURE.md` → Known risks):**
 

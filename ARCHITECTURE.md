@@ -135,7 +135,9 @@ serves the SPA from ./static + JSON API. No authentication by design.
   base, s6), manifests.
 - CI: `build.yml` (release/snapshot via goreleaser on tags/PRs) — **separate
   from the verify job**.
-- New: `verify.yml` — PR-triggered, runs `scripts/verify` (below).
+- `verify.yml` — PR-triggered, runs `scripts/verify` (below); the
+  `verify (scripts/verify)` check is a required merge check on `main`
+  (rule set `main-quality-gate`).
 - Version 1.5.1 is hardcoded manually (banner in `main.go`, README, git tag).
 
 ## Approved technical decisions
@@ -153,7 +155,8 @@ serves the SPA from ./static + JSON API. No authentication by design.
    below. Never weakened.
 4. **Baseline policy:** one-time behavior-preserving cleanup task (defined in
    PROJECT.md) brings the gate green; no suppressions, no `-vet=off`, no
-   exclusions, no weakened checks.
+   exclusions, no weakened checks. **Executed:** completed in PR #71
+   (merged 2026-08-28); the gate has been green since.
 5. **Race remediation policy:** minimal local synchronization (mutex/atomic/
    safe snapshot) preserving architecture and observable behavior; treat
    races as individual bugs (reproduce → `go test -race` test → narrow fix).
@@ -164,12 +167,12 @@ serves the SPA from ./static + JSON API. No authentication by design.
    proxy / trusted network.
 8. **`pkg/` is the public Go module API surface:** no removal/breaking change
    of exported symbols without a public-API assessment (HITL).
-9. **CI verify job:** `pull_request`-triggered only for now (no push-to-main
-   trigger while the gate is intentionally red pending baseline cleanup).
-   After the baseline-cleanup PR makes verify green, mark it a required merge
-   check; a push-to-main trigger can be added later if useful. The
-   release/Goreleaser workflow stays separate and is untouched by the verify
-   work.
+9. **CI verify job:** `pull_request`-triggered; the
+   `verify (scripts/verify)` check is a **required merge check** on `main`
+   (rule set `main-quality-gate`, added once the baseline-cleanup PR made
+   verify green). A `push: main` trigger can be added later if useful
+   (not yet added). The release/Goreleaser workflow stays separate and is
+   untouched by the verify work.
 
 ## scripts/verify (the gate)
 
@@ -199,8 +202,10 @@ checks; never downloads or installs toolchains (verification exports
 5. `cd web && npm ci` (locked dependency graph).
 6. `cd web && npm run build` (production webpack build).
 
-**Gate state:** red on `planning/project-contract` by design (pre-existing
-gofmt/vet debt at check 1); do not weaken.
+**Gate state:** green (the pre-existing gofmt/vet debt that failed check 1 on
+the original `planning/project-contract` branch was removed by the baseline
+cleanup, PR #71); enforced as a required merge check on `main`; do not
+weaken.
 
 ## Known risks & limitations (verified, not yet fixed)
 
