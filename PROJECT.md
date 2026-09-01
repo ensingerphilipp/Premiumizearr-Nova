@@ -1,3 +1,5 @@
+<!-- AO tracker-intake canary: issue github:ensingerphilipp/Premiumizearr-Nova#74 was used to qualify AO tracker intake. -->
+
 # PROJECT.md — Premiumizearr-Nova Project Contract
 
 Durable project contract: goals, scope, change policy, acceptance criteria.
