@@ -37,6 +37,10 @@ type BlackholeResponse struct {
 	Status         string          `json:"status"`
 }
 
+type BlackholePollResponse struct {
+	Queued int `json:"queued"`
+}
+
 type Download struct {
 	Added    int64  `json:"added"`
 	Name     string `json:"name"`
@@ -112,6 +116,29 @@ func (s *WebServerService) BlackholeHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	w.Write(data)
+}
+
+func (s *WebServerService) PollBlackholeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.directoryWatcherService == nil || s.directoryWatcherService.Queue == nil {
+		http.Error(w, "Directory watcher is not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	queued, err := s.directoryWatcherService.ScanNow()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(BlackholePollResponse{Queued: queued}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 type TestArrResponse struct {
