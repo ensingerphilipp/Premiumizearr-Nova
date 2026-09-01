@@ -65,3 +65,19 @@ func TestHistoryContainsNotInHistoryLog(t *testing.T) {
 		t.Errorf("expected formatted not-in-history trace line with arr name and file name:\n%s", out)
 	}
 }
+
+// TestHistoryContainsResolvesNewestGrabbedRecord verifies the issue #22 fix:
+// when an older non-grabbed history record and a newer grabbed record share
+// the transfer's release name, HistoryContains must resolve the grabbed
+// record so the failure can be reported to Sonarr.
+func TestHistoryContainsResolvesNewestGrabbedRecord(t *testing.T) {
+	runErrorTransferReportingTest(t, newTestSonarrArr, "v3")
+}
+
+// TestHistoryContainsOnlyNonGrabbedRecords verifies that a release name
+// present only as non-grabbed history (e.g. an old download failure) is
+// reported as not in history, keeping the "Not in History" trace line.
+func TestHistoryContainsOnlyNonGrabbedRecords(t *testing.T) {
+	const name = "Show.S01E01.720p.WEB.x264-GRP.mkv.nzb"
+	runOnlyNonGrabbedRecordsTest(t, newTestSonarrArr, "v3", "Sonarr [TestSonarr]: "+name+" Not in History")
+}

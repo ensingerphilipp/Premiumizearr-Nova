@@ -66,13 +66,27 @@ func (arr *RadarrArr) HistoryContains(name string) (int64, bool) {
 	arr.HistoryMutex.Lock()
 	defer arr.HistoryMutex.Unlock()
 
+	// The history is returned oldest first and a release name can appear in
+	// several records (e.g. a previous download failure plus the current
+	// grab). Only grabbed records can be marked failed, and history ids are
+	// auto-incrementing, so remember the newest (highest ID) fuzzy-matching
+	// grab; resolving any other record type would let the caller delete the
+	// transfer without Radarr ever learning about the failed download
+	// (issue #22).
+	var grabbedID int64 = -1
 	for _, item := range his.Records {
-		if CompareFileNamesFuzzy(item.SourceTitle, name) {
-			return item.ID, true
+		if item.EventType == grabbedEventType && item.ID > grabbedID && CompareFileNamesFuzzy(item.SourceTitle, name) {
+			grabbedID = item.ID
 		}
 	}
 
-	return -1, false
+	if grabbedID == -1 {
+		return -1, false
+	}
+
+	log.Tracef("Radarr [%s]: Found grabbed record %d in History for %s", arr.Name, grabbedID, name)
+
+	return grabbedID, true
 }
 
 func (arr *RadarrArr) HandleErrorTransfer(transfer *premiumizeme.Transfer, arrID int64, pm *premiumizeme.Premiumizeme) error {
@@ -88,7 +102,7 @@ func (arr *RadarrArr) HandleErrorTransfer(transfer *premiumizeme.Transfer, arrID
 
 	for _, queueItem := range his.Records {
 		if queueItem.ID == arrID {
-			if queueItem.EventType == "grabbed" {
+			if queueItem.EventType == grabbedEventType {
 				err := arr.MarkHistoryItemAsFailed(queueItem.ID)
 				if err != nil {
 					return fmt.Errorf("failed to blacklist item in radarr: %+v", err)
