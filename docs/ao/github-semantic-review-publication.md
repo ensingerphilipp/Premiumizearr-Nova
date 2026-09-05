@@ -39,7 +39,7 @@ Use the canonical PR URL as the target URL.
 
 Before creating a status, read the current status for this context. If its state, description, and target URL already equal the desired values, do nothing.
 
-After dispatch has passed the normal readiness, exact-head, and required-CI checks, publish:
+After dispatch has passed the normal readiness, exact-head, and required DETERMINISTIC CI checks (required checks excluding only the exact context `ao/semantic-review`), publish:
 
 * State: `pending`
 * Description: `AO semantic review running for <SHORT_SHA>`
@@ -83,7 +83,7 @@ It must concisely include:
 * Requested and selected effort
 * Selection reasons when available
 * Native and base events
-* Required-CI result
+* Required DETERMINISTIC CI result (required checks excluding only the exact context `ao/semantic-review`)
 * Semantic disposition
 * Every finding, including informational and non-blocking findings
 * For each finding: stable ID, severity, confidence, summary, and source location
@@ -112,7 +112,7 @@ A publication failure does not invalidate a trustworthy local semantic result. R
 
 For each qualified exact-SHA review:
 
-1. Validate readiness, required CI, repository identity, PR identity, and expected head.
+1. Validate readiness, required DETERMINISTIC CI (required checks excluding only the exact context `ao/semantic-review`), repository identity, PR identity, and expected head.
 2. Dispatch exactly one `ao-pr-review` invocation.
 3. Publish or retain the idempotent `pending` status and `RUNNING` summary.
 4. Monitor without busy polling.
