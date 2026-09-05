@@ -85,7 +85,7 @@ step "Check 1/6: gofmt clean (tracked Go files)"
 UNFORMATTED="$(git ls-files -z '*.go' | xargs -0 -r gofmt -l)"
 if [[ -n "${UNFORMATTED}" ]]; then
   printf '%s\n' "${UNFORMATTED}" | sed 's/^/    /'
-  fail "tracked Go files are not gofmt-clean. Run 'gofmt -w' on them (baseline-cleanup task, see PROJECT.md)."
+  fail "tracked Go files are not gofmt-clean. Run 'gofmt -w' on them."
 fi
 echo "all tracked Go files gofmt-clean"
 
