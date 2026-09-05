@@ -32,7 +32,7 @@ const (
 	ERROR_ALREADY_UPLOADED = "You already added this job."
 )
 
-func (DirectoryWatcherService) New() DirectoryWatcherService {
+func NewDirectoryWatcherService() DirectoryWatcherService {
 	return DirectoryWatcherService{
 		premiumizemeClient: nil,
 		config:             nil,
@@ -75,10 +75,10 @@ func (dw *DirectoryWatcherService) GetStatus() string {
 func (dw *DirectoryWatcherService) Start() {
 	log.Info("Starting directory watcher...")
 
-	dw.downloadsFolderID = utils.GetDownloadsFolderIDFromPremiumizeme(dw.premiumizemeClient, dw.config.TransferDirectory)
-
 	log.Info("Creating Queue...")
 	dw.Queue = stringqueue.NewStringQueue()
+
+	dw.downloadsFolderID = utils.GetDownloadsFolderIDFromPremiumizeme(dw.premiumizemeClient, dw.config.TransferDirectory)
 
 	log.Info("Starting uploads processor...")
 	go dw.processUploads()

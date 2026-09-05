@@ -29,7 +29,7 @@ func main() {
 	var loggingDirectory string
 
 	//Parse flags
-	fmt.Println(asciiArt)
+	fmt.Print(asciiArt)
 	fmt.Println("Premiumizearr-Nova Version: 1.5.1")
 	flag.StringVar(&logLevel, "log", utils.EnvOrDefault("PREMIUMIZEARR_LOG_LEVEL", "info"), "Logging level: \n \tinfo,debug,trace")
 	flag.StringVar(&configFile, "config", utils.EnvOrDefault("PREMIUMIZEARR_CONFIG_DIR_PATH", "./"), "The directory the config.yml is located in")

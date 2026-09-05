@@ -91,7 +91,7 @@ func (s *WebServerService) DownloadsHandler(w http.ResponseWriter, r *http.Reque
 func (s *WebServerService) BlackholeHandler(w http.ResponseWriter, r *http.Request) {
 	var resp BlackholeResponse
 
-	if s.directoryWatcherService == nil {
+	if s.directoryWatcherService == nil || s.directoryWatcherService.Queue == nil {
 		resp.Status = "Not Initialized"
 	} else {
 		for i, n := range s.directoryWatcherService.Queue.GetQueue() {

@@ -7,9 +7,9 @@ import (
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
 	log "github.com/sirupsen/logrus"
 	"golift.io/starr"
+	"golift.io/starr/lidarr"
 	"golift.io/starr/radarr"
 	"golift.io/starr/sonarr"
-	"golift.io/starr/lidarr"
 )
 
 type ArrsManagerService struct {
@@ -65,7 +65,7 @@ func (am *ArrsManagerService) Start() {
 			am.arrs = append(am.arrs, &wrapper)
 			log.Tracef("Added Lidarr arr: %s", arr_config.Name)
 		default:
-			log.Error("Unknown arr type: %s, not adding Arr %s", arr_config.Type, arr_config.Name)
+			log.Errorf("Unknown arr type: %s, not adding Arr %s", arr_config.Type, arr_config.Name)
 		}
 	}
 	log.Debugf("Created %d Arrs", len(am.arrs))

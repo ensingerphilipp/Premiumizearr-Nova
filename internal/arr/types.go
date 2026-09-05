@@ -8,9 +8,9 @@ import (
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/utils"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
+	"golift.io/starr/lidarr"
 	"golift.io/starr/radarr"
 	"golift.io/starr/sonarr"
-	"golift.io/starr/lidarr"
 )
 
 func CompareFileNamesFuzzy(a, b string) bool {

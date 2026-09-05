@@ -141,18 +141,18 @@ func IsRunningInDockerContainer() bool {
 
 func IsDirectoryWriteable(path string) bool {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		log.Errorf("directory does not exist: ", path)
+		log.Errorf("directory does not exist: %s", path)
 		return false
 	}
 
 	if _, err := os.Create(path + "/test.txt"); err != nil {
-		log.Errorf("cannot write test.txt to directory: ", path)
+		log.Errorf("cannot write test.txt to directory: %s", path)
 		return false
 	}
 
 	// Delete test file
 	if err := os.Remove(path + "/test.txt"); err != nil {
-		log.Errorf("cannot delete test.txt file in: ", path)
+		log.Errorf("cannot delete test.txt file in: %s", path)
 		return false
 	}
 

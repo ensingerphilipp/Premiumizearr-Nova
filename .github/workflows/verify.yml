@@ -1,0 +1,33 @@
+name: Verify
+
+# PR-only on purpose: scripts/verify is intentionally red until the
+# baseline-cleanup task (see PROJECT.md). We do not add a push-to-main trigger
+# while main would be knowingly red; it can be added later if useful.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify (scripts/verify)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.24.2
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Run verification gate
+        run: bash scripts/verify
