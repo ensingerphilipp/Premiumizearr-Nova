@@ -80,6 +80,7 @@ func (s *WebServerService) Start() {
 	r.HandleFunc("/api/transfers", s.TransfersHandler)
 	r.HandleFunc("/api/downloads", s.DownloadsHandler)
 	r.HandleFunc("/api/blackhole", s.BlackholeHandler)
+	r.HandleFunc("/api/blackhole/poll", s.PollBlackholeHandler).Methods(http.MethodPost)
 	r.HandleFunc("/api/config", s.ConfigHandler)
 	r.HandleFunc("/api/testArr", s.TestArrHandler)
 
