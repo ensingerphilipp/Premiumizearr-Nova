@@ -275,7 +275,7 @@ func newQuotaTestService(t *testing.T, server *httptest.Server, apiKey, fileName
 		t.Fatal(err)
 	}
 
-	service := DirectoryWatcherService{}.New()
+	service := NewDirectoryWatcherService()
 	service.premiumizemeClient = &client
 	service.Queue = stringqueue.NewStringQueue()
 	service.Queue.Add(filePath)
