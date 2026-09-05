@@ -13,6 +13,11 @@ import (
 	"golift.io/starr/sonarr"
 )
 
+// grabbedEventType is the *arr history event type (camelCase in Sonarr,
+// Radarr and Lidarr) of a release grab. Only grabbed records can be marked
+// failed in the *arr, so error reporting must resolve to one of them.
+const grabbedEventType = "grabbed"
+
 func CompareFileNamesFuzzy(a, b string) bool {
 	//Strip file extension
 	a = utils.StripDownloadTypesExtention(a)
