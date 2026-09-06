@@ -68,7 +68,8 @@ Explicit human (HITL) planning/approval is required for:
 - Breaking API/UI/CLI behavior changes.
 - Security-model or persistence changes.
 - Changes to this contract (`PROJECT.md`, `ARCHITECTURE.md`, `QWEN.md`,
-  `.qwen/review-rules.md`, `scripts/verify`, `.github/workflows/verify.yml`).
+  `.agent-harness.json`, `.qwen/review-rules.md`, `.qwen/review-config.json`,
+  `scripts/verify`, `.github/workflows/verify.yml`).
 - Removal or breaking change of exported symbols under `pkg/` — this is a
   **public Go module**; external consumers may exist. Lack of internal callers
   is not sufficient justification.
