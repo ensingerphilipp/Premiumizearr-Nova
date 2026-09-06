@@ -1,8 +1,5 @@
 name: Verify
 
-# PR-only on purpose: scripts/verify is intentionally red until the
-# baseline-cleanup task (see PROJECT.md). We do not add a push-to-main trigger
-# while main would be knowingly red; it can be added later if useful.
 on:
   pull_request:
 

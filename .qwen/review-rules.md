@@ -19,8 +19,7 @@ require explicit human approval).
 
 - No `-vet=off`, no vet suppressions, no nolint-style comments, no exclusions,
   no weakened checks — in code or in the gate.
-- No product-source edits whose only purpose is to make the gate green (gate
-  failures are reported, not silently "fixed").
+- No product-source edits whose only purpose is to make the gate green without fixing underlying issues.
 - No API keys or other secrets in logs, error messages, or test fixtures
   (premiumize.me key, *arr keys); request URLs that embed keys must not be
   logged.

@@ -43,7 +43,7 @@ serves the SPA from ./static + JSON API. No authentication by design.
 | fsnotify wrapper | `internal/directory_watcher/` | Watch directory, match/callback hooks. |
 | Downloader | `internal/progress_downloader/` | `wget` subprocess via `stdbuf`, regex progress parsing into `WriteCounter`. |
 | Helpers | `internal/utils/` | Docker detection, writeability probe, env defaults, folder-ID resolution; (dead: `Unzip`, `StringInSlice`). |
-| Premiumize.me API | `pkg/premiumizeme/` | REST client (API key in query string). Legacy zip-API methods unused. **Public Go module surface.** The only package with tests. |
+| Premiumize.me API | `pkg/premiumizeme/` | REST client (API key in query string). Legacy zip-API methods unused. **Public Go module surface.** |
 | Queue | `pkg/stringqueue/` | Mutex string queue. |
 | (stub) | `pkg/clouddownloader/` | Empty interface stub, entirely unused. **Public Go module surface.** |
 
@@ -153,25 +153,19 @@ serves the SPA from ./static + JSON API. No authentication by design.
    maintenance decision (HITL).
 3. **Verification gate:** one deterministic command, `scripts/verify` — spec
    below. Never weakened.
-4. **Baseline policy:** one-time behavior-preserving cleanup task (defined in
-   PROJECT.md) brings the gate green; no suppressions, no `-vet=off`, no
-   exclusions, no weakened checks. **Executed:** completed in PR #71
-   (merged 2026-08-28); the gate has been green since.
-5. **Race remediation policy:** minimal local synchronization (mutex/atomic/
+4. **Race remediation policy:** minimal local synchronization (mutex/atomic/
    safe snapshot) preserving architecture and observable behavior; treat
    races as individual bugs (reproduce → `go test -race` test → narrow fix).
    No restructuring of config propagation or service boundaries without HITL.
-6. **wget as the download mechanism:** approved current design.
-7. **No built-in auth:** out of current scope (roadmap candidate requiring
+5. **wget as the download mechanism:** approved current design.
+6. **No built-in auth:** out of current scope (roadmap candidate requiring
    HITL); the approved current security boundary is an authenticated reverse
    proxy / trusted network.
-8. **`pkg/` is the public Go module API surface:** no removal/breaking change
+7. **`pkg/` is the public Go module API surface:** no removal/breaking change
    of exported symbols without a public-API assessment (HITL).
-9. **CI verify job:** `pull_request`-triggered; the
+8. **CI verify job:** `pull_request`-triggered; the
    `verify (scripts/verify)` check is a **required merge check** on `main`
-   (rule set `main-quality-gate`, added once the baseline-cleanup PR made
-   verify green). A `push: main` trigger can be added later if useful
-   (not yet added). The release/Goreleaser workflow stays separate and is
+   The release/Goreleaser workflow stays separate and is
    untouched by the verify work.
 
 ## scripts/verify (the gate)
@@ -201,11 +195,6 @@ checks; never downloads or installs toolchains (verification exports
 4. `go test -race ./...` clean.
 5. `cd web && npm ci` (locked dependency graph).
 6. `cd web && npm run build` (production webpack build).
-
-**Gate state:** green (the pre-existing gofmt/vet debt that failed check 1 on
-the original `planning/project-contract` branch was removed by the baseline
-cleanup, PR #71); enforced as a required merge check on `main`; do not
-weaken.
 
 ## Known risks & limitations (verified, not yet fixed)
 
