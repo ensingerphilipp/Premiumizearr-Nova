@@ -6,13 +6,13 @@ authoritative; this file is a concise operating checklist.
 
 ## Verification
 
-- `scripts/verify` (repo root) is the single mandatory verification gate. Run
+- `scripts/verify` (repo root) is the mandatory local deterministic verification command. Run
   it after any change; do not land a change that makes it worse.
-- The gate is currently **green** (the baseline cleanup removed the
-  pre-existing gofmt/vet debt — see PROJECT.md → "Current gate state"). Do
-  not weaken the gate, use `-vet=off`, add suppressions/exclusions, or edit
-  product source files merely to keep it green. Gate failures are reported,
-  not silently fixed.
+- Do not weaken the gate, use `-vet=off`, add suppressions/exclusions, or edit
+  product source files merely to keep it green without fixing the underlying issues. 
+  Fix in-scope formatting and code defects without weakening verification or changing intended behavior. Report unrelated 
+  or pre-existing failures and route them according to the task and approval boundaries.
+  Gate failures are reported, not silently fixed.
 - Do not modify `scripts/verify`, `.github/workflows/verify.yml`, or the
   contract documents without explicit human approval (contract changes
   require HITL).
@@ -50,7 +50,5 @@ authoritative; this file is a concise operating checklist.
 
 ## Repository notes
 
-- Keep contract/verification work separate from product code work in its own
-  branch/PR (the contract setup and baseline-cleanup tasks followed this
-  pattern and are complete — see PROJECT.md).
+- Keep contract/verification work separate from product code work in its own branch/PR.
 - Commit style: imperative, concise (see `git log`).
