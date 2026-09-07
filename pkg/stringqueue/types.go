@@ -3,6 +3,7 @@ package stringqueue
 import "sync"
 
 type StringQueue struct {
-	queue []string
-	mutex *sync.Mutex
+	queue  []string
+	counts map[string]int
+	mutex  *sync.Mutex
 }
