@@ -1,5 +1,3 @@
-<!-- AO tracker-intake canary: issue github:ensingerphilipp/Premiumizearr-Nova#74 was used to qualify AO tracker intake. -->
-
 # PROJECT.md — Premiumizearr-Nova Project Contract
 
 Durable project contract: goals, scope, change policy, acceptance criteria.
@@ -70,7 +68,8 @@ Explicit human (HITL) planning/approval is required for:
 - Breaking API/UI/CLI behavior changes.
 - Security-model or persistence changes.
 - Changes to this contract (`PROJECT.md`, `ARCHITECTURE.md`, `QWEN.md`,
-  `.qwen/review-rules.md`, `scripts/verify`, `.github/workflows/verify.yml`).
+  `.agent-harness.json`, `.qwen/review-rules.md`, `.qwen/review-config.json`,
+  `scripts/verify`, `.github/workflows/verify.yml`).
 - Removal or breaking change of exported symbols under `pkg/` — this is a
   **public Go module**; external consumers may exist. Lack of internal callers
   is not sufficient justification.
@@ -104,43 +103,11 @@ point and is mirrored by CI (`.github/workflows/verify.yml`). Gate details:
 
 ### Current gate state
 
-`scripts/verify` is **green**: the baseline cleanup (completed — see the
-historical section below) removed the pre-existing gofmt/vet debt, and the
-gate has been passing locally and in CI since. The `verify (scripts/verify)`
-check is enforced as a **required merge check** on `main` (repo rule set
-`main-quality-gate`). Do not weaken the gate or edit product source files
-merely to keep it green.
-
-## Historical: pilot acceptance criteria (contract + verification setup, PR #70, merged 2026-08-27)
-
-The pilot task is complete; the criteria below are recorded as history, not
-current requirements. At the time, the gate was intentionally red on the
-contract branch to prove it caught the pre-existing gofmt/vet debt.
-
-1. All 6 paths in place: `PROJECT.md`, `ARCHITECTURE.md`, `QWEN.md`,
-   `.qwen/review-rules.md`, `scripts/verify`, `.github/workflows/verify.yml`.
-2. `scripts/verify` implemented strictly per the gate spec and failing at the
-   gofmt stage on that branch (proof it caught the pre-existing debt).
-3. The PR verify job in place, running the same gate, red for the same
-   expected reason.
-4. Zero modifications to existing product source files on that branch.
-
-## Historical: baseline cleanup (completed, PR #71, merged 2026-08-28)
-
-The baseline-cleanup task is **complete**; this section is recorded as
-history, not a pending task. It ran as its own PR on its own branch after the
-contract setup was reviewed:
-
-- gofmt'd the then-non-clean Go files (mechanical).
-- Triaged and fixed each `go vet ./...` finding **individually** per its
-  intended behavior — not blanket-mechanical.
-- Added regression tests where a finding revealed or fixed meaningful
-  behavior, plus minimal test infrastructure as needed (httptest fakes for
-  premiumize.me/*arr, `t.TempDir`, no network).
-- **No** suppressions, `-vet=off`, exclusions, or weakened checks.
-- Exit criteria met: `scripts/verify` green locally and in CI; the
-  `verify (scripts/verify)` check was then marked a **required merge check**
-  on `main` (rule set `main-quality-gate`).
+Every proposed change must pass
+`bash scripts/verify`, and all required GitHub checks must be satisfied
+before merge. Determine the current gate state from verification output and
+CI results for the commit under consideration. Earlier results do not exempt
+a new change from verification.
 
 ## Follow-up backlog (priority selection deferred — needs explicit approval)
 

@@ -1,56 +1,25 @@
-# QWEN.md — Qwen operating instructions
+# QWEN.md — Premiumizearr-Nova project instructions
 
-Read `PROJECT.md` (goals, scope, change policy) and `ARCHITECTURE.md`
-(architecture, approved decisions, gate details) before any work. They are
-authoritative; this file is a concise operating checklist.
+Before work, read the repository contracts:
+
+- `PROJECT.md` — product goals, scope, HITL boundaries, public contracts, support policy.
+- `ARCHITECTURE.md` — component boundaries, technical decisions, toolchains, CI and runtime constraints.
+- `.qwen/review-rules.md` — project-specific semantic review invariants.
+
+The host-global Qwen engineering rules remain applicable. This file adds project context; it does not duplicate or weaken the global baseline.
 
 ## Verification
 
-- `scripts/verify` (repo root) is the single mandatory verification gate. Run
-  it after any change; do not land a change that makes it worse.
-- The gate is currently **green** (the baseline cleanup removed the
-  pre-existing gofmt/vet debt — see PROJECT.md → "Current gate state"). Do
-  not weaken the gate, use `-vet=off`, add suppressions/exclusions, or edit
-  product source files merely to keep it green. Gate failures are reported,
-  not silently fixed.
-- Do not modify `scripts/verify`, `.github/workflows/verify.yml`, or the
-  contract documents without explicit human approval (contract changes
-  require HITL).
+The repository's deterministic verification authority is:
 
-## Change policy (summary)
+```bash
+bash scripts/verify
+```
 
-- Autonomous work: bug fixes (failing-first regression test where reasonably
-  feasible), behavior-preserving hygiene, test/verification improvements.
-- HITL required: major dependencies / the Go `go` directive, architecture
-  changes, breaking API/UI/CLI changes, security model, persistence, contract
-  changes, removal or breaking change of `pkg/` exports (public Go module),
-  net-new product features (must originate from an approved objective/issue).
-- Race fixes: minimal local synchronization only — reproduce →
-  `go test -race` → narrow fix; no unrelated concurrency refactoring in the
-  same change; no restructuring of config propagation or service boundaries.
+Run it after relevant changes and before handoff. Exact mechanical checks belong in `scripts/verify`, not in this file.
 
-## Tests
+## Project-specific boundaries
 
-- Every bug fix must add a failing-first regression test where reasonably
-  feasible. If deterministic reproduction is not reasonably feasible, document
-  why and provide the strongest deterministic verification available.
-- Tests must be deterministic: `httptest` fakes for premiumize.me/*arr HTTP,
-  `t.TempDir` for filesystem, no network, no reliance on real config or host
-  binaries.
-- No coverage floor; test meaningful behavior.
+Respect the approval boundaries and public API/security/persistence contracts in `PROJECT.md`. Treat toolchain and architecture decisions in `ARCHITECTURE.md` as project truth.
 
-## Environment expectations
-
-- Locally provisioned Go >= 1.24.2 (verification runs with `GOTOOLCHAIN=local`;
-  go.mod keeps floor `go 1.23.0` / `toolchain go1.24.2`); Node 22; npm; a C
-  compiler (for `-race`).
-- `scripts/verify` checks all of the above and fails with actionable errors;
-  it never installs toolchains and never rewrites `go.mod`. If a prerequisite
-  is missing on this machine, report it — do not silently skip.
-
-## Repository notes
-
-- Keep contract/verification work separate from product code work in its own
-  branch/PR (the contract setup and baseline-cleanup tasks followed this
-  pattern and are complete — see PROJECT.md).
-- Commit style: imperative, concise (see `git log`).
+Do not invent missing project policy. Surface material ambiguity for human resolution.
