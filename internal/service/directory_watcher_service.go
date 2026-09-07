@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"io/ioutil"
 	"os"
 	"path"
@@ -65,6 +66,8 @@ func (dw *DirectoryWatcherService) ConfigUpdatedCallback(currentConfig config.Co
 }
 
 func (dw *DirectoryWatcherService) GetStatus() string {
+	dw.mu.RLock()
+	defer dw.mu.RUnlock()
 	return dw.status
 }
 
@@ -157,7 +160,9 @@ func (dw *DirectoryWatcherService) checkFile(path string) int {
 }
 
 func (dw *DirectoryWatcherService) addFileToQueue(path string) {
-	dw.Queue.Add(path)
+	if !dw.Queue.AddIfAbsent(path) {
+		return
+	}
 	log.Infof("File created in blackhole %s added to Queue. Queue length %d", path, dw.Queue.Len())
 }
 
@@ -174,38 +179,46 @@ func (dw *DirectoryWatcherService) processUploads() {
 			continue
 		}
 
-		sleepTimeSeconds := 2
-		if filePath != "" {
-			log.Debugf("Processing %s", filePath)
-			dw.mu.RLock()
-			folderID := dw.downloadsFolderID
-			dw.mu.RUnlock()
-			err := dw.premiumizemeClient.CreateTransfer(filePath, folderID)
-			if err != nil {
-				switch err.Error() {
-				case ERROR_LIMIT_REACHED:
-					dw.status = "Limit of transfers reached!"
-					log.Trace("Transfer limit reached waiting 10 seconds and retrying")
-					sleepTimeSeconds = 10
-				case ERROR_ALREADY_UPLOADED:
-					log.Trace("File already uploaded, removing from Disk")
-					os.Remove(filePath)
-				default:
-					log.Errorf("Error creating transfer: %s", err)
-				}
-			} else {
-				dw.status = "Okay"
-				os.Remove(filePath)
-				if err != nil {
-					log.Errorf("Error could not delete %s Error: %+v", filePath, err)
-				}
-				log.Infof("Removed %s from blackhole Queue. Queue Size: %d", filePath, dw.Queue.Len())
-			}
-			time.Sleep(time.Second * time.Duration(sleepTimeSeconds))
-		} else {
-			log.Error("Received an empty path from blackhole Queue.")
+		if filePath == "" {
+			continue
 		}
+		time.Sleep(dw.processUpload(filePath))
 	}
+}
+
+// processUpload handles one queue entry and returns the delay before the next.
+func (dw *DirectoryWatcherService) processUpload(filePath string) time.Duration {
+	log.Debugf("Processing %s", filePath)
+	dw.mu.RLock()
+	folderID := dw.downloadsFolderID
+	dw.mu.RUnlock()
+	err := dw.premiumizemeClient.CreateTransfer(filePath, folderID)
+	if err != nil && !errors.Is(err, premiumizeme.ErrTransferAlreadyExists) {
+		// A removed file cannot be retried. Every other failure stays queued,
+		// including unfamiliar vendor messages and transient transport failures.
+		if errors.Is(err, os.ErrNotExist) {
+			return 2 * time.Second
+		}
+		dw.Queue.AddIfAbsent(filePath)
+		dw.mu.Lock()
+		if errors.Is(err, premiumizeme.ErrTransferLimitReached) {
+			dw.status = ERROR_LIMIT_REACHED
+		} else {
+			dw.status = "Transfer failed; retrying"
+		}
+		dw.mu.Unlock()
+		log.Warnf("Could not create transfer; retaining source and retrying in 10 seconds: %s", err)
+		return 10 * time.Second
+	}
+	// Success and already-existing jobs are both terminal.
+	if removeErr := os.Remove(filePath); removeErr != nil {
+		log.Errorf("Could not delete %s: %s", filePath, removeErr)
+	}
+	dw.mu.Lock()
+	dw.status = "Okay"
+	dw.mu.Unlock()
+	log.Infof("Removed %s from blackhole queue. Queue size: %d", filePath, dw.Queue.Len())
+	return 2 * time.Second
 }
 
 func (dw *DirectoryWatcherService) setTransferDirectory(newDir string) {
