@@ -144,7 +144,7 @@ cd Premiumizearr_x.x.x.x_linux_amd64
 sudo mkdir /opt/premiumizearrd/
 sudo cp -r premiumizearrd static/ /opt/premiumizearrd/
 sudo cp premiumizearrd.service /etc/systemd/system/
-sudo systemctl-reload
+sudo systemctl daemon-reload
 sudo systemctl enable premiumizearrd.service
 sudo systemctl start premiumizearrd.service
 ```
