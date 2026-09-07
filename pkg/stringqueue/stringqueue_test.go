@@ -1,6 +1,7 @@
 package stringqueue
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -51,5 +52,33 @@ func TestAddAllowsPathAfterPop(t *testing.T) {
 	queue.Add(filePath)
 	if got := queue.Len(); got != 1 {
 		t.Fatalf("queue length after re-adding popped path = %d, want 1", got)
+	}
+}
+
+func TestAddIfAbsentReportsInsertionAndPreservesOrder(t *testing.T) {
+	queue := NewStringQueue()
+	if !queue.AddIfAbsent("a") || !queue.AddIfAbsent("b") || queue.AddIfAbsent("a") {
+		t.Fatal("incorrect insertion result")
+	}
+	for _, want := range []string{"a", "b"} {
+		ok, got := queue.PopTopOfQueue()
+		if !ok || got != want {
+			t.Fatalf("popped %q, want %q", got, want)
+		}
+	}
+	if !queue.AddIfAbsent("a") {
+		t.Fatal("popped path cannot be requeued")
+	}
+}
+
+func BenchmarkQueueRescan(b *testing.B) {
+	for range b.N {
+		queue := NewStringQueue()
+		for i := range 10000 {
+			queue.Add(fmt.Sprint(i))
+		}
+		for i := range 10000 {
+			queue.Add(fmt.Sprint(i))
+		}
 	}
 }
