@@ -85,7 +85,7 @@ func (pm *Premiumizeme) GetAccountInfo() (AccountInfoResponse, error) {
 		return accountInfo, err
 	}
 	if accountInfo.Status != "success" {
-		return accountInfo, fmt.Errorf("account info request failed: %s", accountInfo.Status)
+		return accountInfo, pm.accountInfoRequestError(fmt.Errorf("%s: %s", accountInfo.Status, accountInfo.Message))
 	}
 
 	return accountInfo, nil
