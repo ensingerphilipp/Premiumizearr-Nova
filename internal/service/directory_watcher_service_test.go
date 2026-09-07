@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/stringqueue"
@@ -311,4 +312,86 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (roundTrip roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return roundTrip(request)
+}
+
+func TestUploadBatchPreservesTransferPacing(t *testing.T) {
+	var calls []time.Time
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/account/info" {
+			w.Write([]byte(`{"status":"success"}`))
+			return
+		}
+		calls = append(calls, time.Now())
+		w.Write([]byte(`{"status":"success"}`))
+	}))
+	defer server.Close()
+	svc, _ := newQuotaTestService(t, server, "test-key", "first.magnet")
+	second := filepath.Join(t.TempDir(), "second.magnet")
+	if err := os.WriteFile(second, []byte("magnet:?xt=urn:btih:second"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	svc.Queue.Add(second)
+	svc.processUploadCycle()
+	if len(calls) != 2 {
+		t.Fatalf("transfers = %d", len(calls))
+	}
+	if gap := calls[1].Sub(calls[0]); gap < 2*time.Second {
+		t.Fatalf("transfer gap = %s, want at least 2s", gap)
+	}
+}
+
+func TestQuotaLookupFailurePreservesLastKnownState(t *testing.T) {
+	response := `{"status":"success","limit_used":1,"booster_points":0}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(response)) }))
+	defer server.Close()
+	svc, _ := newQuotaTestService(t, server, "test-key", "state.magnet")
+	var logs bytes.Buffer
+	logger := log.StandardLogger()
+	old := logger.Out
+	logger.SetOutput(&logs)
+	defer logger.SetOutput(old)
+	if svc.submissionsAllowed() {
+		t.Fatal("exhausted account allowed")
+	}
+	response = `{"status":"error","message":"temporarily unavailable"}`
+	for range 2 {
+		if !svc.submissionsAllowed() {
+			t.Fatal("lookup error must fail open")
+		}
+	}
+	if strings.Contains(svc.GetStatus(), "Paused") {
+		t.Fatalf("stale status: %s", svc.GetStatus())
+	}
+	response = `{"status":"success","limit_used":1,"booster_points":0}`
+	if svc.submissionsAllowed() {
+		t.Fatal("exhausted account allowed after error")
+	}
+	if n := strings.Count(logs.String(), "new blackhole submissions are paused"); n != 1 {
+		t.Fatalf("pause warnings = %d", n)
+	}
+	if n := strings.Count(logs.String(), "Could not check Premiumize fair-use quota"); n != 1 {
+		t.Fatalf("lookup warnings = %d", n)
+	}
+	response = `{"status":"success","limit_used":0.5,"booster_points":0}`
+	if !svc.submissionsAllowed() || svc.GetStatus() != "Okay" {
+		t.Fatal("quota recovery failed")
+	}
+	if !strings.Contains(logs.String(), "resuming blackhole submissions") {
+		t.Fatal("missing recovery log")
+	}
+}
+
+func TestDuplicateQueueAdditionIsNotLoggedAsAdded(t *testing.T) {
+	svc := NewDirectoryWatcherService()
+	svc.Queue = stringqueue.NewStringQueue()
+	var logs bytes.Buffer
+	logger := log.StandardLogger()
+	old := logger.Out
+	logger.SetOutput(&logs)
+	defer logger.SetOutput(old)
+	svc.addFileToQueue("same.magnet")
+	svc.addFileToQueue("same.magnet")
+	if n := strings.Count(logs.String(), "added to Queue"); n != 1 {
+		t.Fatalf("addition logs = %d", n)
+	}
 }

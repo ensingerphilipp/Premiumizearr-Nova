@@ -23,6 +23,7 @@ type DirectoryWatcherService struct {
 	Queue              *stringqueue.StringQueue
 	status             string
 	quotaBlocked       bool
+	quotaCheckFailed   bool
 	downloadsFolderID  string
 	watchDirectory     *directory_watcher.WatchDirectory
 }
@@ -158,7 +159,9 @@ func (dw *DirectoryWatcherService) checkFile(path string) int {
 }
 
 func (dw *DirectoryWatcherService) addFileToQueue(path string) {
-	dw.Queue.Add(path)
+	if !dw.Queue.AddIfAbsent(path) {
+		return
+	}
 	log.Infof("File created in blackhole %s added to Queue. Queue length %d", path, dw.Queue.Len())
 }
 
@@ -198,6 +201,9 @@ func (dw *DirectoryWatcherService) processUploadCycle() int {
 			continue
 		}
 
+		if processed > 0 {
+			time.Sleep(2 * time.Second)
+		}
 		processed++
 		if dw.processUpload(filePath) {
 			// The account check and transfer submission are separate requests, so
@@ -214,15 +220,22 @@ func (dw *DirectoryWatcherService) processUploadCycle() int {
 func (dw *DirectoryWatcherService) submissionsAllowed() bool {
 	accountInfo, err := dw.premiumizemeClient.GetAccountInfo()
 	if err != nil {
-		log.Warnf("Could not check Premiumize fair-use quota; continuing with existing submission behavior: %s", err)
 		dw.mu.Lock()
-		dw.quotaBlocked = false
+		alreadyFailed := dw.quotaCheckFailed
+		dw.quotaCheckFailed = true
+		dw.status = "Premiumize fair-use quota unknown; continuing submissions"
+		// Preserve the last known quota state across failed lookups so a
+		// transient error does not duplicate pause logs or hide recovery.
 		dw.mu.Unlock()
+		if !alreadyFailed {
+			log.Warnf("Could not check Premiumize fair-use quota; continuing with existing submission behavior: %s", err)
+		}
 		return true
 	}
 
 	exhausted := accountInfo.QuotaExhausted()
 	dw.mu.Lock()
+	dw.quotaCheckFailed = false
 	wasBlocked := dw.quotaBlocked
 	dw.quotaBlocked = exhausted
 	if exhausted {
