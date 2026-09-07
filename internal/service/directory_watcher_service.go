@@ -1,9 +1,9 @@
 package service
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
-	"path"
 	"path/filepath"
 	"sync"
 	"time"
@@ -50,7 +50,7 @@ func (dw *DirectoryWatcherService) ConfigUpdatedCallback(currentConfig config.Co
 	if currentConfig.BlackholeDirectory != newConfig.BlackholeDirectory {
 		log.Info("Blackhole directory changed, restarting directory watcher...")
 		log.Info("Running initial directory scan...")
-		go dw.directoryScan(dw.config.BlackholeDirectory)
+		go dw.scanDirectory(dw.config.BlackholeDirectory)
 		dw.watchDirectory.UpdatePath(newConfig.BlackholeDirectory)
 	}
 
@@ -81,7 +81,7 @@ func (dw *DirectoryWatcherService) Start() {
 	go dw.processUploads()
 
 	log.Info("Running initial directory scan...")
-	go dw.directoryScan(dw.config.BlackholeDirectory)
+	go dw.scanDirectory(dw.config.BlackholeDirectory)
 
 	if dw.watchDirectory != nil {
 		log.Info("Stopping directory watcher...")
@@ -101,7 +101,7 @@ func (dw *DirectoryWatcherService) Start() {
 				}
 				time.Sleep(time.Duration(dw.config.PollBlackholeIntervalMinutes) * time.Minute)
 				log.Infof("Running directory scan of %s", dw.config.BlackholeDirectory)
-				dw.directoryScan(dw.config.BlackholeDirectory)
+				dw.scanDirectory(dw.config.BlackholeDirectory)
 				log.Infof("Scan complete, next scan in %d minutes", dw.config.PollBlackholeIntervalMinutes)
 			}
 		}()
@@ -116,22 +116,39 @@ func (dw *DirectoryWatcherService) Start() {
 	}
 }
 
-func (dw *DirectoryWatcherService) directoryScan(p string) {
+// ScanNow scans the configured blackhole directory and adds supported files to
+// the upload queue. It returns after the scan is complete so callers can report
+// whether the request succeeded.
+func (dw *DirectoryWatcherService) ScanNow() (int, error) {
+	if dw.config == nil {
+		return 0, fmt.Errorf("directory watcher is not initialized")
+	}
+
+	return dw.directoryScan(dw.config.BlackholeDirectory)
+}
+
+func (dw *DirectoryWatcherService) scanDirectory(p string) {
+	if _, err := dw.directoryScan(p); err != nil {
+		log.Error(err)
+	}
+}
+
+func (dw *DirectoryWatcherService) directoryScan(p string) (int, error) {
 	log.Trace("Running directory scan")
 	files, err := ioutil.ReadDir(p)
 	if err != nil {
-		log.Errorf("Error with directory scan %+v", err)
-		return
+		return 0, fmt.Errorf("error scanning blackhole directory: %w", err)
 	}
 
+	queued := 0
 	for _, file := range files {
-		go func(file os.FileInfo) {
-			file_path := path.Join(p, file.Name())
-			if dw.checkFile(file_path) == 1 {
-				dw.addFileToQueue(file_path)
-			}
-		}(file)
+		filePath := filepath.Join(p, file.Name())
+		if dw.checkFile(filePath) == 1 && dw.queueFile(filePath) {
+			queued++
+		}
 	}
+
+	return queued, nil
 }
 
 func (dw *DirectoryWatcherService) checkFile(path string) int {
@@ -157,8 +174,17 @@ func (dw *DirectoryWatcherService) checkFile(path string) int {
 }
 
 func (dw *DirectoryWatcherService) addFileToQueue(path string) {
-	dw.Queue.Add(path)
+	dw.queueFile(path)
+}
+
+func (dw *DirectoryWatcherService) queueFile(path string) bool {
+	if !dw.Queue.AddUnique(path) {
+		log.Tracef("File %s is already in the blackhole queue", path)
+		return false
+	}
+
 	log.Infof("File created in blackhole %s added to Queue. Queue length %d", path, dw.Queue.Len())
+	return true
 }
 
 func (dw *DirectoryWatcherService) processUploads() {
