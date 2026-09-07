@@ -1,6 +1,8 @@
 package premiumizeme
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -108,4 +110,77 @@ func readMultipartFields(t *testing.T, req *http.Request) map[string]string {
 	}
 
 	return fields
+}
+
+func TestAPITransportErrorsRedactKeys(t *testing.T) {
+	key := "test secret/+"
+	client := NewPremiumizemeClient(key)
+	file := createTempTransferFile(t, ".magnet", "magnet:?xt=urn:btih:test")
+	file.Close()
+	old := http.DefaultTransport
+	http.DefaultTransport = reviewTransport(func(r *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("connection failed for %s (key %s)", r.URL, key)
+	})
+	defer func() { http.DefaultTransport = old }()
+	cases := map[string]func() error{
+		"transfer/create": func() error { return client.CreateTransfer(file.Name(), "folder") },
+		"transfer/list":   func() error { _, err := client.GetTransfers(); return err },
+		"folder/list":     func() error { _, err := client.ListFolder("folder"); return err },
+		"folders":         func() error { _, err := client.GetFolders(); return err },
+		"folder/delete":   func() error { return client.DeleteFolder("folder") },
+		"item/move":       func() error { return client.MoveItem("item", "folder") },
+		"folder/create":   func() error { _, err := client.CreateFolder("folder", nil); return err },
+		"transfer/delete": func() error { return client.DeleteTransfer("transfer") },
+		"zip/file":        func() error { _, err := client.GenerateZippedFileLink("file"); return err },
+		"zip/folder":      func() error { _, err := client.GenerateZippedFolderLink("folder"); return err },
+		"item/details":    func() error { _, err := client.GenerateFileLink("file"); return err },
+	}
+	for name, call := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := call()
+			if err == nil {
+				t.Fatal("expected transport error")
+			}
+			for _, format := range []string{"%s", "%v", "%+v", "%#v"} {
+				message := fmt.Sprintf(format, err)
+				for _, secret := range []string{key, url.QueryEscape(key), url.PathEscape(key)} {
+					if strings.Contains(message, secret) {
+						t.Errorf("error formatting %s exposes API key", format)
+					}
+				}
+			}
+		})
+	}
+}
+
+type reviewTransport func(*http.Request) (*http.Response, error)
+
+func (f reviewTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestTransferFailuresHaveStableClassification(t *testing.T) {
+	for _, test := range []struct {
+		message string
+		kind    error
+	}{
+		{"You already added this job.", ErrTransferAlreadyExists},
+		{" YOU ALREADY ADDED THIS JOB! ", ErrTransferAlreadyExists},
+		{"Limit of transfers reached!", ErrTransferLimitReached},
+		{"account_limit_reached", ErrTransferLimitReached},
+		{"unknown failure", nil},
+	} {
+		t.Run(test.message, func(t *testing.T) {
+			pm := NewPremiumizemeClient("dummy-key")
+			err := pm.transferFailure(test.message)
+			if err.Error() != test.message {
+				t.Fatal("displayed provider message changed")
+			}
+			wrapped := fmt.Errorf("upload failed: %w", err)
+			if test.kind != nil && !errors.Is(wrapped, test.kind) {
+				t.Fatal("wrapped error lost classification")
+			}
+			if test.kind == nil && (errors.Is(wrapped, ErrTransferAlreadyExists) || errors.Is(wrapped, ErrTransferLimitReached)) {
+				t.Fatal("unknown failure misclassified")
+			}
+		})
+	}
 }
