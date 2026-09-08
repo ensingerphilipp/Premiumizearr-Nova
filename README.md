@@ -42,6 +42,8 @@ Next Steps:
 - Monitor and download Premiumize.me transfers (web ui on default port 8182)
 - Mark transfers as failed in Radarr & Sonarr
 
+New blackhole submissions pause automatically when the Premiumize fair-use quota is exhausted and no booster points are available. Existing cloud transfers are not affected. Source files remain in the blackhole directory and are processed automatically after quota replenishment or booster activation.
+
 ## Install
 
 ### Docker
@@ -144,7 +146,7 @@ cd Premiumizearr_x.x.x.x_linux_amd64
 sudo mkdir /opt/premiumizearrd/
 sudo cp -r premiumizearrd static/ /opt/premiumizearrd/
 sudo cp premiumizearrd.service /etc/systemd/system/
-sudo systemctl-reload
+sudo systemctl daemon-reload
 sudo systemctl enable premiumizearrd.service
 sudo systemctl start premiumizearrd.service
 ```
