@@ -1,19 +1,14 @@
 # Premiumizearr-Nova
-## Build 1.5.1
+## Build 1.5.5
 
 [![Build](https://github.com/ensingerphilipp/premiumizearr-nova/actions/workflows/build.yml/badge.svg)](https://github.com/ensingerphilipp/premiumizearr-nova/actions/workflows/build.yml)
 
 *BUGFIX Release:* 
-* Prevent Download Lockup on orphaned broken links
-* More graceful Downloads (cooldown before retrying on broken downloadlinks)
-* Fix Subfolder handling
-* Improve Download Cleanup
+* Fix transfer folder not being applied to new uploads (multipart field)
+* Fix crash when the web UI queries blackhole status before startup completes
+* Fix SimultaneousDownloads limit being miscounted by the download count
 
-*NEW: Added Transfer-Only-Mode* ✅
-
-*NEW: Skip TLS-Certificate-Check to prevent failed 0B Downloads* ✅
-
-*NEW: Change transferfolder on Premiumize to a user-specified folder* ✅
+*NEW: Pause blackhole submissions when the Premiumize fair-use quota is exhausted* ✅
 
 ## Enjoying so far? Im running on ☕
 <a href="https://ko-fi.com/K3K819CODS"><img src="https://uploads-ssl.webflow.com/5c14e387dab576fe667689cf/5cbed8a4ae2b88347c06c923_BuyMeACoffee_blue-p-500.png" width="250px"></a>
