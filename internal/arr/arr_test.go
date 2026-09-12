@@ -35,12 +35,14 @@ type fakeHistoryRecord struct {
 
 // fakeArrServer is an httptest fake for the *arr history and
 // history-failed endpoints (no network). It records every id the client
-// reports as failed.
+// reports as failed. When historyFail is set, the history endpoint answers
+// with a 500 to simulate an unreachable *arr.
 type fakeArrServer struct {
 	*httptest.Server
-	apiVersion string
-	records    []fakeHistoryRecord
-	failedIDs  []int64
+	apiVersion  string
+	records     []fakeHistoryRecord
+	failedIDs   []int64
+	historyFail bool
 }
 
 // newFakeArrServer serves GET /api/<version>/history with the given records
@@ -55,6 +57,10 @@ func newFakeArrServer(t *testing.T, apiVersion string, records []fakeHistoryReco
 	mux.HandleFunc("/api/"+apiVersion+"/history", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Errorf("unexpected %s on /api/%s/history", r.Method, apiVersion)
+		}
+		if fake.historyFail {
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -176,7 +182,10 @@ func runErrorTransferReportingTest(t *testing.T, newArr newArrFunc, apiVersion s
 
 	a := newArr(fake.URL)
 
-	id, found := a.HistoryContains(transferName)
+	id, found, err := a.HistoryContains(transferName)
+	if err != nil {
+		t.Fatalf("HistoryContains(%q) error = %v, want nil", transferName, err)
+	}
 	if !found {
 		t.Fatalf("HistoryContains(%q) = not found, want found", transferName)
 	}
@@ -194,7 +203,7 @@ func runErrorTransferReportingTest(t *testing.T, newArr newArrFunc, apiVersion s
 	// any network call; reaching the delete step proves the *arr was
 	// notified first.
 	pm := premiumizeme.NewPremiumizemeClient("")
-	err := a.HandleErrorTransfer(&transfer, id, &pm)
+	err = a.HandleErrorTransfer(&transfer, id, &pm)
 	if err == nil || !strings.Contains(err.Error(), "failed to delete transfer from premiumize.me") {
 		t.Fatalf("HandleErrorTransfer error = %v, want the premiumize.me delete step to be reached (only possible after the *arr was told about the failure)", err)
 	}
@@ -234,7 +243,10 @@ func runOnlyNonGrabbedRecordsTest(t *testing.T, newArr newArrFunc, apiVersion st
 	})
 
 	a := newArr(fake.URL)
-	id, found := a.HistoryContains(transferName)
+	id, found, err := a.HistoryContains(transferName)
+	if err != nil {
+		t.Fatalf("HistoryContains(%q) error = %v, want nil", transferName, err)
+	}
 	if found {
 		t.Fatalf("HistoryContains(%q) = found (id %d), want not found: only a non-grabbed record matches", transferName, id)
 	}
@@ -246,5 +258,31 @@ func runOnlyNonGrabbedRecordsTest(t *testing.T, newArr newArrFunc, apiVersion st
 	}
 	if wantNotInHistoryLog != "" && !strings.Contains(logBuf.String(), wantNotInHistoryLog) {
 		t.Errorf("expected formatted not-in-history trace line %q in log output:\n%s", wantNotInHistoryLog, logBuf.String())
+	}
+}
+
+// runHistoryLookupFailureTest verifies that a failed history fetch (the *arr
+// answering 500, e.g. an outage) is reported as a non-nil error rather than
+// an authoritative no-match, so callers can keep an errored transfer under
+// grace-period tracking instead of deleting it.
+func runHistoryLookupFailureTest(t *testing.T, newArr newArrFunc, apiVersion string) {
+	t.Helper()
+
+	fake := newFakeArrServer(t, apiVersion, nil)
+	fake.historyFail = true
+
+	a := newArr(fake.URL)
+	id, found, err := a.HistoryContains("Show.S01E01.720p.WEB.x264-GRP.mkv.nzb")
+	if err == nil {
+		t.Fatalf("HistoryContains error = nil, want a lookup failure (history endpoint returned 500)")
+	}
+	if found {
+		t.Fatalf("HistoryContains found = true on a failed history fetch, want false")
+	}
+	if id != -1 {
+		t.Fatalf("HistoryContains id = %d on a failed history fetch, want -1", id)
+	}
+	if len(fake.failedIDs) != 0 {
+		t.Fatalf("expected no failed-history calls, got %v", fake.failedIDs)
 	}
 }

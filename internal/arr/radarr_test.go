@@ -17,3 +17,10 @@ func TestRadarrHistoryContainsResolvesNewestGrabbedRecord(t *testing.T) {
 func TestRadarrHistoryContainsOnlyNonGrabbedRecords(t *testing.T) {
 	runOnlyNonGrabbedRecordsTest(t, newTestRadarrArr, "v3", "")
 }
+
+// TestRadarrHistoryContainsLookupFailureReturnsError verifies that a failed
+// history fetch (500) surfaces as an error instead of an authoritative
+// no-match, so a Radarr outage never looks like "not in history".
+func TestRadarrHistoryContainsLookupFailureReturnsError(t *testing.T) {
+	runHistoryLookupFailureTest(t, newTestRadarrArr, "v3")
+}

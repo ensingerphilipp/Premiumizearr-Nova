@@ -55,12 +55,12 @@ func (arr *LidarrArr) GetArrName() string {
 
 //Functions
 
-func (arr *LidarrArr) HistoryContains(name string) (int64, bool) {
+func (arr *LidarrArr) HistoryContains(name string) (int64, bool, error) {
 	log.Tracef("Lidarr [%s]: Checking history for %s", arr.Name, name)
 	his, err := arr.GetHistory()
 	if err != nil {
 		log.Errorf("Lidarr [%s]: Failed to get history: %+v", arr.Name, err)
-		return -1, false
+		return -1, false, fmt.Errorf("failed to get history from lidarr: %+v", err)
 	}
 	log.Tracef("Lidarr [%s]: Got History, now Locking History", arr.Name)
 	arr.HistoryMutex.Lock()
@@ -81,12 +81,12 @@ func (arr *LidarrArr) HistoryContains(name string) (int64, bool) {
 	}
 
 	if grabbedID == -1 {
-		return -1, false
+		return -1, false, nil
 	}
 
 	log.Tracef("Lidarr [%s]: Found grabbed record %d in History for %s", arr.Name, grabbedID, name)
 
-	return grabbedID, true
+	return grabbedID, true, nil
 }
 
 func (arr *LidarrArr) HandleErrorTransfer(transfer *premiumizeme.Transfer, arrID int64, pm *premiumizeme.Premiumizeme) error {

@@ -45,7 +45,12 @@ func CompareFileNamesFuzzy(a, b string) bool {
 }
 
 type IArr interface {
-	HistoryContains(string) (int64, bool)
+	// HistoryContains reports whether the arr's history contains a grabbed
+	// record fuzzy-matching name. A non-nil error means the history could
+	// not be retrieved (e.g. the arr is unreachable) and must NOT be
+	// treated as an authoritative no-match. (id, true, nil) is a match;
+	// (-1, false, nil) is an authoritative no-match.
+	HistoryContains(name string) (id int64, found bool, err error)
 	MarkHistoryItemAsFailed(int64) error
 	HandleErrorTransfer(*premiumizeme.Transfer, int64, *premiumizeme.Premiumizeme) error
 	GetArrName() string

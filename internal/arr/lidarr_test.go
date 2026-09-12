@@ -17,3 +17,10 @@ func TestLidarrHistoryContainsResolvesNewestGrabbedRecord(t *testing.T) {
 func TestLidarrHistoryContainsOnlyNonGrabbedRecords(t *testing.T) {
 	runOnlyNonGrabbedRecordsTest(t, newTestLidarrArr, "v1", "")
 }
+
+// TestLidarrHistoryContainsLookupFailureReturnsError verifies that a failed
+// history fetch (500) surfaces as an error instead of an authoritative
+// no-match, so a Lidarr outage never looks like "not in history".
+func TestLidarrHistoryContainsLookupFailureReturnsError(t *testing.T) {
+	runHistoryLookupFailureTest(t, newTestLidarrArr, "v1")
+}

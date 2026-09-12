@@ -197,6 +197,12 @@
           labelText="Arr Update History Interval (seconds)"
           bind:value={config.ArrHistoryUpdateIntervalSeconds}
         />
+        <TextInput
+          type="number"
+          disabled={inputDisabled}
+          labelText="Errored Transfer Delete Grace Period (seconds)"
+          bind:value={config.ErroredTransferDeleteGracePeriodSeconds}
+        />
         {#if config.Arrs !== undefined}
           {#each config.Arrs as arr, i}
             <h5>- {arr.Name ? arr.Name : i}</h5>
