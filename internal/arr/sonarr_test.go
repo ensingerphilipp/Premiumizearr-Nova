@@ -49,7 +49,10 @@ func TestHistoryContainsNotInHistoryLog(t *testing.T) {
 	}
 
 	const name = "missing.show.s01e01.720p"
-	id, found := a.HistoryContains(name)
+	id, found, err := a.HistoryContains(name)
+	if err != nil {
+		t.Fatalf("HistoryContains(%q) error = %v, want nil", name, err)
+	}
 	if found {
 		t.Fatalf("HistoryContains(%q) = found, want not found", name)
 	}
@@ -64,4 +67,27 @@ func TestHistoryContainsNotInHistoryLog(t *testing.T) {
 	if !strings.Contains(out, "Sonarr [TestSonarr]: "+name+" Not in History") {
 		t.Errorf("expected formatted not-in-history trace line with arr name and file name:\n%s", out)
 	}
+}
+
+// TestHistoryContainsResolvesNewestGrabbedRecord verifies the issue #22 fix:
+// when an older non-grabbed history record and a newer grabbed record share
+// the transfer's release name, HistoryContains must resolve the grabbed
+// record so the failure can be reported to Sonarr.
+func TestHistoryContainsResolvesNewestGrabbedRecord(t *testing.T) {
+	runErrorTransferReportingTest(t, newTestSonarrArr, "v3")
+}
+
+// TestHistoryContainsOnlyNonGrabbedRecords verifies that a release name
+// present only as non-grabbed history (e.g. an old download failure) is
+// reported as not in history, keeping the "Not in History" trace line.
+func TestHistoryContainsOnlyNonGrabbedRecords(t *testing.T) {
+	const name = "Show.S01E01.720p.WEB.x264-GRP.mkv.nzb"
+	runOnlyNonGrabbedRecordsTest(t, newTestSonarrArr, "v3", "Sonarr [TestSonarr]: "+name+" Not in History")
+}
+
+// TestHistoryContainsLookupFailureReturnsError verifies that a failed
+// history fetch (500) surfaces as an error instead of an authoritative
+// no-match, so an arr outage never looks like "not in history".
+func TestHistoryContainsLookupFailureReturnsError(t *testing.T) {
+	runHistoryLookupFailureTest(t, newTestSonarrArr, "v3")
 }
