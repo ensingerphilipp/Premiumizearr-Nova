@@ -138,7 +138,7 @@ serves the SPA from ./static + JSON API. No authentication by design.
 - `verify.yml` — PR-triggered, runs `scripts/verify` (below); the
   `verify (scripts/verify)` check is a required merge check on `main`
   (rule set `main-quality-gate`).
-- Version 1.5.1 is hardcoded manually (banner in `main.go`, README, git tag).
+- Version 1.5.5 is hardcoded manually (banner in `main.go`, README, git tag).
 
 ## Approved technical decisions
 
