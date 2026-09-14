@@ -127,7 +127,9 @@ func TestAccountErrorIncludesRedactedReason(t *testing.T) {
 // TestRequestErrorsRedactsAPIKey verifies that network-level request errors
 // (a *url.Error whose message embeds the request URL, and therefore the
 // apikey query parameter) are returned with the API key redacted, so they
-// can be logged without leaking the key.
+// can be logged without leaking the key. A key with URL-special characters
+// is exercised too, so the QueryEscape/PathEscape replacement arms run:
+// the request URL carries the key in its escaped form.
 func TestRequestErrorsRedactsAPIKey(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	baseURL := server.URL + "/api/"
@@ -135,13 +137,38 @@ func TestRequestErrorsRedactsAPIKey(t *testing.T) {
 	// a *url.Error containing the full request URL.
 	server.Close()
 
-	client := NewPremiumizemeClient("super-secret-api-key")
-	client.APIBaseURL = baseURL
+	for _, apiKey := range []string{"super-secret-api-key", "my key+with/special&chars"} {
+		client := NewPremiumizemeClient(apiKey)
+		client.APIBaseURL = baseURL
 
-	if _, err := client.GetTransfers(); err == nil || !strings.Contains(err.Error(), "[REDACTED]") || strings.Contains(err.Error(), "super-secret-api-key") {
-		t.Fatalf("GetTransfers error = %v, want a network error with the API key redacted", err)
-	}
-	if err := client.DeleteTransfer("t1"); err == nil || !strings.Contains(err.Error(), "[REDACTED]") || strings.Contains(err.Error(), "super-secret-api-key") {
-		t.Fatalf("DeleteTransfer error = %v, want a network error with the API key redacted", err)
+		operations := []struct {
+			name string
+			run  func() error
+		}{
+			{
+				name: "GetTransfers",
+				run: func() error {
+					_, err := client.GetTransfers()
+					return err
+				},
+			},
+			{
+				name: "DeleteTransfer",
+				run: func() error {
+					return client.DeleteTransfer("t1")
+				},
+			},
+		}
+		for _, op := range operations {
+			err := op.run()
+			if err == nil || !strings.Contains(err.Error(), "[REDACTED]") {
+				t.Fatalf("%s with key %q: error = %v, want a network error containing [REDACTED]", op.name, apiKey, err)
+			}
+			for _, secret := range []string{apiKey, url.QueryEscape(apiKey), url.PathEscape(apiKey)} {
+				if secret != "" && strings.Contains(err.Error(), secret) {
+					t.Fatalf("%s with key %q: error leaks the API key (form %q): %v", op.name, apiKey, secret, err)
+				}
+			}
+		}
 	}
 }

@@ -135,7 +135,7 @@ func (pm *Premiumizeme) GetTransfers() ([]Transfer, error) {
 	var ret []Transfer
 	req, _ := http.NewRequest("GET", url.String(), nil)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := pm.httpClient().Do(req)
 	if err != nil {
 		return ret, pm.redactRequestError(err)
 	}
@@ -179,7 +179,7 @@ func (pm *Premiumizeme) ListFolder(folderID string) ([]Item, error) {
 
 	resp, err := client.Do(request)
 	if err != nil {
-		return ret, err
+		return ret, pm.redactRequestError(err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -218,7 +218,7 @@ func (pm *Premiumizeme) GetFolders() ([]Item, error) {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return ret, err
+		return ret, pm.redactRequestError(err)
 	}
 
 	defer resp.Body.Close()
@@ -277,7 +277,7 @@ func (pm *Premiumizeme) CreateTransfer(filePath string, parentID string) error {
 
 	resp, err := pm.httpClient().Do(request)
 	if err != nil {
-		return err
+		return pm.redactRequestError(err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -324,7 +324,7 @@ func (pm *Premiumizeme) DeleteFolder(folderID string) error {
 
 	resp, err := client.Do(request)
 	if err != nil {
-		return err
+		return pm.redactRequestError(err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -372,7 +372,7 @@ func (pm *Premiumizeme) MoveItem(itemID string, folderID string) error {
 
 	resp, err := client.Do(request)
 	if err != nil {
-		return err
+		return pm.redactRequestError(err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -422,7 +422,7 @@ func (pm *Premiumizeme) CreateFolder(folderName string, parentID *string) (strin
 
 	resp, err := client.Do(request)
 	if err != nil {
-		return "", err
+		return "", pm.redactRequestError(err)
 	}
 	defer resp.Body.Close()
 
@@ -455,13 +455,12 @@ func (pm *Premiumizeme) DeleteTransfer(id string) error {
 		return err
 	}
 
-	client := &http.Client{}
 	request, err := createDeleteRequest(id, &url)
 	if err != nil {
 		return err
 	}
 
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return pm.redactRequestError(err)
 	}
@@ -685,7 +684,7 @@ func (pm *Premiumizeme) generateZip(ID string, srcType SRCType) (string, error) 
 	client := &http.Client{}
 	resp, err := client.Do(request)
 	if err != nil {
-		return "", err
+		return "", pm.redactRequestError(err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -737,7 +736,7 @@ func (pm *Premiumizeme) GenerateFileLink(ID string) (string, error) {
 
 	resp, err := client.Do(request)
 	if err != nil {
-		return "", err
+		return "", pm.redactRequestError(err)
 	}
 
 	if resp.StatusCode != 200 {

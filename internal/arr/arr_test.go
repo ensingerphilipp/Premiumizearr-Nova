@@ -244,6 +244,50 @@ func runMultipleGrabbedRecordsTest(t *testing.T, newArr newArrFunc, apiVersion s
 	}
 }
 
+// runHistoryContainsFreshForcesRefetchTest verifies that
+// HistoryContainsFresh actually forces a history refetch: while the cache
+// (ArrHistoryUpdateIntervalSeconds) has not expired, a plain HistoryContains
+// still serves the stale cached records, but HistoryContainsFresh sees the
+// records the *arr currently reports.
+func runHistoryContainsFreshForcesRefetchTest(t *testing.T, newArr newArrFunc, apiVersion string) {
+	t.Helper()
+
+	const (
+		releaseName  = "Show.S01E01.720p.WEB.x264-GRP.mkv"
+		transferName = releaseName + ".nzb"
+	)
+
+	fake := newFakeArrServer(t, apiVersion, []fakeHistoryRecord{
+		{ID: 101, EventType: "grabbed", SourceTitle: releaseName, Message: "Grabbed", Date: "2026-08-02T12:00:00.0000000Z"},
+	})
+	a := newArr(fake.URL)
+
+	id, found, err := a.HistoryContains(transferName)
+	if err != nil || !found || id != 101 {
+		t.Fatalf("HistoryContains(%q) = (%d, %v, %v), want (101, true, nil)", transferName, id, found, err)
+	}
+
+	// The *arr history changes (the grab was rolled back), but the cache
+	// has not expired yet: a plain lookup serves the stale cache.
+	fake.records = nil
+	id, found, err = a.HistoryContains(transferName)
+	if err != nil {
+		t.Fatalf("cached HistoryContains(%q) error = %v, want nil", transferName, err)
+	}
+	if !found {
+		t.Fatalf("cached HistoryContains(%q) = not found, want the stale cached record (the cache has not expired)", transferName)
+	}
+
+	// The fresh lookup must refetch and see the updated history.
+	id, found, err = a.HistoryContainsFresh(transferName)
+	if err != nil {
+		t.Fatalf("HistoryContainsFresh(%q) error = %v, want nil", transferName, err)
+	}
+	if found {
+		t.Fatalf("HistoryContainsFresh(%q) = found (id %d), want not found: the forced refetch must see the updated history", transferName, id)
+	}
+}
+
 // runOnlyNonGrabbedRecordsTest verifies that a transfer name that only
 // matches non-grabbed history records (an old download failure for the same
 // release) is reported as not in history, so the caller does not delete the

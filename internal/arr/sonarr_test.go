@@ -84,6 +84,13 @@ func TestHistoryContainsResolvesNewestOfMultipleGrabbedRecords(t *testing.T) {
 	runMultipleGrabbedRecordsTest(t, newTestSonarrArr, "v3")
 }
 
+// TestSonarrHistoryContainsFreshForcesRefetch verifies that
+// HistoryContainsFresh forces a history refetch instead of serving the
+// still-fresh cache.
+func TestSonarrHistoryContainsFreshForcesRefetch(t *testing.T) {
+	runHistoryContainsFreshForcesRefetchTest(t, newTestSonarrArr, "v3")
+}
+
 // TestHistoryContainsOnlyNonGrabbedRecords verifies that a release name
 // present only as non-grabbed history (e.g. an old download failure) is
 // reported as not in history, keeping the "Not in History" trace line.

@@ -259,7 +259,16 @@ func (manager *TransferManagerService) processErroredTransfer(transfer *premiumi
 	// period), so force a fresh lookup before deleting: a fresh match is
 	// reported to the *arr like any other match, a fresh lookup failure
 	// keeps the transfer, and only a fresh authoritative no-match deletes.
-	matched, matchedID, allLookupsSucceeded = manager.searchArrHistory(arrClients, transfer, true)
+	// The *arr set is re-fetched for the deletion decision because a
+	// config update may have changed it since the poll started: an *arr
+	// added mid-poll must be consulted before anything is deleted, and an
+	// *arr set that became empty makes the no-match non-authoritative.
+	freshClients := manager.arrsManager.GetArrs()
+	if len(freshClients) == 0 {
+		log.Debugf("Errored transfer %s (id %s) is kept because no *arr client is configured for the deletion decision", transfer.Name, transfer.ID)
+		return
+	}
+	matched, matchedID, allLookupsSucceeded = manager.searchArrHistory(freshClients, transfer, true)
 	if matched != nil {
 		if !manager.beginErroredTransferProcessing(transfer.ID) {
 			log.Debugf("Errored transfer %s (id %s) is already being processed, skipping this poll", transfer.Name, transfer.ID)
@@ -346,24 +355,56 @@ func (manager *TransferManagerService) reportErroredTransferToArr(arrClient arr.
 		log.Errorf("Error reporting errored transfer %s (id %s) to %s, retrying on next poll: %s", transfer.Name, transfer.ID, arrClient.GetArrName(), err.Error())
 		return
 	}
-	log.Infof("Errored transfer %s (id %s) reported as failed in %s and deleted from premiumize.me", transfer.Name, transfer.ID, arrClient.GetArrName())
+	log.Infof("Errored transfer %s (id %s) handed to %s for the failure report and deleted from premiumize.me", transfer.Name, transfer.ID, arrClient.GetArrName())
 	manager.completeAndForgetErroredTransfer(transfer.ID)
 }
 
 // deleteUnmatchedErroredTransfer deletes an errored transfer that stayed
-// unmatched on every reachable *arr for the whole grace period. The
-// warning carries the transfer ID, name and error so the deletion stays
-// auditable. The per-transfer processing slot is always released; the
-// tracking state is removed only after a successful deletion, so a failed
-// deletion is retried on the next poll.
+// unmatched on every reachable *arr for the whole grace period. Because
+// the delete is irreversible, the transfer is re-listed first and only
+// deleted while it is still errored: a transfer premiumize repaired (or
+// removed) in the meantime is settled instead of deleted, and a failed
+// re-list keeps the state for a retry. The warning carries the transfer
+// ID, name and error so the deletion stays auditable. The per-transfer
+// processing slot is always released; the tracking state is removed only
+// after a successful deletion, so a failed deletion is retried on the
+// next poll.
 func (manager *TransferManagerService) deleteUnmatchedErroredTransfer(transfer *premiumizeme.Transfer) {
 	defer manager.finishErroredTransferProcessing(transfer.ID)
+	stillErrored, err := manager.transferStillErrored(transfer.ID)
+	if err != nil {
+		log.Errorf("Failed to re-check errored transfer %s (id %s) before deleting it, retrying on next poll: %s", transfer.Name, transfer.ID, err.Error())
+		return
+	}
+	if !stillErrored {
+		log.Infof("Errored transfer %s (id %s) is no longer errored or no longer listed, not deleting it", transfer.Name, transfer.ID)
+		manager.completeAndForgetErroredTransfer(transfer.ID)
+		return
+	}
 	if err := manager.premiumizemeClient.DeleteTransfer(transfer.ID); err != nil {
 		log.Errorf("Failed to delete unmatched errored transfer %s (id %s) from premiumize.me, retrying on next poll: %s", transfer.Name, transfer.ID, err.Error())
 		return
 	}
 	log.Warnf("Deleted errored transfer %q (id %s) from premiumize.me after the grace period without a *arr history match; transfer error: %s", transfer.Name, transfer.ID, transfer.Message)
 	manager.completeAndForgetErroredTransfer(transfer.ID)
+}
+
+// transferStillErrored re-fetches the premiumize.me transfer list and
+// reports whether the transfer with id is still present and still errored
+// (the status captured at poll start may be stale by the time the delete
+// runs). It returns (false, nil) when the transfer is gone or no longer
+// errored and (false, err) when the list could not be fetched.
+func (manager *TransferManagerService) transferStillErrored(id string) (bool, error) {
+	transfers, err := manager.premiumizemeClient.GetTransfers()
+	if err != nil {
+		return false, err
+	}
+	for _, t := range transfers {
+		if t.ID == id {
+			return t.Status == "error", nil
+		}
+	}
+	return false, nil
 }
 
 // maxErroredTransferGraceSeconds caps the configured grace period so an

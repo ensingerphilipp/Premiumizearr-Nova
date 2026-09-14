@@ -79,19 +79,31 @@ func (c *fakeClock) Advance(d time.Duration) {
 // transfer manager uses (transfer list + transfer delete). A successful
 // delete removes the transfer from the list, as on premiumize.me. Delete
 // calls can be made to fail a bounded number of times and to block until
-// released, so a test can pin a delete in flight; the list call can be
-// made to fail a bounded number of times as well.
+// released, so a test can pin a delete in flight (per transfer ID, so one
+// pinned delete does not hold up the others); the list call can be made
+// to fail a bounded number of times as well.
 type fakePremiumize struct {
 	*httptest.Server
 	*premiumizeme.Premiumizeme
 	events *eventLog
 
-	mu          sync.Mutex
-	transfers   []premiumizeme.Transfer
-	deleted     []string
-	failDeletes int                // remaining delete calls to answer with an error
-	failList    int                // remaining list calls to answer with an error
-	blockDelete chan chan struct{} // when non-nil, each delete handler blocks until its release channel is closed
+	mu             sync.Mutex
+	transfers      []premiumizeme.Transfer
+	deleted        []string
+	failDeletes    int                      // remaining delete calls to answer with an error
+	failList       int                      // remaining list calls to answer with an error
+	blockedDeletes map[string]chan struct{} // when non-nil, each delete handler for a listed id blocks until its release channel is closed
+}
+
+// blockDeletes enables per-ID delete pinning: every subsequent delete
+// handler registers its release channel in blockedDeletes and waits on it
+// before applying the delete.
+func (fake *fakePremiumize) blockDeletes() {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.blockedDeletes == nil {
+		fake.blockedDeletes = make(map[string]chan struct{})
+	}
 }
 
 func newFakePremiumize(t *testing.T, transfers []premiumizeme.Transfer) *fakePremiumize {
@@ -147,13 +159,13 @@ func newFakePremiumize(t *testing.T, transfers []premiumizeme.Transfer) *fakePre
 			failed = true
 		}
 		var release chan struct{}
-		if fake.blockDelete != nil {
+		if fake.blockedDeletes != nil {
 			release = make(chan struct{})
+			fake.blockedDeletes[id] = release
 		}
 		fake.mu.Unlock()
 
 		if release != nil {
-			fake.blockDelete <- release
 			<-release
 		}
 
@@ -198,6 +210,26 @@ func newFakePremiumize(t *testing.T, transfers []premiumizeme.Transfer) *fakePre
 	fake.Premiumizeme = &pm
 
 	return fake
+}
+
+// awaitBlockedDelete blocks until the fake's delete handler for id has
+// started and is pinned by its release channel, then returns that channel;
+// closing it releases the handler.
+func (fake *fakePremiumize) awaitBlockedDelete(t *testing.T, id string) chan struct{} {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		fake.mu.Lock()
+		release := fake.blockedDeletes[id]
+		fake.mu.Unlock()
+		if release != nil {
+			return release
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for the delete of %s to start", id)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // setTransfers replaces the transfer list the fake serves.
@@ -253,26 +285,33 @@ func waitForProcessing(t *testing.T, m *TransferManagerService) {
 }
 
 // fakeArr is an in-memory arr.IArr for service tests. When lookupErr is set
-// the history lookup fails (an arr outage). When hasMatch is set the
-// transfer name is in the history with grabbed record ID matchedID. When
+// the history lookup fails (an arr outage). When hasMatch is set, every
+// transfer name is in the history with grabbed record ID matchedID;
+// matchByName scopes the match to specific names (checked first). When
 // freshMatch is set, only the fresh lookup (a forced history refetch)
-// reports the match: the cached lookup is older than a recent grab.
-// HandleErrorTransfer mirrors the real wrapper contract: the history item
-// is marked failed first (recorded in the shared event log), then the
-// premiumize.me transfer is deleted via the given client.
+// reports the match: the cached lookup is older than a recent grab. When
+// freshErr is set, only the fresh lookup fails (a forced history refetch
+// going down). HandleErrorTransfer mirrors the real wrapper contract: the
+// history item is marked failed first (recorded in the shared event log),
+// then the premiumize.me transfer is deleted via the given client.
 type fakeArr struct {
-	name       string
-	hasMatch   bool
-	matchedID  int64
-	lookupErr  error
-	failErr    error
-	freshMatch bool
-	events     *eventLog
+	name        string
+	hasMatch    bool
+	matchedID   int64
+	matchByName map[string]int64
+	lookupErr   error
+	freshErr    error
+	failErr     error
+	freshMatch  bool
+	events      *eventLog
 }
 
-func (f *fakeArr) HistoryContains(_ string) (int64, bool, error) {
+func (f *fakeArr) HistoryContains(name string) (int64, bool, error) {
 	if f.lookupErr != nil {
 		return -1, false, f.lookupErr
+	}
+	if id, ok := f.matchByName[name]; ok {
+		return id, true, nil
 	}
 	if f.hasMatch {
 		return f.matchedID, true, nil
@@ -283,6 +322,9 @@ func (f *fakeArr) HistoryContains(_ string) (int64, bool, error) {
 func (f *fakeArr) HistoryContainsFresh(name string) (int64, bool, error) {
 	if f.events != nil {
 		f.events.record("fresh:" + f.name)
+	}
+	if f.freshErr != nil {
+		return -1, false, f.freshErr
 	}
 	if f.freshMatch {
 		return f.matchedID, true, nil
@@ -401,6 +443,13 @@ func TestErroredTransferUnmatchedDeletedAfterGraceExpiry(t *testing.T) {
 	waitForEvent(t, fake, "deleted:t1", 1)
 	waitForProcessing(t, m)
 
+	// The tracking state must already be gone before any further poll:
+	// the successful delete settled it itself, it must not rely on the
+	// next poll's prune.
+	if got := trackingCount(m); got != 0 {
+		t.Fatalf("tracking count right after the successful delete = %d, want 0 (settled by the success path, not a later poll)", got)
+	}
+
 	if got := fake.events.countEvent("delete:t1"); got != 1 {
 		t.Fatalf("delete attempts after grace expiry = %d, want exactly 1", got)
 	}
@@ -409,8 +458,7 @@ func TestErroredTransferUnmatchedDeletedAfterGraceExpiry(t *testing.T) {
 	}
 
 	// The successful delete removed the transfer from the list; the next
-	// poll runs synchronously and must clear the tracking state without
-	// another delete attempt.
+	// poll runs synchronously and must not start another delete attempt.
 	m.TaskUpdateTransfersList()
 	if got := trackingCount(m); got != 0 {
 		t.Fatalf("tracking count after deletion = %d, want 0", got)
@@ -486,6 +534,12 @@ func TestErroredTransferMatchedReportedFailedBeforeDelete(t *testing.T) {
 	if got := fake.events.countEvent("delete:t1"); got != 1 {
 		t.Fatalf("delete attempts = %d, want exactly 1", got)
 	}
+	// The tracking state must already be gone before any further poll:
+	// the successful report/delete settled it itself, it must not rely on
+	// the next poll's prune.
+	if got := trackingCount(m); got != 0 {
+		t.Fatalf("tracking count right after the successful report/delete = %d, want 0 (settled by the success path, not a later poll)", got)
+	}
 
 	m.TaskUpdateTransfersList() // the deleted transfer is gone from the list
 	if got := trackingCount(m); got != 0 {
@@ -558,12 +612,10 @@ func TestErroredTransferRepeatedPollingNoDuplicates(t *testing.T) {
 
 	// Pin the in-flight delete: the fake blocks until the release channel
 	// is closed, so the report goroutine holds the processing slot.
-	fake.mu.Lock()
-	fake.blockDelete = make(chan chan struct{})
-	fake.mu.Unlock()
+	fake.blockDeletes()
 
 	m.TaskUpdateTransfersList() // poll 1: spawns the report, delete blocks in flight
-	release := <-fake.blockDelete
+	release := fake.awaitBlockedDelete(t, "t1")
 	m.TaskUpdateTransfersList() // poll 2 while in flight: must be skipped
 	m.TaskUpdateTransfersList() // poll 3 while in flight: must be skipped
 	close(release)
@@ -962,5 +1014,329 @@ func TestErroredTransferGracePeriodFromConfig(t *testing.T) {
 	waitForProcessing(t, m2)
 	if ids := fake2.deletedIDs(); len(ids) != 1 || ids[0] != "t2" {
 		t.Fatalf("deleted ids = %v, want [t2]", ids)
+	}
+}
+
+// TestErroredTransferFreshLookupFailureNeverDeletes verifies the last gate
+// before an unmatched deletion: when the grace-expired FRESH history
+// lookup fails on an *arr (an outage that started after the cached
+// lookup), the no-match is not authoritative and the transfer is kept
+// until the *arr answers again.
+func TestErroredTransferFreshLookupFailureNeverDeletes(t *testing.T) {
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
+	clock := newFakeClock()
+	sonarr := &fakeArr{name: "Sonarr", events: fake.events}
+	m := newErroredTransferTestService(t, fake, clock, sonarr)
+
+	m.TaskUpdateTransfersList() // first seen at T0, cached lookup: no match
+	clock.Advance(5 * time.Minute)
+
+	// The forced history refetch goes down: the fresh no-match is not
+	// authoritative, so the transfer must be kept.
+	sonarr.freshErr = errors.New("sonarr history refetch failed")
+	m.TaskUpdateTransfersList()
+	if got := fake.events.countEvent("fresh:Sonarr"); got != 1 {
+		t.Fatalf("fresh lookups = %d, want 1 (the grace-expired path must force a fresh lookup)", got)
+	}
+	if got := fake.events.countEvent("delete:t1"); got != 0 {
+		t.Fatalf("delete attempts after a failed fresh lookup = %d, want 0 (a lookup failure is not a no-match)", got)
+	}
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count after a failed fresh lookup = %d, want 1 (kept for the next poll)", got)
+	}
+
+	// The *arr recovers and the fresh lookup confirms the no-match: the
+	// long-expired grace period now deletes the transfer.
+	sonarr.freshErr = nil
+	m.TaskUpdateTransfersList()
+	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
+	if ids := fake.deletedIDs(); len(ids) != 1 || ids[0] != "t1" {
+		t.Fatalf("deleted ids = %v, want [t1] after the fresh lookup recovered", ids)
+	}
+}
+
+// TestErroredTrackingNotStoppedWhileProcessingInFlight verifies that the
+// poller-side "no longer errored" stop path does not remove the tracking
+// state of a transfer whose report/delete goroutine is still in flight:
+// the goroutine still owns the processing slot and settles the state.
+func TestErroredTrackingNotStoppedWhileProcessingInFlight(t *testing.T) {
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
+	clock := newFakeClock()
+	m := newErroredTransferTestService(t, fake, clock,
+		&fakeArr{name: "Sonarr", hasMatch: true, matchedID: 101, events: fake.events},
+	)
+	fake.blockDeletes()
+
+	m.TaskUpdateTransfersList() // match: report spawned, delete pinned in flight
+	release := fake.awaitBlockedDelete(t, "t1")
+
+	// The transfer stops being errored while processing is in flight:
+	// the stop path must skip the in-flight entry instead of removing it.
+	done := erroredTransfer("t1")
+	done.Status = "completed"
+	fake.setTransfers(t, []premiumizeme.Transfer{done})
+	m.TaskUpdateTransfersList()
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count while processing is in flight = %d, want 1 (the stop path must not remove an in-flight entry)", got)
+	}
+
+	close(release)
+	waitForProcessing(t, m)
+	if got := fake.events.countEvent("fail:101"); got != 1 {
+		t.Fatalf("failure reports = %d, want exactly 1", got)
+	}
+	if got := fake.events.countEvent("delete:t1"); got != 1 {
+		t.Fatalf("delete attempts = %d, want exactly 1", got)
+	}
+	if ids := fake.deletedIDs(); len(ids) != 1 || ids[0] != "t1" {
+		t.Fatalf("deleted ids = %v, want [t1]", ids)
+	}
+	if got := trackingCount(m); got != 0 {
+		t.Fatalf("tracking count after the in-flight processing settled = %d, want 0", got)
+	}
+}
+
+// TestErroredTrackingNotPrunedWhileProcessingInFlight verifies that
+// pruneErroredTransfers does not remove the tracking state of a transfer
+// that disappeared from the list while its report/delete goroutine is
+// still in flight: the goroutine still owns the processing slot and
+// settles the state.
+func TestErroredTrackingNotPrunedWhileProcessingInFlight(t *testing.T) {
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
+	clock := newFakeClock()
+	m := newErroredTransferTestService(t, fake, clock,
+		&fakeArr{name: "Sonarr", hasMatch: true, matchedID: 101, events: fake.events},
+	)
+	fake.blockDeletes()
+
+	m.TaskUpdateTransfersList() // match: report spawned, delete pinned in flight
+	release := fake.awaitBlockedDelete(t, "t1")
+
+	// The transfer disappears from the list while processing is in
+	// flight: the prune path must skip the in-flight entry.
+	fake.setTransfers(t, nil)
+	m.TaskUpdateTransfersList()
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count while processing is in flight = %d, want 1 (the prune path must not remove an in-flight entry)", got)
+	}
+
+	close(release)
+	waitForProcessing(t, m)
+	if got := fake.events.countEvent("fail:101"); got != 1 {
+		t.Fatalf("failure reports = %d, want exactly 1", got)
+	}
+	if got := fake.events.countEvent("delete:t1"); got != 1 {
+		t.Fatalf("delete attempts = %d, want exactly 1", got)
+	}
+	if got := trackingCount(m); got != 0 {
+		t.Fatalf("tracking count after the in-flight processing settled = %d, want 0", got)
+	}
+}
+
+// TestErroredTransferDeletePathInFlightSkipsRepeatedPolls verifies the
+// in-flight skip on the UNMATCHED delete path: while one delete of a
+// grace-expired transfer is in flight, repeated polls must not spawn a
+// second one, so the transfer is deleted exactly once.
+func TestErroredTransferDeletePathInFlightSkipsRepeatedPolls(t *testing.T) {
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
+	clock := newFakeClock()
+	m := newErroredTransferTestService(t, fake, clock, &fakeArr{name: "Sonarr"})
+	fake.blockDeletes()
+
+	m.TaskUpdateTransfersList() // first seen at T0
+	clock.Advance(5 * time.Minute)
+
+	m.TaskUpdateTransfersList() // grace expired: delete spawned, pinned in flight
+	release := fake.awaitBlockedDelete(t, "t1")
+
+	// Repeated polls while the delete is in flight: all must skip.
+	for i := 0; i < 2; i++ {
+		clock.Advance(24 * time.Hour)
+		m.TaskUpdateTransfersList()
+	}
+	if got := fake.events.countEvent("delete:t1"); got != 1 {
+		t.Fatalf("delete attempts while one is in flight = %d, want 1 (repeated polls must skip the in-flight transfer)", got)
+	}
+
+	close(release)
+	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
+	if got := fake.events.countEvent("delete:t1"); got != 1 {
+		t.Fatalf("delete attempts = %d, want exactly 1", got)
+	}
+	if ids := fake.deletedIDs(); len(ids) != 1 || ids[0] != "t1" {
+		t.Fatalf("deleted ids = %v, want [t1]", ids)
+	}
+
+	m.TaskUpdateTransfersList()
+	if got := trackingCount(m); got != 0 {
+		t.Fatalf("tracking count after completion = %d, want 0", got)
+	}
+}
+
+// TestErroredTransferFreshMatchInFlightSkipsRepeatedPolls verifies the
+// in-flight skip on the FRESH-match path: while one report/delete for a
+// fresh-lookup match is in flight, repeated polls (which also find the
+// fresh match) must not spawn a second one.
+func TestErroredTransferFreshMatchInFlightSkipsRepeatedPolls(t *testing.T) {
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
+	clock := newFakeClock()
+	m := newErroredTransferTestService(t, fake, clock,
+		&fakeArr{name: "Sonarr", freshMatch: true, matchedID: 101, events: fake.events},
+	)
+	fake.blockDeletes()
+
+	m.TaskUpdateTransfersList() // cached lookup: no match, within grace
+	clock.Advance(5 * time.Minute)
+
+	m.TaskUpdateTransfersList() // grace expired: fresh match, report spawned, delete pinned
+	release := fake.awaitBlockedDelete(t, "t1")
+
+	// Repeated polls while in flight: each re-runs the fresh lookup and
+	// finds the same match, but must skip (the slot is held).
+	for i := 0; i < 2; i++ {
+		clock.Advance(24 * time.Hour)
+		m.TaskUpdateTransfersList()
+	}
+	if got := fake.events.countEvent("delete:t1"); got != 1 {
+		t.Fatalf("delete attempts while one is in flight = %d, want 1 (repeated fresh matches must skip the in-flight transfer)", got)
+	}
+	if got := fake.events.countEvent("fresh:Sonarr"); got != 3 {
+		t.Fatalf("fresh lookups = %d, want 3 (one per grace-expired poll)", got)
+	}
+
+	close(release)
+	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
+	if got := fake.events.countEvent("fail:101"); got != 1 {
+		t.Fatalf("failure reports = %d, want exactly 1", got)
+	}
+	if got := fake.events.countEvent("delete:t1"); got != 1 {
+		t.Fatalf("delete attempts = %d, want exactly 1", got)
+	}
+	if ids := fake.deletedIDs(); len(ids) != 1 || ids[0] != "t1" {
+		t.Fatalf("deleted ids = %v, want [t1]", ids)
+	}
+
+	m.TaskUpdateTransfersList()
+	if got := trackingCount(m); got != 0 {
+		t.Fatalf("tracking count after completion = %d, want 0", got)
+	}
+}
+
+// TestErroredTransferProcessingIsolatedPerTransferID verifies that the
+// processing slots are per transfer ID: while one transfer's delete is
+// pinned in flight, a second errored transfer is reported and deleted
+// independently, and settling the first does not duplicate or disturb the
+// second.
+func TestErroredTransferProcessingIsolatedPerTransferID(t *testing.T) {
+	secondName := "Other.Release.720p.WEB.x264-GRP.mkv.nzb"
+	second := erroredTransfer("t2")
+	second.Name = secondName
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1"), second})
+	clock := newFakeClock()
+	m := newErroredTransferTestService(t, fake, clock,
+		// Each *arr matches exactly one of the two transfers, so the two
+		// report/delete goroutines run against different *arrs.
+		&fakeArr{name: "Sonarr", matchByName: map[string]int64{testErroredTransferName: 101}, events: fake.events},
+		&fakeArr{name: "Radarr", matchByName: map[string]int64{secondName: 201}, events: fake.events},
+	)
+	fake.blockDeletes()
+
+	m.TaskUpdateTransfersList() // both transfers match (different *arrs): both reports in flight
+	release1 := fake.awaitBlockedDelete(t, "t1")
+	release2 := fake.awaitBlockedDelete(t, "t2")
+
+	// Both deletes pinned: nothing may have been deleted yet.
+	if got := fake.events.countEvent("delete:t1"); got != 1 {
+		t.Fatalf("delete:t1 attempts before release = %d, want 1 (attempt started, delete pinned)", got)
+	}
+	if got := fake.events.countEvent("delete:t2"); got != 1 {
+		t.Fatalf("delete:t2 attempts before release = %d, want 1 (attempt started, delete pinned)", got)
+	}
+	if ids := fake.deletedIDs(); len(ids) != 0 {
+		t.Fatalf("deleted ids before release = %v, want none (both deletes are pinned)", ids)
+	}
+
+	// Release the first delete: it settles independently of the second.
+	close(release1)
+	waitForEvent(t, fake, "deleted:t1", 1)
+	if got := fake.events.countEvent("delete:t2"); got != 1 {
+		t.Fatalf("delete:t2 attempts after the first settled = %d, want 1 (the second must stay in flight, not be duplicated)", got)
+	}
+	if ids := fake.deletedIDs(); len(ids) != 1 || ids[0] != "t1" {
+		t.Fatalf("deleted ids after the first settled = %v, want [t1]", ids)
+	}
+
+	// A poll while the second delete is still in flight must skip it.
+	m.TaskUpdateTransfersList()
+	if got := fake.events.countEvent("delete:t2"); got != 1 {
+		t.Fatalf("delete:t2 attempts after a concurrent poll = %d, want 1 (the in-flight second must be skipped)", got)
+	}
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count with the second still in flight = %d, want 1 (only the second remains)", got)
+	}
+
+	close(release2)
+	waitForEvent(t, fake, "deleted:t2", 1)
+	waitForProcessing(t, m)
+	if got := fake.events.countEvent("fail:101"); got != 1 {
+		t.Fatalf("failure reports to Sonarr = %d, want exactly 1", got)
+	}
+	if got := fake.events.countEvent("fail:201"); got != 1 {
+		t.Fatalf("failure reports to Radarr = %d, want exactly 1", got)
+	}
+	if got := fake.events.countEvent("delete:t1"); got != 1 {
+		t.Fatalf("delete:t1 attempts = %d, want exactly 1", got)
+	}
+	if got := fake.events.countEvent("delete:t2"); got != 1 {
+		t.Fatalf("delete:t2 attempts = %d, want exactly 1", got)
+	}
+	ids := fake.deletedIDs()
+	if len(ids) != 2 || ids[0] != "t1" || ids[1] != "t2" {
+		t.Fatalf("deleted ids = %v, want [t1 t2]", ids)
+	}
+
+	m.TaskUpdateTransfersList()
+	if got := trackingCount(m); got != 0 {
+		t.Fatalf("tracking count after both settled = %d, want 0", got)
+	}
+}
+
+// TestErroredTrackingListFailureKeepsOriginalFirstSeen verifies that a
+// failed transfer-list poll does not reset the grace period: the first
+// seen time from the successful poll stands, so the grace period that
+// spans the failed poll still expires and deletes.
+func TestErroredTrackingListFailureKeepsOriginalFirstSeen(t *testing.T) {
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
+	clock := newFakeClock()
+	m := newErroredTransferTestService(t, fake, clock, &fakeArr{name: "Sonarr"})
+
+	m.TaskUpdateTransfersList() // first seen at T0
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count after first poll = %d, want 1", got)
+	}
+
+	// Halfway through the 5 minute grace period the transfer list fails:
+	// the poll aborts before it can touch the tracking state.
+	clock.Advance(2*time.Minute + 30*time.Second)
+	fake.mu.Lock()
+	fake.failList = 1
+	fake.mu.Unlock()
+	m.TaskUpdateTransfersList()
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count after a failed list poll = %d, want 1", got)
+	}
+
+	// Halfway again (5 minutes after T0 in total): the grace period is
+	// measured from the ORIGINAL first-seen time, so it has now expired
+	// and the unmatched transfer is deleted.
+	clock.Advance(2*time.Minute + 30*time.Second)
+	m.TaskUpdateTransfersList()
+	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
+	if ids := fake.deletedIDs(); len(ids) != 1 || ids[0] != "t1" {
+		t.Fatalf("deleted ids = %v, want [t1] (the failed list poll must not reset the grace period)", ids)
 	}
 }

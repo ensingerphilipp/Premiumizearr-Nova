@@ -18,6 +18,13 @@ func TestLidarrHistoryContainsResolvesNewestOfMultipleGrabbedRecords(t *testing.
 	runMultipleGrabbedRecordsTest(t, newTestLidarrArr, "v1")
 }
 
+// TestLidarrHistoryContainsFreshForcesRefetch verifies that
+// HistoryContainsFresh forces a history refetch instead of serving the
+// still-fresh cache.
+func TestLidarrHistoryContainsFreshForcesRefetch(t *testing.T) {
+	runHistoryContainsFreshForcesRefetchTest(t, newTestLidarrArr, "v1")
+}
+
 // TestLidarrHistoryContainsOnlyNonGrabbedRecords verifies that a release name
 // present only as non-grabbed history (e.g. an old download failure) is
 // reported as not in history.
