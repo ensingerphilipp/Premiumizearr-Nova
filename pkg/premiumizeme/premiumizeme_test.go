@@ -123,3 +123,25 @@ func TestAccountErrorIncludesRedactedReason(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// TestRequestErrorsRedactsAPIKey verifies that network-level request errors
+// (a *url.Error whose message embeds the request URL, and therefore the
+// apikey query parameter) are returned with the API key redacted, so they
+// can be logged without leaking the key.
+func TestRequestErrorsRedactsAPIKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	baseURL := server.URL + "/api/"
+	// Closing the server makes the request fail at the network level with
+	// a *url.Error containing the full request URL.
+	server.Close()
+
+	client := NewPremiumizemeClient("super-secret-api-key")
+	client.APIBaseURL = baseURL
+
+	if _, err := client.GetTransfers(); err == nil || !strings.Contains(err.Error(), "[REDACTED]") || strings.Contains(err.Error(), "super-secret-api-key") {
+		t.Fatalf("GetTransfers error = %v, want a network error with the API key redacted", err)
+	}
+	if err := client.DeleteTransfer("t1"); err == nil || !strings.Contains(err.Error(), "[REDACTED]") || strings.Contains(err.Error(), "super-secret-api-key") {
+		t.Fatalf("DeleteTransfer error = %v, want a network error with the API key redacted", err)
+	}
+}

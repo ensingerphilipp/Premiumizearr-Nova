@@ -212,6 +212,38 @@ func runErrorTransferReportingTest(t *testing.T, newArr newArrFunc, apiVersion s
 	}
 }
 
+// runMultipleGrabbedRecordsTest verifies that when several grabbed history
+// records share the transfer's release name (repeated grabs of the same
+// release), HistoryContains resolves the newest one (highest id), so the
+// failure is reported against the record the *arr actually tried.
+func runMultipleGrabbedRecordsTest(t *testing.T, newArr newArrFunc, apiVersion string) {
+	t.Helper()
+
+	const (
+		releaseName  = "Show.S01E01.720p.WEB.x264-GRP.mkv"
+		transferName = releaseName + ".nzb"
+		olderID      = int64(101)
+		newerID      = int64(102)
+	)
+
+	fake := newFakeArrServer(t, apiVersion, []fakeHistoryRecord{
+		{ID: olderID, EventType: "grabbed", SourceTitle: releaseName, Message: "Grabbed", Date: "2026-08-01T12:00:00.0000000Z"},
+		{ID: newerID, EventType: "grabbed", SourceTitle: releaseName, Message: "Grabbed", Date: "2026-08-02T12:00:00.0000000Z"},
+	})
+
+	a := newArr(fake.URL)
+	id, found, err := a.HistoryContains(transferName)
+	if err != nil {
+		t.Fatalf("HistoryContains(%q) error = %v, want nil", transferName, err)
+	}
+	if !found {
+		t.Fatalf("HistoryContains(%q) = not found, want found", transferName)
+	}
+	if id != newerID {
+		t.Fatalf("HistoryContains(%q) id = %d, want %d (the newest grabbed record)", transferName, id, newerID)
+	}
+}
+
 // runOnlyNonGrabbedRecordsTest verifies that a transfer name that only
 // matches non-grabbed history records (an old download failure for the same
 // release) is reported as not in history, so the caller does not delete the

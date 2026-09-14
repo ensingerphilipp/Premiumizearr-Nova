@@ -89,6 +89,16 @@ func (arr *LidarrArr) HistoryContains(name string) (int64, bool, error) {
 	return grabbedID, true, nil
 }
 
+// HistoryContainsFresh is HistoryContains with a forced history refresh:
+// resetting LastUpdate makes the next GetHistory refetch from Lidarr, so a
+// deletion decision never relies on a cache older than a recent grab.
+func (arr *LidarrArr) HistoryContainsFresh(name string) (int64, bool, error) {
+	arr.LastUpdateMutex.Lock()
+	arr.LastUpdate = time.Time{}
+	arr.LastUpdateMutex.Unlock()
+	return arr.HistoryContains(name)
+}
+
 func (arr *LidarrArr) HandleErrorTransfer(transfer *premiumizeme.Transfer, arrID int64, pm *premiumizeme.Premiumizeme) error {
 	his, err := arr.GetHistory()
 	if err != nil {

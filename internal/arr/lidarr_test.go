@@ -11,6 +11,13 @@ func TestLidarrHistoryContainsResolvesNewestGrabbedRecord(t *testing.T) {
 	runErrorTransferReportingTest(t, newTestLidarrArr, "v1")
 }
 
+// TestLidarrHistoryContainsResolvesNewestOfMultipleGrabbedRecords verifies
+// that with several grabbed records sharing the release name, the newest
+// one is resolved so the failure lands on the record Lidarr actually tried.
+func TestLidarrHistoryContainsResolvesNewestOfMultipleGrabbedRecords(t *testing.T) {
+	runMultipleGrabbedRecordsTest(t, newTestLidarrArr, "v1")
+}
+
 // TestLidarrHistoryContainsOnlyNonGrabbedRecords verifies that a release name
 // present only as non-grabbed history (e.g. an old download failure) is
 // reported as not in history.

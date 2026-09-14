@@ -51,6 +51,11 @@ type IArr interface {
 	// treated as an authoritative no-match. (id, true, nil) is a match;
 	// (-1, false, nil) is an authoritative no-match.
 	HistoryContains(name string) (id int64, found bool, err error)
+	// HistoryContainsFresh is HistoryContains with a forced history
+	// refresh: the cached history may be older than a recent grab (the
+	// cache refreshes on ArrHistoryUpdateIntervalSeconds), so decisions
+	// that delete a transfer must be based on a fresh lookup.
+	HistoryContainsFresh(name string) (id int64, found bool, err error)
 	MarkHistoryItemAsFailed(int64) error
 	HandleErrorTransfer(*premiumizeme.Transfer, int64, *premiumizeme.Premiumizeme) error
 	GetArrName() string

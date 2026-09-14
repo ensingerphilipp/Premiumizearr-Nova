@@ -48,6 +48,7 @@ type TransferManagerService struct {
 	failedDownloads       map[string]time.Time // Maps item name to failure timestamp
 	erroredTransfersMutex *sync.Mutex
 	erroredTransfers      map[string]*erroredTransferState // Maps premiumize.me transfer ID to grace-period tracking state
+	processingWG          *sync.WaitGroup                  // Tracks in-flight report/delete goroutines so callers can synchronize with them
 	nowFunc               func() time.Time
 }
 
@@ -67,6 +68,7 @@ func (t TransferManagerService) New() TransferManagerService {
 	t.failedDownloads = make(map[string]time.Time, 0)
 	t.erroredTransfersMutex = &sync.Mutex{}
 	t.erroredTransfers = make(map[string]*erroredTransferState, 0)
+	t.processingWG = &sync.WaitGroup{}
 	t.nowFunc = time.Now
 	return t
 }
@@ -194,7 +196,7 @@ func (manager *TransferManagerService) TaskUpdateTransfersList() {
 		if transfer.Status != "error" {
 			// No longer errored: stop tracking so the transfer is not
 			// carried over into a later grace period.
-			manager.forgetErroredTransfer(transfer.ID)
+			manager.stopTrackingErroredTransfer(transfer.ID)
 			continue
 		}
 		manager.processErroredTransfer(transfer)
@@ -207,43 +209,36 @@ func (manager *TransferManagerService) TaskUpdateTransfersList() {
 // period has not elapsed, every poll re-checks all configured *arrs for a
 // matching grabbed history record; a match is handled immediately (the
 // *arr history item is marked failed first, then the transfer is deleted).
-// Only an authoritative no-match on every reachable *arr past the grace
-// period leads to deletion. A failed history lookup is never treated as a
-// no-match, so an *arr outage cannot cause automatic deletion.
+// Only an authoritative no-match on every configured *arr past the grace
+// period leads to deletion - and even then only after a fresh history
+// lookup, because the cached history may predate a recent grab. A failed
+// history lookup is never treated as a no-match, and with no *arr
+// configured there is nothing to notify, so neither case can cause
+// automatic deletion.
 func (manager *TransferManagerService) processErroredTransfer(transfer *premiumizeme.Transfer) {
 	now := manager.now()
 	state := manager.getOrTrackErroredTransfer(transfer.ID, now)
+	arrClients := manager.arrsManager.GetArrs()
 
-	var matched arr.IArr
-	var matchedID int64
-	allLookupsSucceeded := true
-	for _, arrClient := range manager.arrsManager.GetArrs() {
-		log.Tracef("Checking errored transfer %s against %s history", transfer.Name, arrClient.GetArrName())
-		arrID, found, err := arrClient.HistoryContains(transfer.Name)
-		if err != nil {
-			allLookupsSucceeded = false
-			log.Warnf("History lookup for errored transfer %s (id %s) against %s failed: %s - keeping the transfer, a lookup failure is not a no-match", transfer.Name, transfer.ID, arrClient.GetArrName(), err.Error())
-			continue
-		}
-		if !found {
-			log.Tracef("%s history doesn't contain %s", arrClient.GetArrName(), transfer.Name)
-			continue
-		}
-		log.Tracef("Found %s in %s history", transfer.Name, arrClient.GetArrName())
-		matched = arrClient
-		matchedID = arrID
-		break
+	if len(arrClients) == 0 {
+		// No *arr is configured, so the transfer cannot be verified
+		// against any history and no *arr could be notified about the
+		// failed download: keep it instead of deleting it.
+		log.Debugf("Errored transfer %s (id %s) is kept because no *arr client is configured", transfer.Name, transfer.ID)
+		return
 	}
 
+	matched, matchedID, allLookupsSucceeded := manager.searchArrHistory(arrClients, transfer, false)
 	if matched != nil {
 		if !manager.beginErroredTransferProcessing(transfer.ID) {
 			log.Debugf("Errored transfer %s (id %s) is already being processed, skipping this poll", transfer.Name, transfer.ID)
 			return
 		}
-		go manager.reportErroredTransferToArr(matched, matchedID, transfer)
+		manager.spawnErroredTransferProcessing(func() {
+			manager.reportErroredTransferToArr(matched, matchedID, transfer)
+		})
 		return
 	}
-
 	if !allLookupsSucceeded {
 		// At least one *arr could not be checked, so the no-match is not
 		// authoritative: an *arr outage must never lead to automatic
@@ -258,12 +253,85 @@ func (manager *TransferManagerService) processErroredTransfer(transfer *premiumi
 		return
 	}
 
+	// The grace period has elapsed with a no-match on every *arr, but the
+	// cached history may be older than a recent grab (the cache refreshes
+	// on ArrHistoryUpdateIntervalSeconds, independent of the grace
+	// period), so force a fresh lookup before deleting: a fresh match is
+	// reported to the *arr like any other match, a fresh lookup failure
+	// keeps the transfer, and only a fresh authoritative no-match deletes.
+	matched, matchedID, allLookupsSucceeded = manager.searchArrHistory(arrClients, transfer, true)
+	if matched != nil {
+		if !manager.beginErroredTransferProcessing(transfer.ID) {
+			log.Debugf("Errored transfer %s (id %s) is already being processed, skipping this poll", transfer.Name, transfer.ID)
+			return
+		}
+		manager.spawnErroredTransferProcessing(func() {
+			manager.reportErroredTransferToArr(matched, matchedID, transfer)
+		})
+		return
+	}
+	if !allLookupsSucceeded {
+		log.Debugf("Errored transfer %s (id %s) fresh history lookup did not succeed on every *arr, keeping it for the next poll", transfer.Name, transfer.ID)
+		return
+	}
+
 	log.Debugf("Errored transfer %s (id %s) still unmatched after the grace period of %s, deleting it", transfer.Name, transfer.ID, grace)
 	if !manager.beginErroredTransferProcessing(transfer.ID) {
 		log.Debugf("Errored transfer %s (id %s) is already being processed, skipping this poll", transfer.Name, transfer.ID)
 		return
 	}
-	go manager.deleteUnmatchedErroredTransfer(transfer)
+	manager.spawnErroredTransferProcessing(func() {
+		manager.deleteUnmatchedErroredTransfer(transfer)
+	})
+}
+
+// searchArrHistory checks the transfer name against the history of every
+// configured *arr and returns the first matching arr client plus its
+// grabbed record ID, or (nil, 0) when no *arr matched. When fresh is set,
+// each lookup refetches the history from the *arr instead of using the
+// cached copy, so a stale cache cannot hide a recent grab. The third
+// return value is true only when every *arr answered without an error,
+// which is what makes a no-match authoritative.
+func (manager *TransferManagerService) searchArrHistory(arrClients []arr.IArr, transfer *premiumizeme.Transfer, fresh bool) (arr.IArr, int64, bool) {
+	allLookupsSucceeded := true
+	var matched arr.IArr
+	var matchedID int64
+	for _, arrClient := range arrClients {
+		log.Tracef("Checking errored transfer %s against %s history", transfer.Name, arrClient.GetArrName())
+		var arrID int64
+		var found bool
+		var err error
+		if fresh {
+			arrID, found, err = arrClient.HistoryContainsFresh(transfer.Name)
+		} else {
+			arrID, found, err = arrClient.HistoryContains(transfer.Name)
+		}
+		if err != nil {
+			allLookupsSucceeded = false
+			log.Warnf("History lookup for errored transfer %s (id %s) against %s failed: %s - keeping the transfer, a lookup failure is not a no-match", transfer.Name, transfer.ID, arrClient.GetArrName(), err.Error())
+			continue
+		}
+		if !found {
+			log.Tracef("%s history doesn't contain %s", arrClient.GetArrName(), transfer.Name)
+			continue
+		}
+		log.Tracef("Found %s in %s history", transfer.Name, arrClient.GetArrName())
+		matched = arrClient
+		matchedID = arrID
+		break
+	}
+	return matched, matchedID, allLookupsSucceeded
+}
+
+// spawnErroredTransferProcessing runs fn in a goroutine counted in
+// processingWG, so callers can wait until all in-flight report/delete work
+// has settled.
+func (manager *TransferManagerService) spawnErroredTransferProcessing(fn func()) {
+	manager.processingWG.Add(1)
+	go func() {
+		defer manager.processingWG.Done()
+		fn()
+	}()
 }
 
 // reportErroredTransferToArr marks the matched *arr history record as
@@ -279,7 +347,7 @@ func (manager *TransferManagerService) reportErroredTransferToArr(arrClient arr.
 		return
 	}
 	log.Infof("Errored transfer %s (id %s) reported as failed in %s and deleted from premiumize.me", transfer.Name, transfer.ID, arrClient.GetArrName())
-	manager.forgetErroredTransfer(transfer.ID)
+	manager.completeAndForgetErroredTransfer(transfer.ID)
 }
 
 // deleteUnmatchedErroredTransfer deletes an errored transfer that stayed
@@ -295,8 +363,14 @@ func (manager *TransferManagerService) deleteUnmatchedErroredTransfer(transfer *
 		return
 	}
 	log.Warnf("Deleted errored transfer %q (id %s) from premiumize.me after the grace period without a *arr history match; transfer error: %s", transfer.Name, transfer.ID, transfer.Message)
-	manager.forgetErroredTransfer(transfer.ID)
+	manager.completeAndForgetErroredTransfer(transfer.ID)
 }
+
+// maxErroredTransferGraceSeconds caps the configured grace period so an
+// out-of-range value cannot overflow the duration arithmetic into a
+// negative grace (which would delete immediately); 10 years is
+// effectively "keep forever" for this purpose.
+const maxErroredTransferGraceSeconds = 10 * 365 * 24 * 60 * 60
 
 // erroredTransferGracePeriod returns the configured grace period for
 // unmatched errored transfers, falling back to the 5 minute default when
@@ -307,6 +381,9 @@ func (manager *TransferManagerService) erroredTransferGracePeriod() time.Duratio
 	seconds := manager.config.ErroredTransferDeleteGracePeriodSeconds
 	if seconds <= 0 {
 		return 5 * time.Minute
+	}
+	if seconds > maxErroredTransferGraceSeconds {
+		seconds = maxErroredTransferGraceSeconds
 	}
 	return time.Duration(seconds) * time.Second
 }
@@ -350,7 +427,10 @@ func (manager *TransferManagerService) beginErroredTransferProcessing(id string)
 }
 
 // finishErroredTransferProcessing releases the per-transfer processing slot
-// after a report/delete attempt finished, whatever its outcome.
+// after a report/delete attempt finished, whatever its outcome. On a
+// failed attempt the tracking state is kept (same first-seen time) so the
+// next poll retries; on a successful attempt the state was already removed
+// by completeAndForgetErroredTransfer.
 func (manager *TransferManagerService) finishErroredTransferProcessing(id string) {
 	manager.erroredTransfersMutex.Lock()
 	defer manager.erroredTransfersMutex.Unlock()
@@ -359,23 +439,51 @@ func (manager *TransferManagerService) finishErroredTransferProcessing(id string
 	}
 }
 
-// forgetErroredTransfer removes the tracking state for a transfer.
-func (manager *TransferManagerService) forgetErroredTransfer(id string) {
+// completeAndForgetErroredTransfer atomically releases the per-transfer
+// processing slot and removes the tracking state after a successful
+// report/delete. Both steps happen under one lock acquisition so no poll
+// can observe a released-but-not-yet-removed entry and start a duplicate
+// goroutine.
+func (manager *TransferManagerService) completeAndForgetErroredTransfer(id string) {
 	manager.erroredTransfersMutex.Lock()
 	defer manager.erroredTransfersMutex.Unlock()
+	if state, ok := manager.erroredTransfers[id]; ok {
+		state.processing = false
+	}
+	delete(manager.erroredTransfers, id)
+}
+
+// stopTrackingErroredTransfer is the poller-side way of dropping the
+// tracking state for a transfer that is no longer errored. An entry whose
+// report/delete goroutine is still in flight is left alone: that goroutine
+// still owns the processing slot and settles the state itself, and any
+// leftover state is dropped by the next poll or by pruneErroredTransfers.
+func (manager *TransferManagerService) stopTrackingErroredTransfer(id string) {
+	manager.erroredTransfersMutex.Lock()
+	defer manager.erroredTransfersMutex.Unlock()
+	if state, ok := manager.erroredTransfers[id]; ok && state.processing {
+		return
+	}
 	delete(manager.erroredTransfers, id)
 }
 
 // pruneErroredTransfers removes the tracking state of transfers that
-// disappeared from the premiumize.me transfer list.
+// disappeared from the premiumize.me transfer list. Entries with an
+// in-flight report/delete are kept: the goroutine still owns the
+// processing slot and settles the state, the next poll prunes the
+// leftover.
 func (manager *TransferManagerService) pruneErroredTransfers(currentTransferIDs map[string]bool) {
 	manager.erroredTransfersMutex.Lock()
 	defer manager.erroredTransfersMutex.Unlock()
-	for id := range manager.erroredTransfers {
-		if !currentTransferIDs[id] {
-			log.Debugf("Errored transfer id %s disappeared from the transfer list, stopping tracking", id)
-			delete(manager.erroredTransfers, id)
+	for id, state := range manager.erroredTransfers {
+		if currentTransferIDs[id] {
+			continue
 		}
+		if state.processing {
+			continue
+		}
+		log.Debugf("Errored transfer id %s disappeared from the transfer list, stopping tracking", id)
+		delete(manager.erroredTransfers, id)
 	}
 }
 

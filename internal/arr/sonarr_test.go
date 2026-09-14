@@ -77,6 +77,13 @@ func TestHistoryContainsResolvesNewestGrabbedRecord(t *testing.T) {
 	runErrorTransferReportingTest(t, newTestSonarrArr, "v3")
 }
 
+// TestHistoryContainsResolvesNewestOfMultipleGrabbedRecords verifies that
+// with several grabbed records sharing the release name, the newest one is
+// resolved so the failure lands on the record Sonarr actually tried.
+func TestHistoryContainsResolvesNewestOfMultipleGrabbedRecords(t *testing.T) {
+	runMultipleGrabbedRecordsTest(t, newTestSonarrArr, "v3")
+}
+
 // TestHistoryContainsOnlyNonGrabbedRecords verifies that a release name
 // present only as non-grabbed history (e.g. an old download failure) is
 // reported as not in history, keeping the "Not in History" trace line.

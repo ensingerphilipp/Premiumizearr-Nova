@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -78,7 +79,8 @@ func (c *fakeClock) Advance(d time.Duration) {
 // transfer manager uses (transfer list + transfer delete). A successful
 // delete removes the transfer from the list, as on premiumize.me. Delete
 // calls can be made to fail a bounded number of times and to block until
-// released, so a test can pin a delete in flight.
+// released, so a test can pin a delete in flight; the list call can be
+// made to fail a bounded number of times as well.
 type fakePremiumize struct {
 	*httptest.Server
 	*premiumizeme.Premiumizeme
@@ -88,6 +90,7 @@ type fakePremiumize struct {
 	transfers   []premiumizeme.Transfer
 	deleted     []string
 	failDeletes int                // remaining delete calls to answer with an error
+	failList    int                // remaining list calls to answer with an error
 	blockDelete chan chan struct{} // when non-nil, each delete handler blocks until its release channel is closed
 }
 
@@ -105,6 +108,14 @@ func newFakePremiumize(t *testing.T, transfers []premiumizeme.Transfer) *fakePre
 		fake.mu.Lock()
 		defer fake.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
+		if fake.failList > 0 {
+			fake.failList--
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "error",
+				"message": "fake premiumize list failure",
+			})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":    "success",
 			"transfers": fake.transfers,
@@ -222,19 +233,41 @@ func waitForEvent(t *testing.T, fake *fakePremiumize, event string, count int) {
 	}
 }
 
+// waitForProcessing blocks until every in-flight report/delete goroutine
+// spawned by the polls so far has fully finished (state settled), so a
+// test asserts on the settled tracking state instead of racing the
+// goroutines. Bounded by a deadline so a stuck goroutine fails the test
+// instead of hanging it.
+func waitForProcessing(t *testing.T, m *TransferManagerService) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		m.processingWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for in-flight errored transfer processing to finish")
+	}
+}
+
 // fakeArr is an in-memory arr.IArr for service tests. When lookupErr is set
 // the history lookup fails (an arr outage). When hasMatch is set the
-// transfer name is in the history with grabbed record ID matchedID.
+// transfer name is in the history with grabbed record ID matchedID. When
+// freshMatch is set, only the fresh lookup (a forced history refetch)
+// reports the match: the cached lookup is older than a recent grab.
 // HandleErrorTransfer mirrors the real wrapper contract: the history item
 // is marked failed first (recorded in the shared event log), then the
 // premiumize.me transfer is deleted via the given client.
 type fakeArr struct {
-	name      string
-	hasMatch  bool
-	matchedID int64
-	lookupErr error
-	failErr   error
-	events    *eventLog
+	name       string
+	hasMatch   bool
+	matchedID  int64
+	lookupErr  error
+	failErr    error
+	freshMatch bool
+	events     *eventLog
 }
 
 func (f *fakeArr) HistoryContains(_ string) (int64, bool, error) {
@@ -245,6 +278,16 @@ func (f *fakeArr) HistoryContains(_ string) (int64, bool, error) {
 		return f.matchedID, true, nil
 	}
 	return -1, false, nil
+}
+
+func (f *fakeArr) HistoryContainsFresh(name string) (int64, bool, error) {
+	if f.events != nil {
+		f.events.record("fresh:" + f.name)
+	}
+	if f.freshMatch {
+		return f.matchedID, true, nil
+	}
+	return f.HistoryContains(name)
 }
 
 func (f *fakeArr) MarkHistoryItemAsFailed(id int64) error {
@@ -273,17 +316,28 @@ func (f *fakeArr) GetArrName() string {
 // fakes with the default 5 minute grace period and the injectable clock.
 func newErroredTransferTestService(t *testing.T, fake *fakePremiumize, clock *fakeClock, arrs ...arr.IArr) *TransferManagerService {
 	t.Helper()
+	return newErroredTransferTestServiceWithGrace(t, fake, clock, 300, arrs...)
+}
+
+// newErroredTransferTestServiceWithGrace wires a TransferManagerService
+// against the fakes with an explicit grace period (seconds) in the config
+// and the injectable clock. A cleanup hook waits for in-flight
+// report/delete goroutines before the fakes are torn down, so no
+// goroutine can outlive the fake servers.
+func newErroredTransferTestServiceWithGrace(t *testing.T, fake *fakePremiumize, clock *fakeClock, graceSeconds int, arrs ...arr.IArr) *TransferManagerService {
+	t.Helper()
 
 	m := TransferManagerService{}.New()
 	cfg := &config.Config{
 		DownloadsDirectory:                      t.TempDir(),
-		ErroredTransferDeleteGracePeriodSeconds: 300,
+		ErroredTransferDeleteGracePeriodSeconds: graceSeconds,
 	}
 	am := ArrsManagerService{}.New()
 	am.Init(cfg)
 	am.arrs = arrs
 	m.Init(fake.Premiumizeme, &am, cfg)
 	m.nowFunc = clock.Now
+	t.Cleanup(func() { waitForProcessing(t, &m) })
 	return &m
 }
 
@@ -345,6 +399,7 @@ func TestErroredTransferUnmatchedDeletedAfterGraceExpiry(t *testing.T) {
 	clock.Advance(5 * time.Minute)
 	m.TaskUpdateTransfersList() // grace elapsed: delete is spawned
 	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
 
 	if got := fake.events.countEvent("delete:t1"); got != 1 {
 		t.Fatalf("delete attempts after grace expiry = %d, want exactly 1", got)
@@ -407,6 +462,7 @@ func TestErroredTransferMatchedReportedFailedBeforeDelete(t *testing.T) {
 
 	m.TaskUpdateTransfersList() // match: report + delete are spawned
 	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
 
 	events := fake.events.snapshot()
 	failIndex, deleteIndex := -1, -1
@@ -454,12 +510,14 @@ func TestErroredTransferDeleteFailureRetriedNextPoll(t *testing.T) {
 
 	m.TaskUpdateTransfersList() // attempt 1: fails
 	waitForEvent(t, fake, "delete:t1", 1)
+	waitForProcessing(t, m)
 	if got := trackingCount(m); got != 1 {
 		t.Fatalf("tracking count after failed delete = %d, want 1 (must be retried)", got)
 	}
 
 	m.TaskUpdateTransfersList() // attempt 2: fails
 	waitForEvent(t, fake, "delete:t1", 2)
+	waitForProcessing(t, m)
 	if got := trackingCount(m); got != 1 {
 		t.Fatalf("tracking count after second failed delete = %d, want 1 (must be retried)", got)
 	}
@@ -470,6 +528,7 @@ func TestErroredTransferDeleteFailureRetriedNextPoll(t *testing.T) {
 
 	m.TaskUpdateTransfersList() // attempt 3: succeeds
 	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
 	if got := fake.events.countEvent("delete:t1"); got != 3 {
 		t.Fatalf("total delete attempts = %d, want 3", got)
 	}
@@ -510,6 +569,7 @@ func TestErroredTransferRepeatedPollingNoDuplicates(t *testing.T) {
 	close(release)
 
 	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
 	if got := fake.events.countEvent("fail:101"); got != 1 {
 		t.Fatalf("failure reports = %d, want exactly 1 despite repeated polling", got)
 	}
@@ -539,6 +599,7 @@ func TestErroredTransferSearchesAllArrs(t *testing.T) {
 
 	m.TaskUpdateTransfersList()
 	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
 
 	if got := fake.events.countEvent("fail:201"); got != 1 {
 		t.Fatalf("failure reports to the matching (second) arr = %d, want 1", got)
@@ -554,22 +615,23 @@ func TestErroredTransferSearchesAllArrs(t *testing.T) {
 }
 
 // TestErroredTrackingClearedWhenNotErroredOrGone verifies that tracking
-// state is cleared when a transfer stops being errored (a fresh grace
-// period applies if it errors again) and when it disappears from the
-// premiumize.me transfer list.
+// state is cleared when a transfer stops being errored, and that a
+// cleared-then-re-errored transfer starts a fresh grace period that
+// expires inclusively at its own boundary (deletion IS the correct
+// outcome there).
 func TestErroredTrackingClearedWhenNotErroredOrGone(t *testing.T) {
 	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
 	clock := newFakeClock()
 	m := newErroredTransferTestService(t, fake, clock, &fakeArr{name: "Sonarr"})
 
-	m.TaskUpdateTransfersList()
+	m.TaskUpdateTransfersList() // first seen at T0
 	if got := trackingCount(m); got != 1 {
 		t.Fatalf("tracking count after first poll = %d, want 1", got)
 	}
 
 	// The transfer stops being errored: tracking must be cleared
 	// immediately (synchronous), so a later re-error starts a fresh grace
-	// period instead of deleting right away.
+	// period instead of inheriting T0.
 	done := erroredTransfer("t1")
 	done.Status = "completed"
 	fake.setTransfers(t, []premiumizeme.Transfer{done})
@@ -580,23 +642,278 @@ func TestErroredTrackingClearedWhenNotErroredOrGone(t *testing.T) {
 
 	errored := erroredTransfer("t1")
 	fake.setTransfers(t, []premiumizeme.Transfer{errored})
-	m.TaskUpdateTransfersList()
+	m.TaskUpdateTransfersList() // re-errored at T0: fresh first-seen time
 	if got := trackingCount(m); got != 1 {
 		t.Fatalf("tracking count after the transfer errored again = %d, want 1", got)
 	}
-	// Fresh first-seen time: the full grace period has elapsed since T0,
-	// yet no delete may happen yet.
-	clock.Advance(10 * time.Minute)
+
+	// Fresh first-seen time: still within the fresh grace period, so no
+	// delete may happen yet.
+	clock.Advance(4*time.Minute + 59*time.Second)
 	m.TaskUpdateTransfersList()
 	if got := fake.events.countEvent("delete:t1"); got != 0 {
-		t.Fatalf("delete attempts after re-error = %d, want 0 (fresh grace period after clearing)", got)
+		t.Fatalf("delete attempts within the fresh grace period = %d, want 0", got)
+	}
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count within the fresh grace period = %d, want 1", got)
 	}
 
-	// The transfer disappears from the list: tracking must be pruned.
+	// At exactly the fresh grace boundary the grace period has elapsed
+	// (expiry is inclusive at the boundary), so the unmatched transfer is
+	// deleted now.
+	clock.Advance(1 * time.Second)
+	m.TaskUpdateTransfersList()
+	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
+	if ids := fake.deletedIDs(); len(ids) != 1 || ids[0] != "t1" {
+		t.Fatalf("deleted ids = %v, want [t1] at the fresh grace boundary", ids)
+	}
+
+	// The deletion removed the transfer from the list: the next poll
+	// clears the tracking state.
+	m.TaskUpdateTransfersList()
+	if got := trackingCount(m); got != 0 {
+		t.Fatalf("tracking count after deletion = %d, want 0", got)
+	}
+}
+
+// TestErroredTrackingPrunedWhenGoneFromList verifies that tracking state
+// is pruned when an errored transfer disappears from the premiumize.me
+// transfer list while still inside its grace period.
+func TestErroredTrackingPrunedWhenGoneFromList(t *testing.T) {
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
+	clock := newFakeClock()
+	m := newErroredTransferTestService(t, fake, clock, &fakeArr{name: "Sonarr"})
+
+	m.TaskUpdateTransfersList()
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count after first poll = %d, want 1", got)
+	}
+
+	// The transfer disappears from the list: tracking must be pruned and
+	// nothing may be deleted.
 	fake.setTransfers(t, nil)
 	m.TaskUpdateTransfersList()
 	if got := trackingCount(m); got != 0 {
-		t.Fatalf("tracking count after the transfer disappeared = %d, want 0", got)
+		t.Fatalf("tracking count after the transfer disappeared = %d, want 0 (pruned)", got)
+	}
+	if got := fake.events.countEvent("delete:t1"); got != 0 {
+		t.Fatalf("delete attempts = %d, want 0 (the transfer is gone, nothing to delete)", got)
+	}
+}
+
+// TestErroredTransferWithoutAnyArrNeverDeletes verifies the regression
+// guard for a configuration with no *arr clients: there is nothing to
+// verify the transfer against and nothing to notify about the failed
+// download, so an errored transfer is kept (and tracked) forever instead
+// of being silently auto-deleted after the grace period.
+func TestErroredTransferWithoutAnyArrNeverDeletes(t *testing.T) {
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
+	clock := newFakeClock()
+	m := newErroredTransferTestService(t, fake, clock) // no arr clients
+
+	m.TaskUpdateTransfersList()
+	for i := 0; i < 3; i++ {
+		clock.Advance(24 * time.Hour) // far beyond the grace period
+		m.TaskUpdateTransfersList()
+	}
+
+	if got := fake.events.countEvent("delete:t1"); got != 0 {
+		t.Fatalf("delete attempts without any *arr = %d, want 0 (nothing to verify or notify)", got)
+	}
+	if ids := fake.deletedIDs(); len(ids) != 0 {
+		t.Fatalf("deleted ids = %v, want none", ids)
+	}
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count without any *arr = %d, want 1 (kept, not deleted)", got)
+	}
+}
+
+// TestErroredTransferStaleNoMatchNotDeleted verifies that the deletion
+// decision does not trust the stale per-arr history cache: when the cached
+// lookup says "no match" but a fresh history fetch finds the grab, the
+// transfer is reported to the arr (fail first) and only then deleted -
+// never silently deleted as unmatched.
+func TestErroredTransferStaleNoMatchNotDeleted(t *testing.T) {
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
+	clock := newFakeClock()
+	m := newErroredTransferTestService(t, fake, clock,
+		&fakeArr{name: "Sonarr", freshMatch: true, matchedID: 101, events: fake.events},
+	)
+
+	m.TaskUpdateTransfersList() // cached lookup: no match, within grace
+	if got := fake.events.countEvent("delete:t1"); got != 0 {
+		t.Fatalf("delete attempts within the grace period = %d, want 0", got)
+	}
+
+	clock.Advance(5 * time.Minute)
+	m.TaskUpdateTransfersList() // grace expired: the fresh lookup finds the grab
+	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
+
+	if got := fake.events.countEvent("fresh:Sonarr"); got != 1 {
+		t.Fatalf("fresh lookups before the deletion decision = %d, want exactly 1", got)
+	}
+	if got := fake.events.countEvent("fail:101"); got != 1 {
+		t.Fatalf("failure reports = %d, want 1 (the arr must be told about the failed download)", got)
+	}
+	events := fake.events.snapshot()
+	freshIndex, failIndex, deleteIndex := -1, -1, -1
+	for i, e := range events {
+		switch e {
+		case "fresh:Sonarr":
+			freshIndex = i
+		case "fail:101":
+			failIndex = i
+		case "delete:t1":
+			deleteIndex = i
+		}
+	}
+	if freshIndex < 0 || failIndex < 0 || deleteIndex < 0 || freshIndex > failIndex || failIndex > deleteIndex {
+		t.Fatalf("events = %v, want the fresh lookup BEFORE the failure report BEFORE the delete", events)
+	}
+	if ids := fake.deletedIDs(); len(ids) != 1 || ids[0] != "t1" {
+		t.Fatalf("deleted ids = %v, want [t1]", ids)
+	}
+}
+
+// TestErroredTrackingSurvivesTransferListFailure verifies that a failed
+// premiumize.me transfer-list poll does not lose grace-period tracking
+// state: the poll returns early on the error, and the next successful poll
+// continues from the same first-seen time.
+func TestErroredTrackingSurvivesTransferListFailure(t *testing.T) {
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
+	clock := newFakeClock()
+	m := newErroredTransferTestService(t, fake, clock, &fakeArr{name: "Sonarr"})
+
+	m.TaskUpdateTransfersList() // first seen at T0
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count after first poll = %d, want 1", got)
+	}
+
+	fake.mu.Lock()
+	fake.failList = 1 // the next transfer-list call answers with an error
+	fake.mu.Unlock()
+
+	m.TaskUpdateTransfersList() // list fails: the poll aborts before processing anything
+	if got := fake.events.countEvent("delete:t1"); got != 0 {
+		t.Fatalf("delete attempts after a failed list poll = %d, want 0", got)
+	}
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count after a failed list poll = %d, want 1 (tracking must survive the error)", got)
+	}
+
+	// The next successful poll is still inside the grace period (same
+	// first-seen time, only 2 minutes later) and must not delete.
+	clock.Advance(2 * time.Minute)
+	m.TaskUpdateTransfersList()
+	if got := fake.events.countEvent("delete:t1"); got != 0 {
+		t.Fatalf("delete attempts after the list recovered = %d, want 0 (still within the grace period)", got)
+	}
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count after the list recovered = %d, want 1", got)
+	}
+}
+
+// TestErroredTransferReportFailureRetriedNextPoll verifies that a failed
+// *arr failure report (HandleErrorTransfer error) keeps the tracking state
+// and is retried on the next poll, and that a successful retry reports the
+// failure exactly once and deletes the transfer.
+func TestErroredTransferReportFailureRetriedNextPoll(t *testing.T) {
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
+	clock := newFakeClock()
+	sonarr := &fakeArr{name: "Sonarr", hasMatch: true, matchedID: 101, events: fake.events}
+	m := newErroredTransferTestService(t, fake, clock, sonarr)
+
+	sonarr.failErr = errors.New("sonarr unavailable")
+	m.TaskUpdateTransfersList() // report spawned, fails in the *arr
+	waitForProcessing(t, m)
+	if got := fake.events.countEvent("fail:101"); got != 0 {
+		t.Fatalf("failure reports after a failed report = %d, want 0", got)
+	}
+	if got := fake.events.countEvent("delete:t1"); got != 0 {
+		t.Fatalf("delete attempts after a failed report = %d, want 0 (the arr was never told)", got)
+	}
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count after a failed report = %d, want 1 (must be retried)", got)
+	}
+
+	sonarr.failErr = nil
+	m.TaskUpdateTransfersList() // retry: report + delete
+	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
+	if got := fake.events.countEvent("fail:101"); got != 1 {
+		t.Fatalf("failure reports after the retry = %d, want exactly 1", got)
+	}
+	if got := fake.events.countEvent("delete:t1"); got != 1 {
+		t.Fatalf("delete attempts after the retry = %d, want exactly 1", got)
+	}
+	if ids := fake.deletedIDs(); len(ids) != 1 || ids[0] != "t1" {
+		t.Fatalf("deleted ids = %v, want [t1]", ids)
+	}
+
+	m.TaskUpdateTransfersList() // deleted: gone from the list, tracking cleared
+	if got := trackingCount(m); got != 0 {
+		t.Fatalf("tracking count after the successful retry = %d, want 0", got)
+	}
+}
+
+// TestErroredTransferMixedLookupFailureNeverDeletes verifies the mixed
+// case: with one *arr answering an authoritative no-match and another
+// unreachable, the no-match is not authoritative and the transfer is kept
+// no matter how long the outage lasts; once the unreachable *arr recovers
+// (still no match) the long-expired grace period deletes the transfer.
+func TestErroredTransferMixedLookupFailureNeverDeletes(t *testing.T) {
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
+	clock := newFakeClock()
+	radarr := &fakeArr{name: "Radarr", lookupErr: errors.New("radarr unreachable")}
+	m := newErroredTransferTestService(t, fake, clock,
+		&fakeArr{name: "Sonarr"}, // authoritative no-match
+		radarr,                   // outage
+	)
+
+	m.TaskUpdateTransfersList() // first seen at T0
+	for i := 0; i < 3; i++ {
+		clock.Advance(24 * time.Hour) // far beyond the grace period
+		m.TaskUpdateTransfersList()
+	}
+
+	if got := fake.events.countEvent("delete:t1"); got != 0 {
+		t.Fatalf("delete attempts while one *arr is unreachable = %d, want 0 (a mixed no-match is not authoritative)", got)
+	}
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count while one *arr is unreachable = %d, want 1", got)
+	}
+
+	// The unreachable *arr recovers and also has no match: the no-match is
+	// now authoritative on every *arr, so the long-expired grace period
+	// deletes the transfer.
+	radarr.lookupErr = nil
+	m.TaskUpdateTransfersList()
+	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
+	if ids := fake.deletedIDs(); len(ids) != 1 || ids[0] != "t1" {
+		t.Fatalf("deleted ids = %v, want [t1] after the outage recovered", ids)
+	}
+}
+
+// TestErroredTransferGracePeriodClampedForHugeValues verifies that an
+// out-of-range configured grace period cannot overflow the duration
+// arithmetic into a negative grace (which would delete immediately): the
+// value is clamped and the transfer is kept.
+func TestErroredTransferGracePeriodClampedForHugeValues(t *testing.T) {
+	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
+	clock := newFakeClock()
+	m := newErroredTransferTestServiceWithGrace(t, fake, clock, math.MaxInt, &fakeArr{name: "Sonarr"})
+
+	m.TaskUpdateTransfersList()
+	clock.Advance(24 * time.Hour)
+	m.TaskUpdateTransfersList()
+	if got := fake.events.countEvent("delete:t1"); got != 0 {
+		t.Fatalf("delete attempts with a huge configured grace period = %d, want 0 (clamped, not wrapped negative)", got)
+	}
+	if got := trackingCount(m); got != 1 {
+		t.Fatalf("tracking count with a huge configured grace period = %d, want 1", got)
 	}
 }
 
@@ -608,16 +925,7 @@ func TestErroredTransferGracePeriodFromConfig(t *testing.T) {
 	// Custom 60 second grace period.
 	fake := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t1")})
 	clock := newFakeClock()
-	m := TransferManagerService{}.New()
-	cfg := &config.Config{
-		DownloadsDirectory:                      t.TempDir(),
-		ErroredTransferDeleteGracePeriodSeconds: 60,
-	}
-	am := ArrsManagerService{}.New()
-	am.Init(cfg)
-	am.arrs = []arr.IArr{&fakeArr{name: "Sonarr"}}
-	m.Init(fake.Premiumizeme, &am, cfg)
-	m.nowFunc = clock.Now
+	m := newErroredTransferTestServiceWithGrace(t, fake, clock, 60, &fakeArr{name: "Sonarr"})
 
 	m.TaskUpdateTransfersList() // first seen at T0
 	clock.Advance(59 * time.Second)
@@ -628,6 +936,7 @@ func TestErroredTransferGracePeriodFromConfig(t *testing.T) {
 	clock.Advance(2 * time.Second) // 61s > 60s
 	m.TaskUpdateTransfersList()
 	waitForEvent(t, fake, "deleted:t1", 1)
+	waitForProcessing(t, m)
 	if ids := fake.deletedIDs(); len(ids) != 1 || ids[0] != "t1" {
 		t.Fatalf("deleted ids = %v, want [t1]", ids)
 	}
@@ -636,13 +945,7 @@ func TestErroredTransferGracePeriodFromConfig(t *testing.T) {
 	// immediate deletion.
 	fake2 := newFakePremiumize(t, []premiumizeme.Transfer{erroredTransfer("t2")})
 	clock2 := newFakeClock()
-	m2 := TransferManagerService{}.New()
-	cfg2 := &config.Config{DownloadsDirectory: t.TempDir()}
-	am2 := ArrsManagerService{}.New()
-	am2.Init(cfg2)
-	am2.arrs = []arr.IArr{&fakeArr{name: "Sonarr"}}
-	m2.Init(fake2.Premiumizeme, &am2, cfg2)
-	m2.nowFunc = clock2.Now
+	m2 := newErroredTransferTestServiceWithGrace(t, fake2, clock2, 0, &fakeArr{name: "Sonarr"})
 
 	m2.TaskUpdateTransfersList()
 	if got := fake2.events.countEvent("delete:t2"); got != 0 {
@@ -656,6 +959,7 @@ func TestErroredTransferGracePeriodFromConfig(t *testing.T) {
 	clock2.Advance(2 * time.Second)
 	m2.TaskUpdateTransfersList()
 	waitForEvent(t, fake2, "deleted:t2", 1)
+	waitForProcessing(t, m2)
 	if ids := fake2.deletedIDs(); len(ids) != 1 || ids[0] != "t2" {
 		t.Fatalf("deleted ids = %v, want [t2]", ids)
 	}
