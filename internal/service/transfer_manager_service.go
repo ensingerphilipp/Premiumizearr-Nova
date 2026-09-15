@@ -251,30 +251,34 @@ func (manager *TransferManagerService) TaskCheckPremiumizeDownloadsFolder() {
 		return
 	}
 
-	if !manager.checkFolder(manager.downloadsFolderID, manager.config.DownloadsDirectory) {
-		return
+	var arrFolders map[string]string
+	if manager.config.EnableArrSubfolders {
+		manager.arrFoldersMutex.Lock()
+		arrFolders = make(map[string]string, len(manager.arrFolders))
+		for slug, folderID := range manager.arrFolders {
+			arrFolders[slug] = folderID
+		}
+		manager.arrFoldersMutex.Unlock()
 	}
 
-	if !manager.config.EnableArrSubfolders {
-		return
+	excludeNames := make(map[string]bool, len(arrFolders))
+	for slug := range arrFolders {
+		excludeNames[slug] = true
 	}
 
-	manager.arrFoldersMutex.Lock()
-	arrFolders := make(map[string]string, len(manager.arrFolders))
-	for slug, folderID := range manager.arrFolders {
-		arrFolders[slug] = folderID
+	if !manager.checkFolder(manager.downloadsFolderID, manager.config.DownloadsDirectory, excludeNames) {
+		return
 	}
-	manager.arrFoldersMutex.Unlock()
 
 	for slug, folderID := range arrFolders {
 		localDir := filepath.Join(manager.config.DownloadsDirectory, slug)
-		if !manager.checkFolder(folderID, localDir) {
+		if !manager.checkFolder(folderID, localDir, nil) {
 			return // SimultaneousDownloads cap reached
 		}
 	}
 }
 
-func (manager *TransferManagerService) checkFolder(premiumizeFolderID, localDir string) bool {
+func (manager *TransferManagerService) checkFolder(premiumizeFolderID, localDir string, excludeNames map[string]bool) bool {
 	items, err := manager.premiumizemeClient.ListFolder(premiumizeFolderID)
 	if err != nil {
 		log.Errorf("Error listing downloads folder: %s", err.Error())
@@ -282,6 +286,11 @@ func (manager *TransferManagerService) checkFolder(premiumizeFolderID, localDir 
 	}
 
 	for _, item := range items {
+		// Skip the Arr container folders themselves - they are scanned separately.
+		if excludeNames[item.Name] {
+			continue
+		}
+
 		// Skip items that are currently downloading
 		if manager.downloadExists(item.Name) {
 			log.Tracef("Item %s is already downloading", item.Name)

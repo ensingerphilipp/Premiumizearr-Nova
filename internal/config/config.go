@@ -45,9 +45,11 @@ func LoadOrCreateConfig(altConfigLocation string, _appCallback AppCallback) (Con
 	config.appCallback = _appCallback
 	config.altConfigLocation = altConfigLocation
 
-	if err := ValidateArrs(config.Arrs); err != nil {
-		log.Errorf("Invalid Arrs configuration: %s", err)
-		return config, ErrInvalidArrConfig
+	if config.EnableArrSubfolders {
+		if err := ValidateArrs(config.Arrs); err != nil {
+			log.Errorf("Invalid Arrs configuration: %s. EnableArrSubfolders requires every Arr Name to be a lowercase slug (letters, digits, hyphens only) since it is used as the subfolder name. Fix the Arr names in config.yaml (or in the web UI) and restart, or set EnableArrSubfolders back to false.", err)
+			return config, ErrInvalidArrConfig
+		}
 	}
 
 	config.Save()
