@@ -20,6 +20,9 @@ type DownloadDetails struct {
 	Added              time.Time
 	Name               string
 	ProgressDownloader *progress_downloader.WriteCounter
+	// topLevel marks entries for top-level folder jobs admitted by
+	// HandleFinishedItem; only these count against SimultaneousDownloads.
+	topLevel bool
 }
 
 type TransferManagerService struct {
@@ -307,7 +310,7 @@ func (manager *TransferManagerService) updateTransfers(transfers []premiumizeme.
 	manager.transfers = transfers
 }
 
-func (manager *TransferManagerService) addDownload(item *premiumizeme.Item) {
+func (manager *TransferManagerService) addDownload(item *premiumizeme.Item, topLevel bool) {
 	manager.downloadListMutex.Lock()
 	defer manager.downloadListMutex.Unlock()
 
@@ -315,14 +318,23 @@ func (manager *TransferManagerService) addDownload(item *premiumizeme.Item) {
 		Added:              time.Now(),
 		Name:               item.Name,
 		ProgressDownloader: progress_downloader.NewWriteCounter(),
+		topLevel:           topLevel,
 	}
 }
 
 func (manager *TransferManagerService) countDownloads() int {
 	manager.downloadListMutex.Lock()
 	defer manager.downloadListMutex.Unlock()
-	// Calculate len(manager.downloadList) / 2 as every download also has a Parent Folder in manager.downloadList
-	return (len(manager.downloadList) / 2)
+	// Count active top-level jobs only: each is counted for its full
+	// lifetime - listing, link generation, child downloads, and gaps
+	// between children - until its deferred removal.
+	count := 0
+	for _, dl := range manager.downloadList {
+		if dl.topLevel {
+			count++
+		}
+	}
+	return count
 }
 
 func (manager *TransferManagerService) removeDownload(name string) {
@@ -400,7 +412,7 @@ func (manager *TransferManagerService) HandleFinishedItem(item premiumizeme.Item
 		return
 	}
 
-	manager.addDownload(&item)
+	manager.addDownload(&item, true)
 	go func() {
 		defer manager.removeDownload(item.Name)
 		err := manager.downloadFolderRecursively(item, downloadDirectory)
@@ -455,7 +467,7 @@ func (manager *TransferManagerService) downloadFolderRecursively(item premiumize
 		}
 
 		if item.Type == "file" {
-			manager.addDownload(&item)
+			manager.addDownload(&item, false)
 			link, err := manager.premiumizemeClient.GenerateFileLink(item.ID)
 			if err != nil {
 				log.Debugf("File Link Generation err: %s", err)
@@ -469,7 +481,7 @@ func (manager *TransferManagerService) downloadFolderRecursively(item premiumize
 			if err != nil {
 				manager.removeDownload(item.Name)
 				manager.markDownloadFailed(item.Name)
-				log.Errorf("Error downloading file %s: %w, continuing with other files", item.Name, err)
+				log.Errorf("Error downloading file %s: %s, continuing with other files", item.Name, err)
 				folderHasErrors = true
 				continue // Continue with next file instead of aborting
 			}
@@ -478,7 +490,7 @@ func (manager *TransferManagerService) downloadFolderRecursively(item premiumize
 			err = manager.downloadFolderRecursively(item, savePath)
 			if err != nil {
 				manager.markDownloadFailed(item.Name)
-				log.Errorf("Error downloading folder %s: %w, continuing with other items", item.Name, err)
+				log.Errorf("Error downloading folder %s: %s, continuing with other items", item.Name, err)
 				folderHasErrors = true
 				continue // Continue with next item instead of aborting
 			}

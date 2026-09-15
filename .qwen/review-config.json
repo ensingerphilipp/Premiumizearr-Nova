@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "highRiskPaths": [
+    "go.mod",
+    "go.sum",
+    "web/package.json",
+    "web/package-lock.json",
+    "Dockerfile*",
+    ".goreleaser*",
+    "pkg/**",
+    "internal/config/**"
+  ],
+  "highRiskLabels": [
+    "security",
+    "architecture",
+    "breaking-change",
+    "release-critical",
+    "risk:high",
+    "concurrency"
+  ]
+}

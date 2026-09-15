@@ -5,6 +5,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -108,4 +109,17 @@ func readMultipartFields(t *testing.T, req *http.Request) map[string]string {
 	}
 
 	return fields
+}
+
+func TestAccountErrorIncludesRedactedReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"status":"error","message":"invalid key secret-key"}`))
+	}))
+	defer server.Close()
+	client := NewPremiumizemeClient("secret-key")
+	client.APIBaseURL = server.URL
+	_, err := client.GetAccountInfo()
+	if err == nil || !strings.Contains(err.Error(), "invalid key") || strings.Contains(err.Error(), "secret-key") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }

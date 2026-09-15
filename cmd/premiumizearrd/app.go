@@ -28,7 +28,7 @@ func (app *App) Start(logLevel string, configFile string, loggingDirectory strin
 	//Setup static login
 	lvl, err := log.ParseLevel(logLevel)
 	if err != nil {
-		log.Errorf("error flag not recognized, defaulting to Info!!", err)
+		log.Errorf("error flag not recognized: %s, defaulting to Info!!", err)
 		lvl = log.InfoLevel
 	}
 	log.SetLevel(lvl)
@@ -84,7 +84,7 @@ func (app *App) Start(logLevel string, configFile string, loggingDirectory strin
 	app.premiumizemeClient = premiumizeme.NewPremiumizemeClient(app.config.PremiumizemeAPIKey)
 
 	app.transferManager = service.TransferManagerService{}.New()
-	app.directoryWatcher = service.DirectoryWatcherService{}.New()
+	app.directoryWatcher = service.NewDirectoryWatcherService()
 	app.webServer = service.WebServerService{}.New()
 	app.arrsManager = service.ArrsManagerService{}.New()
 

@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
+	"github.com/gorilla/mux"
 	log "github.com/sirupsen/logrus"
 )
 

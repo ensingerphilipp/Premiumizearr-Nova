@@ -5,6 +5,20 @@ type SimpleResponse struct {
 	Message string `json:"message"`
 }
 
+type AccountInfoResponse struct {
+	Status        string   `json:"status"`
+	Message       string   `json:"message"`
+	LimitUsed     *float64 `json:"limit_used"`
+	BoosterPoints *float64 `json:"booster_points"`
+}
+
+func (accountInfo AccountInfoResponse) QuotaExhausted() bool {
+	return accountInfo.LimitUsed != nil &&
+		accountInfo.BoosterPoints != nil &&
+		*accountInfo.LimitUsed >= 1.0 &&
+		*accountInfo.BoosterPoints <= 0
+}
+
 type GenerateZipResponse struct {
 	Status   string `json:"status"`
 	Location string `json:"location"`

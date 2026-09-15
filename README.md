@@ -1,19 +1,14 @@
 # Premiumizearr-Nova
-## Build 1.5.1
+## Build 1.5.5
 
 [![Build](https://github.com/ensingerphilipp/premiumizearr-nova/actions/workflows/build.yml/badge.svg)](https://github.com/ensingerphilipp/premiumizearr-nova/actions/workflows/build.yml)
 
 *BUGFIX Release:* 
-* Prevent Download Lockup on orphaned broken links
-* More graceful Downloads (cooldown before retrying on broken downloadlinks)
-* Fix Subfolder handling
-* Improve Download Cleanup
+* Fix transfer folder not being applied to new uploads (multipart field)
+* Fix crash when the web UI queries blackhole status before startup completes
+* Fix SimultaneousDownloads limit being miscounted by the download count
 
-*NEW: Added Transfer-Only-Mode* ✅
-
-*NEW: Skip TLS-Certificate-Check to prevent failed 0B Downloads* ✅
-
-*NEW: Change transferfolder on Premiumize to a user-specified folder* ✅
+*NEW: Pause blackhole submissions when the Premiumize fair-use quota is exhausted* ✅
 
 ## Enjoying so far? Im running on ☕
 <a href="https://ko-fi.com/K3K819CODS"><img src="https://uploads-ssl.webflow.com/5c14e387dab576fe667689cf/5cbed8a4ae2b88347c06c923_BuyMeACoffee_blue-p-500.png" width="250px"></a>
@@ -41,6 +36,8 @@ Next Steps:
 - Monitor blackhole directory to push `.magnet`, `.torrent`  and `.nzb` to Premiumize.me
 - Monitor and download Premiumize.me transfers (web ui on default port 8182)
 - Mark transfers as failed in Radarr & Sonarr
+
+New blackhole submissions pause automatically when the Premiumize fair-use quota is exhausted and no booster points are available. Existing cloud transfers are not affected. Source files remain in the blackhole directory and are processed automatically after quota replenishment or booster activation.
 
 ## Install
 
@@ -144,7 +141,7 @@ cd Premiumizearr_x.x.x.x_linux_amd64
 sudo mkdir /opt/premiumizearrd/
 sudo cp -r premiumizearrd static/ /opt/premiumizearrd/
 sudo cp premiumizearrd.service /etc/systemd/system/
-sudo systemctl-reload
+sudo systemctl daemon-reload
 sudo systemctl enable premiumizearrd.service
 sudo systemctl start premiumizearrd.service
 ```
