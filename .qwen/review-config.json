@@ -1,12 +1,14 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "highRiskPaths": [
     "go.mod",
     "go.sum",
     "web/package.json",
     "web/package-lock.json",
     "Dockerfile*",
-    ".goreleaser*",
+    ".goreleaser*"
+  ],
+  "softRiskPaths": [
     "pkg/**",
     "internal/config/**"
   ],
