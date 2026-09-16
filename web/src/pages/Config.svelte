@@ -66,6 +66,12 @@
         }
 
         config = data;
+        // Defensively normalize a non-array Arrs: the server is now fixed
+        // to always emit an array, and this guards against a future
+        // regression or a malformed payload.
+        if (!Array.isArray(config.Arrs)) {
+          config.Arrs = [];
+        }
         inputDisabled = false;
       })
       .catch((error) => {
