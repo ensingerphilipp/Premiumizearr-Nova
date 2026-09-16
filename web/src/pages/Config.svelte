@@ -66,6 +66,12 @@
         }
 
         config = data;
+        // A legacy config without an Arrs section is served as "Arrs":
+        // null; normalize so the #each and the add/remove/test helpers
+        // never run on a non-array.
+        if (!Array.isArray(config.Arrs)) {
+          config.Arrs = [];
+        }
         inputDisabled = false;
       })
       .catch((error) => {
