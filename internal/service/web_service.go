@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"html/template"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,6 +28,20 @@ type WebServerService struct {
 	arrsManagerService      *ArrsManagerService
 	config                  *config.Config
 	srv                     *http.Server
+	listener                net.Listener
+}
+
+// normalizeWebRoot canonicalizes the configured WebRoot to the absolute
+// URL prefix shared by the rendered index template and the SPA handler:
+// trimmed, without a trailing slash, and with a leading slash when
+// non-empty, so assets are referenced as absolute URLs like "/nova/bundle.js".
+func normalizeWebRoot(webRoot string) string {
+	webRoot = strings.TrimSpace(webRoot)
+	webRoot = strings.TrimSuffix(webRoot, "/")
+	if webRoot != "" && !strings.HasPrefix(webRoot, "/") {
+		webRoot = "/" + webRoot
+	}
+	return webRoot
 }
 
 func (s WebServerService) New() WebServerService {
@@ -35,6 +50,7 @@ func (s WebServerService) New() WebServerService {
 	s.directoryWatcherService = nil
 	s.arrsManagerService = nil
 	s.srv = nil
+	s.listener = nil
 	return s
 }
 
@@ -62,8 +78,10 @@ func (s *WebServerService) Start() {
 		log.Fatal(err)
 	}
 
+	webRoot := normalizeWebRoot(s.config.WebRoot)
+
 	var ibytes bytes.Buffer
-	err = tmpl.Execute(&ibytes, &IndexTemplates{s.config.WebRoot})
+	err = tmpl.Execute(&ibytes, &IndexTemplates{webRoot})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -72,7 +90,7 @@ func (s *WebServerService) Start() {
 	spa := spaHandler{
 		staticPath: "static",
 		indexPath:  "index.html",
-		webRoot:    s.config.WebRoot,
+		webRoot:    webRoot,
 	}
 
 	r := mux.NewRouter()
@@ -87,6 +105,12 @@ func (s *WebServerService) Start() {
 
 	address := fmt.Sprintf("%s:%s", s.config.BindIP, s.config.BindPort)
 
+	ln, err := net.Listen("tcp", address)
+	if err != nil {
+		log.Fatal(err)
+	}
+	s.listener = ln
+
 	s.srv = &http.Server{
 		Handler: r,
 		Addr:    address,
@@ -97,7 +121,7 @@ func (s *WebServerService) Start() {
 
 	log.Infof("Web server started on %s", address)
 
-	go s.srv.ListenAndServe()
+	go s.srv.Serve(ln)
 }
 
 // Shamelessly stolen from mux examples https://github.com/gorilla/mux#examples
@@ -118,7 +142,7 @@ func (h spaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.webRoot != "" {
-		path = strings.Replace(path, h.webRoot, "", 1)
+		path = strings.TrimPrefix(path, h.webRoot)
 	}
 	// prepend the path with the path to the static directory
 	path = filepath.Join(h.staticPath, path)
