@@ -75,6 +75,12 @@
 
   function submit() {
     inputDisabled = true;
+    // The grace period input is a DOM string; the strict Go config
+    // decoder rejects strings, so coerce it to an integer before
+    // serializing (empty or invalid input becomes 0, which the server
+    // treats as "unset").
+    const gracePeriod = parseInt(config.ErroredTransferDeleteGracePeriodSeconds, 10);
+    config.ErroredTransferDeleteGracePeriodSeconds = Number.isNaN(gracePeriod) ? 0 : gracePeriod;
     fetch(CalculateAPIPath("api/config"), {
       method: "POST",
       headers: {
@@ -196,6 +202,12 @@
           disabled={inputDisabled}
           labelText="Arr Update History Interval (seconds)"
           bind:value={config.ArrHistoryUpdateIntervalSeconds}
+        />
+        <TextInput
+          type="number"
+          disabled={inputDisabled}
+          labelText="Errored Transfer Delete Grace Period (seconds)"
+          bind:value={config.ErroredTransferDeleteGracePeriodSeconds}
         />
         {#if config.Arrs !== undefined}
           {#each config.Arrs as arr, i}

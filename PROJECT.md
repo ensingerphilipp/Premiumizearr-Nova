@@ -128,9 +128,10 @@ a new change from verification.
 2. Data races: shared `*config.Config` mutated by the config API while poll
    loops read it; unlocked status-field writes; web server `Close()`+`Start()`
    from a handler goroutine (global `indexBytes`).
-3. `HandleErrorTransfer` spawned as a fresh goroutine every 15s per errored,
-   history-matched transfer (concurrent/repeated `Fail()` +
-   `DeleteTransfer()`).
+3. FIXED (PR #76): `HandleErrorTransfer` spawned as a fresh goroutine every
+   15s per errored, history-matched transfer (concurrent/repeated `Fail()`
+   + `DeleteTransfer()`) — a per-ID processing slot plus the grace-period
+   state machine now prevent repeated concurrent report/delete.
 
 ## Deployment & operations notes
 
