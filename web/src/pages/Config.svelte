@@ -44,6 +44,8 @@
   // type="number" input binds null, which the backend decodes into the zero
   // value and would silently save 0 (issue #89). The grace period input is
   // exempt: clearing it is the documented way to reset it to the default.
+  // Server-side counterpart: numericConfigFields in
+  // internal/service/web_service_config_routes.go.
   const numericFields = [
     ["ArrHistoryUpdateIntervalSeconds", "Arr Update History Interval (seconds)"],
     ["PollBlackholeIntervalMinutes", "Poll Blackhole Interval Minutes"],

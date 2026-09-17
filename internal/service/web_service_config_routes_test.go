@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -123,5 +124,190 @@ func TestConfigHandlerAcceptsExplicitZeroNumericFields(t *testing.T) {
 		t.Errorf("explicit zero values were not saved as-is: PollBlackholeIntervalMinutes=%d SimultaneousDownloads=%d DownloadSpeedLimit=%d ArrHistoryUpdateIntervalSeconds=%d ErroredTransferDeleteGracePeriodSeconds=%d",
 			cfg.PollBlackholeIntervalMinutes, cfg.SimultaneousDownloads, cfg.DownloadSpeedLimit,
 			cfg.ArrHistoryUpdateIntervalSeconds, cfg.ErroredTransferDeleteGracePeriodSeconds)
+	}
+}
+
+// TestConfigHandlerRejectsNullBody is the regression test for review finding
+// R1-1: a top-level JSON null body unmarshals into a nil raw map
+// (validation no-op) and into a zero-value config.Config (decode no-op), so
+// UpdateConfig wiped the entire config while answering succeeded: true.
+func TestConfigHandlerRejectsNullBody(t *testing.T) {
+	ws, cfg := newConfigRouteTestService(t)
+	apiKeyBefore := cfg.PremiumizemeAPIKey
+
+	req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader("null"))
+	rec := httptest.NewRecorder()
+	ws.ConfigHandler(rec, req)
+
+	var resp ConfigChangeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshaling response %q: %v", rec.Body.String(), err)
+	}
+	if resp.Succeeded {
+		t.Errorf("succeeded = true, want false for a top-level null payload")
+	}
+	if cfg.PremiumizemeAPIKey != apiKeyBefore || cfg.SimultaneousDownloads != 5 {
+		t.Errorf("config was modified by a rejected null payload: PremiumizemeAPIKey=%q SimultaneousDownloads=%d",
+			cfg.PremiumizemeAPIKey, cfg.SimultaneousDownloads)
+	}
+}
+
+// TestConfigHandlerRejectsOversizedBody is the regression test for review
+// finding R1-2: the POST handler must cap request-body buffering so an
+// unauthenticated caller cannot force the daemon to buffer an unbounded body
+// (OOM DoS); the cap must still pass legitimate payloads (the ~450 B
+// zeroNumericFieldsPayload fixture in TestConfigHandlerAcceptsExplicitZeroNumericFields).
+func TestConfigHandlerRejectsOversizedBody(t *testing.T) {
+	ws, cfg := newConfigRouteTestService(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(strings.Repeat("x", 2<<20)))
+	rec := httptest.NewRecorder()
+	ws.ConfigHandler(rec, req)
+
+	var resp ConfigChangeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshaling response %q: %v", rec.Body.String(), err)
+	}
+	if resp.Succeeded {
+		t.Fatalf("succeeded = true for an oversized body")
+	}
+	if !strings.Contains(resp.Status, "too large") {
+		t.Errorf("status = %q, want the body-size cap error", resp.Status)
+	}
+	if cfg.SimultaneousDownloads != 5 {
+		t.Errorf("SimultaneousDownloads = %d, want 5 (rejected body must not replace the config)", cfg.SimultaneousDownloads)
+	}
+}
+
+// TestNumericConfigFieldsMatchesConfigIntFields is the sync guard for review
+// finding R1-3: numericConfigFields must track the exported int fields of
+// config.Config, so a new int field cannot slip past the null validation.
+func TestNumericConfigFieldsMatchesConfigIntFields(t *testing.T) {
+	var intFields []string
+	v := reflect.TypeOf(config.Config{})
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Field(i)
+		if f.PkgPath != "" {
+			continue // unexported
+		}
+		if f.Type.Kind() == reflect.Int {
+			intFields = append(intFields, f.Name)
+		}
+	}
+	want := make(map[string]bool, len(numericConfigFields))
+	for _, name := range numericConfigFields {
+		want[name] = true
+	}
+	got := make(map[string]bool, len(intFields))
+	for _, name := range intFields {
+		got[name] = true
+	}
+	for name := range want {
+		if !got[name] {
+			t.Errorf("numericConfigFields lists %q but config.Config has no exported int field by that name", name)
+		}
+	}
+	for name := range got {
+		if !want[name] {
+			t.Errorf("config.Config has exported int field %q but numericConfigFields does not list it", name)
+		}
+	}
+}
+
+// configIntField reads an exported int field of config.Config by name for
+// the per-field table tests.
+func configIntField(t *testing.T, cfg *config.Config, name string) int {
+	t.Helper()
+	f := reflect.ValueOf(cfg).Elem().FieldByName(name)
+	if !f.IsValid() || f.Kind() != reflect.Int {
+		t.Fatalf("config.Config has no int field %q", name)
+	}
+	return int(f.Int())
+}
+
+func cloneStringAnyMap(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// TestConfigHandlerNumericFieldNullRejectedZeroAccepted is the per-field
+// table for review finding R1-3: for every numeric field, an explicit null
+// must be rejected (naming the field, config unchanged) while an explicit 0
+// must remain storable. The rows vary null vs 0, not null vs absent —
+// omitted fields keep the whole-struct replace behavior.
+func TestConfigHandlerNumericFieldNullRejectedZeroAccepted(t *testing.T) {
+	base := map[string]any{
+		"PremiumizemeAPIKey":                      "xxxxxxxxx",
+		"Arrs":                                    []any{},
+		"BlackholeDirectory":                      "/blackhole",
+		"PollBlackholeDirectory":                  false,
+		"PollBlackholeIntervalMinutes":            0,
+		"DownloadsDirectory":                      "/downloads",
+		"TransferDirectory":                       "arrDownloads",
+		"BindIP":                                  "0.0.0.0",
+		"BindPort":                                "8182",
+		"WebRoot":                                 "",
+		"SimultaneousDownloads":                   0,
+		"DownloadSpeedLimit":                      0,
+		"EnableTlsCheck":                          false,
+		"TransferOnlyMode":                        false,
+		"ArrHistoryUpdateIntervalSeconds":         0,
+		"ErroredTransferDeleteGracePeriodSeconds": 0,
+	}
+
+	for _, field := range numericConfigFields {
+		t.Run(field+"_null_rejected", func(t *testing.T) {
+			ws, cfg := newConfigRouteTestService(t)
+			before := configIntField(t, cfg, field)
+
+			payload := cloneStringAnyMap(base)
+			payload[field] = nil
+			body, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatalf("marshaling payload: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(string(body)))
+			rec := httptest.NewRecorder()
+			ws.ConfigHandler(rec, req)
+
+			var resp ConfigChangeResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("unmarshaling response %q: %v", rec.Body.String(), err)
+			}
+			if resp.Succeeded {
+				t.Errorf("succeeded = true, want false for null %s", field)
+			}
+			if !strings.Contains(resp.Status, field) {
+				t.Errorf("status = %q, want it to name the rejected field", resp.Status)
+			}
+			if got := configIntField(t, cfg, field); got != before {
+				t.Errorf("%s = %d, want %d (rejected payload must not replace the config)", field, got, before)
+			}
+		})
+		t.Run(field+"_zero_accepted", func(t *testing.T) {
+			ws, cfg := newConfigRouteTestService(t)
+
+			body, err := json.Marshal(cloneStringAnyMap(base))
+			if err != nil {
+				t.Fatalf("marshaling payload: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(string(body)))
+			rec := httptest.NewRecorder()
+			ws.ConfigHandler(rec, req)
+
+			var resp ConfigChangeResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("unmarshaling response %q: %v", rec.Body.String(), err)
+			}
+			if !resp.Succeeded {
+				t.Fatalf("succeeded = false, want true for explicit zero %s: %s", field, resp.Status)
+			}
+			if got := configIntField(t, cfg, field); got != 0 {
+				t.Errorf("%s = %d, want 0 (explicit zero must be stored as-is)", field, got)
+			}
+		})
 	}
 }
