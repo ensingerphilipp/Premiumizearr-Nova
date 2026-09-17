@@ -107,6 +107,12 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 	log.Trace("Checking for missing config fields")
 	updated := false
 
+	if configInterface["Arrs"] == nil {
+		log.Info("Arrs not set, setting to an empty list")
+		config.Arrs = []ArrConfig{}
+		updated = true
+	}
+
 	if configInterface["PollBlackholeDirectory"] == nil {
 		log.Info("PollBlackholeDirectory not set, setting to false")
 		config.PollBlackholeDirectory = false
