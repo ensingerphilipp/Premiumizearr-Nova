@@ -37,15 +37,46 @@ type WebServerService struct {
 
 // normalizeWebRoot canonicalizes the configured WebRoot to the absolute
 // URL prefix shared by the rendered index template and the SPA handler:
-// trimmed, without a trailing slash, and with a leading slash when
+// trimmed, without trailing slashes, and with a leading slash when
 // non-empty, so assets are referenced as absolute URLs like "/nova/bundle.js".
 func normalizeWebRoot(webRoot string) string {
 	webRoot = strings.TrimSpace(webRoot)
-	webRoot = strings.TrimSuffix(webRoot, "/")
+	webRoot = strings.TrimRight(webRoot, "/")
 	if webRoot != "" && !strings.HasPrefix(webRoot, "/") {
 		webRoot = "/" + webRoot
 	}
 	return webRoot
+}
+
+// validateWebRoot returns the canonical WebRoot usable as a mux route
+// pattern, or an error. The WebRoot becomes a gorilla/mux route pattern on
+// every (re)start (see issue #90 review R2-1), so values with mux
+// metacharacters like "/{x:(y)}" must be rejected before they can panic
+// route construction or otherwise take down the running web surface.
+// Allowed: the empty string (host root) and plain nested paths such as
+// "/apps/nova" — non-empty segments of ASCII letters, digits, ".", "_" and
+// "-", separated by single slashes.
+func validateWebRoot(webRoot string) (string, error) {
+	webRoot = normalizeWebRoot(webRoot)
+	if webRoot == "" {
+		return "", nil
+	}
+	for _, segment := range strings.Split(strings.TrimPrefix(webRoot, "/"), "/") {
+		if segment == "" {
+			return "", fmt.Errorf("invalid WebRoot %q: repeated slashes are not allowed (expected a path like \"/apps/nova\")", webRoot)
+		}
+		for _, r := range segment {
+			if !isWebRootSegmentChar(r) {
+				return "", fmt.Errorf("invalid WebRoot %q: path segments may only contain ASCII letters, digits, \".\", \"_\" and \"-\" (found %q)", webRoot, string(r))
+			}
+		}
+	}
+	return webRoot, nil
+}
+
+func isWebRootSegmentChar(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+		r == '.' || r == '_' || r == '-'
 }
 
 func (s WebServerService) New() WebServerService {
@@ -62,12 +93,18 @@ func (s *WebServerService) ConfigUpdatedCallback(currentConfig config.Config, ne
 	if currentConfig.BindIP != newConfig.BindIP ||
 		currentConfig.BindPort != newConfig.BindPort ||
 		currentConfig.WebRoot != newConfig.WebRoot {
+		// Validate before touching the running server: a rejected change
+		// must leave the current web surface up (R2-1).
+		if _, err := validateWebRoot(newConfig.WebRoot); err != nil {
+			log.Errorf("web server not restarted: %v", err)
+			return
+		}
 		log.Tracef("Config updated, restarting web server...")
 		// s.srv is nil when the (re)start never got a listener, e.g. the
 		// previous bind attempt failed.
 		if s.srv != nil {
 			if err := s.srv.Close(); err != nil {
-				log.Fatal(err)
+				log.Errorf("could not close web server during config update: %v", err)
 			}
 		}
 		s.Start()
@@ -82,13 +119,22 @@ func (s *WebServerService) Init(transferManager *TransferManagerService, directo
 }
 
 func (s *WebServerService) Start() {
+	// Reject a WebRoot that could not serve as a mux route pattern before
+	// doing anything that mutates server state. Log and return instead of
+	// log.Fatal: on the config-update path this runs in an HTTP handler
+	// goroutine, and on a bad config.yaml the other services (arr pollers,
+	// directory watcher) must keep working.
+	webRoot, err := validateWebRoot(s.config.WebRoot)
+	if err != nil {
+		log.Errorf("web server not started: %v", err)
+		return
+	}
+
 	log.Info("Starting web server...")
 	tmpl, err := template.ParseFiles("./static/index.html")
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	webRoot := normalizeWebRoot(s.config.WebRoot)
 
 	// With a non-empty WebRoot the page is served under /<webRoot>/ and
 	// the assets must be requested as absolute "/<webRoot>/bundle.js"

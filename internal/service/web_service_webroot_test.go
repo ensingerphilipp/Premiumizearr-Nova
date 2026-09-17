@@ -27,6 +27,7 @@ func TestNormalizeWebRoot(t *testing.T) {
 		{in: "nova", want: "/nova"},
 		{in: "/nova", want: "/nova"},
 		{in: "/nova/", want: "/nova"},
+		{in: "/nova//", want: "/nova"},
 		{in: "nova/", want: "/nova"},
 		{in: "  nova  ", want: "/nova"},
 		{in: "/", want: ""},
@@ -34,6 +35,64 @@ func TestNormalizeWebRoot(t *testing.T) {
 	for _, c := range cases {
 		if got := normalizeWebRoot(c.in); got != c.want {
 			t.Errorf("normalizeWebRoot(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestValidateWebRoot covers the literal allowlist enforced before a
+// WebRoot is used as a mux route pattern (review findings R2-1/R2-5):
+// mux metacharacters ({ } ( ) + |), malformed path syntax and repeated
+// slashes must be rejected; the empty string and normal nested paths are
+// accepted.
+func TestValidateWebRoot(t *testing.T) {
+	valid := []struct {
+		in   string
+		want string
+	}{
+		{in: "", want: ""},
+		{in: "/", want: ""},
+		{in: "nova", want: "/nova"},
+		{in: "/nova", want: "/nova"},
+		{in: "/nova/", want: "/nova"},
+		{in: "/nova//", want: "/nova"},
+		{in: "  /apps/nova  ", want: "/apps/nova"},
+		{in: "/a-b.c_d", want: "/a-b.c_d"},
+		{in: "/v1/2", want: "/v1/2"},
+	}
+	for _, c := range valid {
+		got, err := validateWebRoot(c.in)
+		if err != nil {
+			t.Errorf("validateWebRoot(%q) unexpected error: %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("validateWebRoot(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+
+	invalid := []string{
+		"/{x:(y)}", // R2-1: panics mux route construction (NumSubexp check)
+		"{",
+		"}",
+		"(",
+		")",
+		"+",
+		"|",
+		"/nova{x}",
+		"/nova|other",
+		"/nova+x",
+		"///nova",  // R2-5: repeated slashes
+		"/nova//x", // R2-5: repeated slashes
+		"/nova x",  // whitespace inside a segment
+		"/nova?y",
+		"/nova#y",
+		"/nova\\y",
+		"/nova~x",
+		"/nøva", // non-ASCII
+	}
+	for _, in := range invalid {
+		if got, err := validateWebRoot(in); err == nil {
+			t.Errorf("validateWebRoot(%q) = %q, want error", in, got)
 		}
 	}
 }
@@ -55,9 +114,10 @@ func matchesContentType(ct string, want []string) bool {
 }
 
 // startTestServer starts the real web server on an ephemeral port with the
-// given WebRoot and returns the base URL (http://127.0.0.1:port). The real
-// index.html template is served together with sentinel bundle assets.
-func startTestServer(t *testing.T, webRoot string) string {
+// given WebRoot and returns the base URL (http://127.0.0.1:port) and the
+// service. The real index.html template is served together with sentinel
+// bundle assets.
+func startTestServer(t *testing.T, webRoot string) (string, *WebServerService) {
 	t.Helper()
 	templateSrc, err := os.ReadFile(filepath.Join("..", "..", "web", "public", "index.html"))
 	if err != nil {
@@ -97,7 +157,7 @@ func startTestServer(t *testing.T, webRoot string) string {
 		t.Fatalf("web server failed to start on an ephemeral port")
 	}
 	t.Cleanup(func() { s.srv.Close() })
-	return fmt.Sprintf("http://127.0.0.1:%d", s.listener.Addr().(*net.TCPAddr).Port)
+	return fmt.Sprintf("http://127.0.0.1:%d", s.listener.Addr().(*net.TCPAddr).Port), &s
 }
 
 // TestWebRootServesAssets is a regression test for issue #90 and review
@@ -125,7 +185,7 @@ func TestWebRootServesAssets(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			base := startTestServer(t, tc.webRoot)
+			base, _ := startTestServer(t, tc.webRoot)
 
 			prefix := normalizeWebRoot(tc.webRoot)
 			assetBase := "./"
@@ -198,7 +258,7 @@ func TestWebRootServesAssets(t *testing.T) {
 func TestWebRootAPIRoutes(t *testing.T) {
 	for _, webRoot := range []string{"", "nova", "/nova"} {
 		t.Run(fmt.Sprintf("webRoot=%q", webRoot), func(t *testing.T) {
-			base := startTestServer(t, webRoot)
+			base, _ := startTestServer(t, webRoot)
 			prefix := normalizeWebRoot(webRoot)
 			client := &http.Client{Timeout: 10 * time.Second}
 
@@ -286,5 +346,112 @@ func TestWebServerBindFailureDoesNotExitDaemon(t *testing.T) {
 	s.ConfigUpdatedCallback(oldCfg, *cfg)
 	if s.srv != nil {
 		t.Fatalf("s.srv set after ConfigUpdatedCallback with failed bind, want nil")
+	}
+}
+
+// TestConfigUpdateWithMalformedWebRootKeepsServerRunning is a regression
+// test for review finding R2-1: an unauthenticated POST /api/config can
+// set any WebRoot, which is then used as a mux route pattern on restart.
+// A value with mux metacharacters used to panic route construction after
+// the old server was already closed, taking down the whole web surface
+// (UI + all /api) until process restart. The update must be rejected and
+// the running server must keep serving.
+func TestConfigUpdateWithMalformedWebRootKeepsServerRunning(t *testing.T) {
+	base, s := startTestServer(t, "nova")
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	assertSurfaceUp := func() {
+		t.Helper()
+		for _, url := range []string{base + "/nova/", base + "/nova/api/config", base + "/api/config"} {
+			resp, err := client.Get(url)
+			if err != nil {
+				t.Fatalf("GET %s after rejected update: %v", url, err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("GET %s after rejected update status = %d, want %d", url, resp.StatusCode, http.StatusOK)
+			}
+		}
+	}
+
+	assertSurfaceUp()
+
+	// The config package applies the new config to the shared struct
+	// before invoking the callbacks, so s.config carries the (malformed)
+	// WebRoot by the time the restart runs.
+	oldCfg := *s.config
+	for _, bad := range []string{"/{x:(y)}", "}{", "///nova", "/nova|other"} {
+		s.config.WebRoot = bad
+		s.ConfigUpdatedCallback(oldCfg, *s.config)
+		if s.srv == nil {
+			t.Fatalf("s.srv is nil after rejected update with WebRoot %q — the running server was torn down", bad)
+		}
+		assertSurfaceUp()
+	}
+
+	// A subsequent valid update (nested path) restarts the server normally.
+	s.config.WebRoot = "/apps/nova"
+	s.ConfigUpdatedCallback(oldCfg, *s.config)
+	if s.srv == nil {
+		t.Fatal("s.srv nil after valid update with nested WebRoot /apps/nova")
+	}
+	newBase := fmt.Sprintf("http://127.0.0.1:%d", s.listener.Addr().(*net.TCPAddr).Port)
+	resp, err := client.Get(newBase + "/apps/nova/")
+	if err != nil {
+		t.Fatalf("GET %s after valid update: %v", newBase+"/apps/nova/", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s after valid update status = %d, want %d", newBase+"/apps/nova/", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestWebServerRestartBindFailureAndRecovery is a regression test for
+// review finding R2-4: it drives the live restart path that a cold start
+// never exercises — non-nil s.srv → Close → failed bind → and recovery of
+// the web surface on the next config update.
+func TestWebServerRestartBindFailureAndRecovery(t *testing.T) {
+	base, s := startTestServer(t, "nova")
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	// Occupy a port so the restarted server cannot bind.
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserving a port: %v", err)
+	}
+	defer blocker.Close()
+	blockedPort := strconv.Itoa(blocker.Addr().(*net.TCPAddr).Port)
+
+	cfg := s.config
+	oldCfg := *cfg
+	// The config package applies the new config to the shared struct
+	// before invoking the callbacks.
+	cfg.BindPort = blockedPort
+	s.ConfigUpdatedCallback(oldCfg, *cfg)
+
+	if s.srv != nil {
+		t.Fatalf("s.srv set after restart with failed bind, want nil")
+	}
+	// The old server was closed when the restart began.
+	if resp, err := client.Get(base + "/nova/"); err == nil {
+		resp.Body.Close()
+		t.Fatalf("old server still serving after restart with failed bind")
+	}
+
+	// Recovery: a subsequent update to a free port brings the surface back.
+	oldCfg = *cfg
+	cfg.BindPort = "0"
+	s.ConfigUpdatedCallback(oldCfg, *cfg)
+	if s.srv == nil {
+		t.Fatalf("s.srv nil after recovery restart")
+	}
+	newBase := fmt.Sprintf("http://127.0.0.1:%d", s.listener.Addr().(*net.TCPAddr).Port)
+	resp, err := client.Get(newBase + "/nova/")
+	if err != nil {
+		t.Fatalf("GET %s after recovery: %v", newBase+"/nova/", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s after recovery status = %d, want %d", newBase+"/nova/", resp.StatusCode, http.StatusOK)
 	}
 }
