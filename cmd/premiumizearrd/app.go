@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"path"
 	"time"
 
@@ -82,6 +83,10 @@ func (app *App) Start(logLevel string, configFile string, loggingDirectory strin
 
 	// Initialisation
 	app.premiumizemeClient = premiumizeme.NewPremiumizemeClient(app.config.PremiumizemeAPIKey)
+	// The default client has no timeout: a hung premiumize.me call would
+	// block the 15s poll loop forever (and, for the report/delete
+	// goroutines, pin the transfer's processing slot until then).
+	app.premiumizemeClient.HTTPClient = &http.Client{Timeout: 5 * time.Minute}
 
 	app.transferManager = service.TransferManagerService{}.New()
 	app.directoryWatcher = service.NewDirectoryWatcherService()

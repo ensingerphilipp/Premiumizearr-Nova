@@ -114,6 +114,12 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 	log.Trace("Checking for missing config fields")
 	updated := false
 
+	if configInterface["Arrs"] == nil {
+		log.Info("Arrs not set, setting to an empty list")
+		config.Arrs = []ArrConfig{}
+		updated = true
+	}
+
 	if configInterface["PollBlackholeDirectory"] == nil {
 		log.Info("PollBlackholeDirectory not set, setting to false")
 		config.PollBlackholeDirectory = false
@@ -162,6 +168,12 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 		updated = true
 	}
 
+	if configInterface["ErroredTransferDeleteGracePeriodSeconds"] == nil {
+		log.Info("ErroredTransferDeleteGracePeriodSeconds not set, setting to 300")
+		config.ErroredTransferDeleteGracePeriodSeconds = 300
+		updated = true
+	}
+
 	config.altConfigLocation = altConfigLocation
 
 	if updated {
@@ -190,20 +202,21 @@ func defaultConfig() Config {
 			{Name: "radarr", URL: "http://127.0.0.1:7878", APIKey: "xxxxxxxxx", Type: Radarr},
 			{Name: "lidarr", URL: "http://127.0.0.1:8686", APIKey: "xxxxxxxxx", Type: Lidarr},
 		},
-		BlackholeDirectory:              "",
-		PollBlackholeDirectory:          false,
-		PollBlackholeIntervalMinutes:    10,
-		DownloadsDirectory:              "",
-		TransferDirectory:               "arrDownloads",
-		BindIP:                          "0.0.0.0",
-		BindPort:                        "8182",
-		WebRoot:                         "",
-		SimultaneousDownloads:           5,
-		DownloadSpeedLimit:              100,
-		EnableTlsCheck:                  false,
-		TransferOnlyMode:                false,
-		EnableArrSubfolders:             false,
-		ArrHistoryUpdateIntervalSeconds: 20,
+		BlackholeDirectory:                      "",
+		PollBlackholeDirectory:                  false,
+		PollBlackholeIntervalMinutes:            10,
+		DownloadsDirectory:                      "",
+		TransferDirectory:                       "arrDownloads",
+		BindIP:                                  "0.0.0.0",
+		BindPort:                                "8182",
+		WebRoot:                                 "",
+		SimultaneousDownloads:                   5,
+		DownloadSpeedLimit:                      100,
+		EnableTlsCheck:                          false,
+		TransferOnlyMode:                        false,
+		EnableArrSubfolders:                     false,
+		ArrHistoryUpdateIntervalSeconds:         20,
+		ErroredTransferDeleteGracePeriodSeconds: 300,
 	}
 }
 

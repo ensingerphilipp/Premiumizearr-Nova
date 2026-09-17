@@ -101,6 +101,22 @@ func (pm *Premiumizeme) accountInfoRequestError(err error) error {
 	return fmt.Errorf("account info request failed: %s", message)
 }
 
+// redactRequestError removes the premiumize.me API key from a request error
+// before it is returned to callers: the request URL carries the key as a
+// query parameter, so a raw *url.Error would print it into logs.
+func (pm *Premiumizeme) redactRequestError(err error) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	for _, secret := range []string{pm.APIKey, url.QueryEscape(pm.APIKey), url.PathEscape(pm.APIKey)} {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[REDACTED]")
+		}
+	}
+	return fmt.Errorf("%s", message)
+}
+
 var (
 	ErrAPIKeyNotSet = fmt.Errorf("premiumize.me API key not set")
 )
@@ -119,9 +135,9 @@ func (pm *Premiumizeme) GetTransfers() ([]Transfer, error) {
 	var ret []Transfer
 	req, _ := http.NewRequest("GET", url.String(), nil)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := pm.httpClient().Do(req)
 	if err != nil {
-		return ret, err
+		return ret, pm.redactRequestError(err)
 	}
 
 	defer resp.Body.Close()
@@ -163,7 +179,7 @@ func (pm *Premiumizeme) ListFolder(folderID string) ([]Item, error) {
 
 	resp, err := client.Do(request)
 	if err != nil {
-		return ret, err
+		return ret, pm.redactRequestError(err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -202,7 +218,7 @@ func (pm *Premiumizeme) GetFolders() ([]Item, error) {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return ret, err
+		return ret, pm.redactRequestError(err)
 	}
 
 	defer resp.Body.Close()
@@ -261,7 +277,7 @@ func (pm *Premiumizeme) CreateTransfer(filePath string, parentID string) error {
 
 	resp, err := pm.httpClient().Do(request)
 	if err != nil {
-		return err
+		return pm.redactRequestError(err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -308,7 +324,7 @@ func (pm *Premiumizeme) DeleteFolder(folderID string) error {
 
 	resp, err := client.Do(request)
 	if err != nil {
-		return err
+		return pm.redactRequestError(err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -356,7 +372,7 @@ func (pm *Premiumizeme) MoveItem(itemID string, folderID string) error {
 
 	resp, err := client.Do(request)
 	if err != nil {
-		return err
+		return pm.redactRequestError(err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -406,7 +422,7 @@ func (pm *Premiumizeme) CreateFolder(folderName string, parentID *string) (strin
 
 	resp, err := client.Do(request)
 	if err != nil {
-		return "", err
+		return "", pm.redactRequestError(err)
 	}
 	defer resp.Body.Close()
 
@@ -439,15 +455,14 @@ func (pm *Premiumizeme) DeleteTransfer(id string) error {
 		return err
 	}
 
-	client := &http.Client{}
 	request, err := createDeleteRequest(id, &url)
 	if err != nil {
 		return err
 	}
 
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
-		return err
+		return pm.redactRequestError(err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -669,7 +684,7 @@ func (pm *Premiumizeme) generateZip(ID string, srcType SRCType) (string, error) 
 	client := &http.Client{}
 	resp, err := client.Do(request)
 	if err != nil {
-		return "", err
+		return "", pm.redactRequestError(err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -721,7 +736,7 @@ func (pm *Premiumizeme) GenerateFileLink(ID string) (string, error) {
 
 	resp, err := client.Do(request)
 	if err != nil {
-		return "", err
+		return "", pm.redactRequestError(err)
 	}
 
 	if resp.StatusCode != 200 {
