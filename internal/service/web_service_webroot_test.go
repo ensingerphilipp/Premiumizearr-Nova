@@ -1,12 +1,14 @@
 package service
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -52,15 +54,61 @@ func matchesContentType(ct string, want []string) bool {
 	return false
 }
 
-// TestWebRootServesAssets is a regression test for issue #90: with any
-// non-empty WebRoot the rendered index must reference the assets by
-// absolute URL, and those URLs must serve the actual asset files instead
-// of the SPA fallback index.html (which rendered a blank page).
-func TestWebRootServesAssets(t *testing.T) {
+// startTestServer starts the real web server on an ephemeral port with the
+// given WebRoot and returns the base URL (http://127.0.0.1:port). The real
+// index.html template is served together with sentinel bundle assets.
+func startTestServer(t *testing.T, webRoot string) string {
+	t.Helper()
 	templateSrc, err := os.ReadFile(filepath.Join("..", "..", "web", "public", "index.html"))
 	if err != nil {
 		t.Fatalf("reading web/public/index.html: %v", err)
 	}
+	faviconSrc, err := os.ReadFile(filepath.Join("..", "..", "web", "public", "favicon.png"))
+	if err != nil {
+		t.Fatalf("reading web/public/favicon.png: %v", err)
+	}
+
+	dir := t.TempDir()
+	staticDir := filepath.Join(dir, "static")
+	if err := os.MkdirAll(staticDir, 0o755); err != nil {
+		t.Fatalf("creating static dir: %v", err)
+	}
+	for name, content := range map[string][]byte{
+		"index.html":  templateSrc,
+		"bundle.js":   []byte(webRootTestBundleJS),
+		"bundle.css":  []byte(webRootTestBundleCSS),
+		"favicon.png": faviconSrc,
+	} {
+		if err := os.WriteFile(filepath.Join(staticDir, name), content, 0o644); err != nil {
+			t.Fatalf("writing %s: %v", name, err)
+		}
+	}
+	// The web server loads ./static/index.html relative to the process CWD.
+	t.Chdir(dir)
+
+	s := WebServerService{}.New()
+	s.Init(nil, nil, nil, &config.Config{
+		BindIP:   "127.0.0.1",
+		BindPort: "0",
+		WebRoot:  webRoot,
+	})
+	s.Start()
+	if s.srv == nil {
+		t.Fatalf("web server failed to start on an ephemeral port")
+	}
+	t.Cleanup(func() { s.srv.Close() })
+	return fmt.Sprintf("http://127.0.0.1:%d", s.listener.Addr().(*net.TCPAddr).Port)
+}
+
+// TestWebRootServesAssets is a regression test for issue #90 and review
+// finding R1-3: with any non-empty WebRoot the rendered index must
+// reference the assets by an absolute "/<webRoot>/" URL, and those URLs
+// must serve the actual asset files instead of the SPA fallback index.html
+// (which rendered a blank page). With an empty WebRoot the references must
+// stay document-relative ("./...") so the documented reverse-proxy
+// deployment (proxy strips the path prefix, app served under a subpath)
+// keeps working.
+func TestWebRootServesAssets(t *testing.T) {
 	faviconSrc, err := os.ReadFile(filepath.Join("..", "..", "web", "public", "favicon.png"))
 	if err != nil {
 		t.Fatalf("reading web/public/favicon.png: %v", err)
@@ -77,38 +125,17 @@ func TestWebRootServesAssets(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			staticDir := filepath.Join(dir, "static")
-			if err := os.MkdirAll(staticDir, 0o755); err != nil {
-				t.Fatalf("creating static dir: %v", err)
-			}
-			for name, content := range map[string][]byte{
-				"index.html":  templateSrc,
-				"bundle.js":   []byte(webRootTestBundleJS),
-				"bundle.css":  []byte(webRootTestBundleCSS),
-				"favicon.png": faviconSrc,
-			} {
-				if err := os.WriteFile(filepath.Join(staticDir, name), content, 0o644); err != nil {
-					t.Fatalf("writing %s: %v", name, err)
-				}
-			}
-			// The web server loads ./static/index.html relative to the process CWD.
-			t.Chdir(dir)
-
-			s := WebServerService{}.New()
-			s.Init(nil, nil, nil, &config.Config{
-				BindIP:   "127.0.0.1",
-				BindPort: "0",
-				WebRoot:  tc.webRoot,
-			})
-			s.Start()
-			defer s.srv.Close()
+			base := startTestServer(t, tc.webRoot)
 
 			prefix := normalizeWebRoot(tc.webRoot)
-			base := fmt.Sprintf("http://127.0.0.1:%d", s.listener.Addr().(*net.TCPAddr).Port)
+			assetBase := "./"
+			if prefix != "" {
+				assetBase = prefix + "/"
+			}
 			client := &http.Client{Timeout: 10 * time.Second}
 
-			// The rendered index must reference every asset by absolute URL.
+			// The rendered index must reference every asset by a URL that
+			// resolves correctly from the page.
 			pageResp, err := client.Get(base + prefix + "/")
 			if err != nil {
 				t.Fatalf("GET %s: %v", base+prefix+"/", err)
@@ -122,19 +149,19 @@ func TestWebRootServesAssets(t *testing.T) {
 				t.Fatalf("GET %s status = %d, want %d", base+prefix+"/", pageResp.StatusCode, http.StatusOK)
 			}
 			for _, wantRef := range []string{
-				fmt.Sprintf("href='%s/favicon.png'", prefix),
-				fmt.Sprintf("href='%s/bundle.css'", prefix),
-				fmt.Sprintf("src='%s/bundle.js'", prefix),
+				fmt.Sprintf("href='%sfavicon.png'", assetBase),
+				fmt.Sprintf("href='%sbundle.css'", assetBase),
+				fmt.Sprintf("src='%sbundle.js'", assetBase),
 			} {
 				if !strings.Contains(string(page), wantRef) {
 					t.Errorf("served index does not reference %q:\n%s", wantRef, page)
 				}
 			}
 
-			// Each referenced asset URL must serve the real file, not the SPA fallback.
-			// wantContentTypes accepts every Content-Type the Go mime database may
-			// report for the asset extension on this system (e.g. .js is
-			// application/javascript or text/javascript depending on /etc/mime.types).
+			// Each referenced asset URL must serve the real file, not the
+			// SPA fallback. (For an empty WebRoot the page is served at the
+			// host root, so the document-relative refs resolve to the same
+			// "/<asset>" URLs the browser requests.)
 			assertServesFile := func(asset string, wantContentTypes []string, wantBody string) {
 				t.Helper()
 				assetResp, err := client.Get(base + prefix + asset)
@@ -160,5 +187,104 @@ func TestWebRootServesAssets(t *testing.T) {
 			assertServesFile("/bundle.css", []string{"text/css"}, webRootTestBundleCSS)
 			assertServesFile("/favicon.png", []string{"image/png"}, string(faviconSrc))
 		})
+	}
+}
+
+// TestWebRootAPIRoutes is a regression test for review finding R1-1: with a
+// non-empty WebRoot the UI is served under /<webRoot>/ and the front-end
+// calls the API relative to the page location, so the /api routes must be
+// reachable under the normalized webRoot as well. The root /api
+// registrations are the existing contract and must be kept.
+func TestWebRootAPIRoutes(t *testing.T) {
+	for _, webRoot := range []string{"", "nova", "/nova"} {
+		t.Run(fmt.Sprintf("webRoot=%q", webRoot), func(t *testing.T) {
+			base := startTestServer(t, webRoot)
+			prefix := normalizeWebRoot(webRoot)
+			client := &http.Client{Timeout: 10 * time.Second}
+
+			assertAPIConfig := func(apiURL string) {
+				t.Helper()
+				resp, err := client.Get(apiURL)
+				if err != nil {
+					t.Fatalf("GET %s: %v", apiURL, err)
+				}
+				defer resp.Body.Close()
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					t.Fatalf("reading body of %s: %v", apiURL, err)
+				}
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("GET %s status = %d, want %d", apiURL, resp.StatusCode, http.StatusOK)
+				}
+				// The SPA fallback serves index.html; the API serves JSON.
+				if !json.Valid(body) {
+					t.Fatalf("GET %s returned non-JSON (SPA fallback served instead?): %q", apiURL, string(body))
+				}
+				if want := fmt.Sprintf(`"WebRoot":%q`, webRoot); !strings.Contains(string(body), want) {
+					t.Errorf("GET %s body missing %s:\n%s", apiURL, want, body)
+				}
+			}
+
+			// Root registrations are the existing contract.
+			assertAPIConfig(base + "/api/config")
+			// The UI under /<webRoot>/ calls the API relative to the page.
+			if prefix != "" {
+				assertAPIConfig(base + prefix + "/api/config")
+			}
+		})
+	}
+}
+
+// TestWebServerBindFailureDoesNotExitDaemon is a regression test for review
+// finding R1-2: a web bind failure (e.g. the port taken during the
+// config-update restart, which runs inside an HTTP handler goroutine) must
+// log and return, not os.Exit the whole daemon. s.srv must stay nil so
+// ConfigUpdatedCallback can skip the Close of a server that was never up.
+func TestWebServerBindFailureDoesNotExitDaemon(t *testing.T) {
+	templateSrc, err := os.ReadFile(filepath.Join("..", "..", "web", "public", "index.html"))
+	if err != nil {
+		t.Fatalf("reading web/public/index.html: %v", err)
+	}
+
+	dir := t.TempDir()
+	staticDir := filepath.Join(dir, "static")
+	if err := os.MkdirAll(staticDir, 0o755); err != nil {
+		t.Fatalf("creating static dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(staticDir, "index.html"), templateSrc, 0o644); err != nil {
+		t.Fatalf("writing index.html: %v", err)
+	}
+	t.Chdir(dir)
+
+	// Occupy a port so net.Listen fails with address-in-use.
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserving a port: %v", err)
+	}
+	defer blocker.Close()
+	port := blocker.Addr().(*net.TCPAddr).Port
+
+	cfg := &config.Config{
+		BindIP:   "127.0.0.1",
+		BindPort: strconv.Itoa(port),
+	}
+	s := WebServerService{}.New()
+	s.Init(nil, nil, nil, cfg)
+	s.Start() // must return, not os.Exit (old code: log.Fatal -> os.Exit(1))
+	if s.srv != nil {
+		t.Fatalf("s.srv set after bind failure, want nil")
+	}
+	if s.listener != nil {
+		t.Fatalf("s.listener set after bind failure, want nil")
+	}
+
+	// ConfigUpdatedCallback must survive a nil server: skip the Close,
+	// retry the Start, hit the same bind failure, and return. The WebRoot
+	// must differ so the callback takes the restart branch.
+	oldCfg := *cfg
+	cfg.WebRoot = "other"
+	s.ConfigUpdatedCallback(oldCfg, *cfg)
+	if s.srv != nil {
+		t.Fatalf("s.srv set after ConfigUpdatedCallback with failed bind, want nil")
 	}
 }

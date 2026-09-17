@@ -17,7 +17,11 @@ import (
 )
 
 type IndexTemplates struct {
-	RootPath string
+	// AssetBase is the URL prefix for the asset references rendered into
+	// index.html: "./" when the app is served at the host root (or behind
+	// a reverse proxy that strips the path prefix), "/<webRoot>/" when a
+	// WebRoot is configured.
+	AssetBase string
 }
 
 var indexBytes []byte
@@ -59,7 +63,13 @@ func (s *WebServerService) ConfigUpdatedCallback(currentConfig config.Config, ne
 		currentConfig.BindPort != newConfig.BindPort ||
 		currentConfig.WebRoot != newConfig.WebRoot {
 		log.Tracef("Config updated, restarting web server...")
-		s.srv.Close()
+		// s.srv is nil when the (re)start never got a listener, e.g. the
+		// previous bind attempt failed.
+		if s.srv != nil {
+			if err := s.srv.Close(); err != nil {
+				log.Fatal(err)
+			}
+		}
 		s.Start()
 	}
 }
@@ -80,8 +90,18 @@ func (s *WebServerService) Start() {
 
 	webRoot := normalizeWebRoot(s.config.WebRoot)
 
+	// With a non-empty WebRoot the page is served under /<webRoot>/ and
+	// the assets must be requested as absolute "/<webRoot>/bundle.js"
+	// (issue #90). With an empty WebRoot the references stay
+	// document-relative ("./bundle.js") so deployments behind a reverse
+	// proxy that strips the path prefix keep working.
+	assetBase := "./"
+	if webRoot != "" {
+		assetBase = webRoot + "/"
+	}
+
 	var ibytes bytes.Buffer
-	err = tmpl.Execute(&ibytes, &IndexTemplates{webRoot})
+	err = tmpl.Execute(&ibytes, &IndexTemplates{assetBase})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -94,12 +114,19 @@ func (s *WebServerService) Start() {
 	}
 
 	r := mux.NewRouter()
-
-	r.HandleFunc("/api/transfers", s.TransfersHandler)
-	r.HandleFunc("/api/downloads", s.DownloadsHandler)
-	r.HandleFunc("/api/blackhole", s.BlackholeHandler)
-	r.HandleFunc("/api/config", s.ConfigHandler)
-	r.HandleFunc("/api/testArr", s.TestArrHandler)
+	registerAPIRoutes := func(rt *mux.Router) {
+		rt.HandleFunc("/api/transfers", s.TransfersHandler)
+		rt.HandleFunc("/api/downloads", s.DownloadsHandler)
+		rt.HandleFunc("/api/blackhole", s.BlackholeHandler)
+		rt.HandleFunc("/api/config", s.ConfigHandler)
+		rt.HandleFunc("/api/testArr", s.TestArrHandler)
+	}
+	registerAPIRoutes(r)
+	// The UI under /<webRoot>/ calls the API relative to the page
+	// location, so expose the API under the webRoot as well.
+	if webRoot != "" {
+		registerAPIRoutes(r.PathPrefix(webRoot).Subrouter())
+	}
 
 	r.PathPrefix("/").Handler(spa)
 
@@ -107,7 +134,13 @@ func (s *WebServerService) Start() {
 
 	ln, err := net.Listen("tcp", address)
 	if err != nil {
-		log.Fatal(err)
+		// Do not exit the daemon on a bind failure: Start can run inside
+		// a config-update HTTP handler goroutine, where os.Exit would kill
+		// the whole process. The web UI stays down, the daemon keeps running.
+		log.Errorf("could not listen on %s: %v — web UI unavailable", address, err)
+		s.srv = nil
+		s.listener = nil
+		return
 	}
 	s.listener = ln
 
