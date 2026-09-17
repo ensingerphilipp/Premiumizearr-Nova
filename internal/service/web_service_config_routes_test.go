@@ -179,39 +179,171 @@ func TestConfigHandlerRejectsOversizedBody(t *testing.T) {
 	}
 }
 
+// isIntegerKind covers every reflect integer kind, so a renamed or widened
+// integer config field (int64, uint32, ...) cannot slip past the sync guard.
+func isIntegerKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return true
+	default:
+		return false
+	}
+}
+
 // TestNumericConfigFieldsMatchesConfigIntFields is the sync guard for review
-// finding R1-3: numericConfigFields must track the exported int fields of
-// config.Config, so a new int field cannot slip past the null validation.
+// findings R1-3/R1-4: numericConfigFields must exactly match the integer
+// fields of config.Config, keyed by their json tag (first token, "-" skipped,
+// absent/empty tag falls back to the Go field name) across every integer
+// kind — not just reflect.Int by Go field name.
 func TestNumericConfigFieldsMatchesConfigIntFields(t *testing.T) {
-	var intFields []string
+	want := make(map[string]bool)
 	v := reflect.TypeOf(config.Config{})
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Field(i)
 		if f.PkgPath != "" {
 			continue // unexported
 		}
-		if f.Type.Kind() == reflect.Int {
-			intFields = append(intFields, f.Name)
+		if !isIntegerKind(f.Type.Kind()) {
+			continue
 		}
+		tag := f.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		key := strings.Split(tag, ",")[0]
+		if key == "" {
+			key = f.Name
+		}
+		want[key] = true
 	}
-	want := make(map[string]bool, len(numericConfigFields))
+	got := make(map[string]bool, len(numericConfigFields))
 	for _, name := range numericConfigFields {
-		want[name] = true
-	}
-	got := make(map[string]bool, len(intFields))
-	for _, name := range intFields {
 		got[name] = true
 	}
-	for name := range want {
-		if !got[name] {
-			t.Errorf("numericConfigFields lists %q but config.Config has no exported int field by that name", name)
+	for key := range want {
+		if !got[key] {
+			t.Errorf("config.Config has integer json field %q but numericConfigFields does not list it", key)
 		}
 	}
-	for name := range got {
-		if !want[name] {
-			t.Errorf("config.Config has exported int field %q but numericConfigFields does not list it", name)
+	for key := range got {
+		if !want[key] {
+			t.Errorf("numericConfigFields lists %q but config.Config has no integer field with that json key", key)
 		}
 	}
+}
+
+// assertConfigUnchanged fails if a rejected payload modified the config.
+func assertConfigUnchanged(t *testing.T, cfg *config.Config, apiKeyBefore string, sdBefore int) {
+	t.Helper()
+	if cfg.PremiumizemeAPIKey != apiKeyBefore || cfg.SimultaneousDownloads != sdBefore {
+		t.Errorf("config was modified by a rejected payload: PremiumizemeAPIKey=%q (was %q) SimultaneousDownloads=%d (was %d)",
+			cfg.PremiumizemeAPIKey, apiKeyBefore, cfg.SimultaneousDownloads, sdBefore)
+	}
+}
+
+// TestConfigHandlerRejectsIncompletePayload is the regression test for review
+// finding R1-1: an empty or partial object passes the null guard but still
+// wipes the whole config through the whole-struct replace while answering
+// succeeded: true.
+func TestConfigHandlerRejectsIncompletePayload(t *testing.T) {
+	t.Run("empty object", func(t *testing.T) {
+		ws, cfg := newConfigRouteTestService(t)
+		apiKeyBefore, sdBefore := cfg.PremiumizemeAPIKey, cfg.SimultaneousDownloads
+
+		req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader("{}"))
+		rec := httptest.NewRecorder()
+		ws.ConfigHandler(rec, req)
+
+		var resp ConfigChangeResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshaling response %q: %v", rec.Body.String(), err)
+		}
+		if resp.Succeeded {
+			t.Errorf("succeeded = true, want false for an empty payload")
+		}
+		if !strings.Contains(resp.Status, "PremiumizemeAPIKey") {
+			t.Errorf("status = %q, want it to name missing fields", resp.Status)
+		}
+		assertConfigUnchanged(t, cfg, apiKeyBefore, sdBefore)
+	})
+	t.Run("partial object", func(t *testing.T) {
+		ws, cfg := newConfigRouteTestService(t)
+		apiKeyBefore, sdBefore := cfg.PremiumizemeAPIKey, cfg.SimultaneousDownloads
+
+		req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(`{"BindPort":"8182"}`))
+		rec := httptest.NewRecorder()
+		ws.ConfigHandler(rec, req)
+
+		var resp ConfigChangeResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshaling response %q: %v", rec.Body.String(), err)
+		}
+		if resp.Succeeded {
+			t.Errorf("succeeded = true, want false for a partial payload")
+		}
+		if !strings.Contains(resp.Status, "SimultaneousDownloads") {
+			t.Errorf("status = %q, want it to name missing fields", resp.Status)
+		}
+		assertConfigUnchanged(t, cfg, apiKeyBefore, sdBefore)
+	})
+}
+
+// TestConfigHandlerRejectsCaseVariantNullField is the regression test for
+// review finding R1-2: encoding/json resolves field names case-insensitively,
+// so a case-variant spelling of a numeric field with a null value must be
+// rejected exactly like the exact-case spelling.
+func TestConfigHandlerRejectsCaseVariantNullField(t *testing.T) {
+	ws, cfg := newConfigRouteTestService(t)
+	apiKeyBefore, sdBefore := cfg.PremiumizemeAPIKey, cfg.SimultaneousDownloads
+
+	// Full payload (every config key present) where SimultaneousDownloads is
+	// set canonically and repeated in lower case with a null value.
+	body := strings.Replace(nullSimultaneousDownloadsPayload,
+		`"SimultaneousDownloads":null`,
+		`"SimultaneousDownloads":7,"simultaneousdownloads":null`, 1)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	ws.ConfigHandler(rec, req)
+
+	var resp ConfigChangeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshaling response %q: %v", rec.Body.String(), err)
+	}
+	if resp.Succeeded {
+		t.Errorf("succeeded = true, want false for a case-variant null SimultaneousDownloads")
+	}
+	if !strings.Contains(resp.Status, "SimultaneousDownloads") {
+		t.Errorf("status = %q, want the canonical field name", resp.Status)
+	}
+	assertConfigUnchanged(t, cfg, apiKeyBefore, sdBefore)
+}
+
+// TestConfigHandlerRejectsWrongTypedField exercises the struct-decode error
+// branch (review finding R1-3): a payload that passes validation but fails
+// the json decode into config.Config must be rejected without touching the
+// config.
+func TestConfigHandlerRejectsWrongTypedField(t *testing.T) {
+	ws, cfg := newConfigRouteTestService(t)
+	apiKeyBefore, sdBefore := cfg.PremiumizemeAPIKey, cfg.SimultaneousDownloads
+
+	body := strings.Replace(zeroNumericFieldsPayload,
+		`"SimultaneousDownloads":0`,
+		`"SimultaneousDownloads":"five"`, 1)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	ws.ConfigHandler(rec, req)
+
+	var resp ConfigChangeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshaling response %q: %v", rec.Body.String(), err)
+	}
+	if resp.Succeeded {
+		t.Fatalf("succeeded = true for a wrongly typed field: %s", resp.Status)
+	}
+	assertConfigUnchanged(t, cfg, apiKeyBefore, sdBefore)
 }
 
 // configIntField reads an exported int field of config.Config by name for
@@ -237,7 +369,8 @@ func cloneStringAnyMap(m map[string]any) map[string]any {
 // table for review finding R1-3: for every numeric field, an explicit null
 // must be rejected (naming the field, config unchanged) while an explicit 0
 // must remain storable. The rows vary null vs 0, not null vs absent —
-// omitted fields keep the whole-struct replace behavior.
+// absent fields are rejected by the completeness check
+// (TestConfigHandlerRejectsIncompletePayload).
 func TestConfigHandlerNumericFieldNullRejectedZeroAccepted(t *testing.T) {
 	base := map[string]any{
 		"PremiumizemeAPIKey":                      "xxxxxxxxx",
