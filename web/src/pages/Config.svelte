@@ -40,7 +40,28 @@
   };
   const ERR_SAVE = "Error Saving Config";
   const ERR_TEST = "Error Testing *arr client";
+  
+  // Numeric inputs that must hold a finite number before saving. A cleared
+  // type="number" input binds null, which the backend decodes into the zero
+  // value and would silently save 0 (issue #89). The grace period input is
+  // exempt: clearing it is the documented way to reset it to the default.
+  // Server-side counterpart: numericConfigFields in
 
+  // internal/service/web_service_config_routes.go.
+  const numericFields = [
+    ["ArrHistoryUpdateIntervalSeconds", "Arr Update History Interval (seconds)"],
+    ["PollBlackholeIntervalMinutes", "Poll Blackhole Interval Minutes"],
+    ["SimultaneousDownloads", "Simultaneous Downloads"],
+    ["DownloadSpeedLimit", "SpeedLimit per Download in Megabytes / s"],
+  ];
+
+  function invalidNumericFields() {
+    return numericFields.filter(([key]) => {
+      const value = config[key];
+      return value === null || value === undefined || value === "" || !Number.isFinite(Number(value));
+    });
+  }
+  
   function slugify(value) {
     return value.toLowerCase().replace(/[^a-z0-9]+/g, "-");
   }
@@ -48,7 +69,7 @@
   function trimSlugEdges(value) {
     return value.replace(/^-+|-+$/g, "");
   }
-
+  
   let arrTesting = [];
   let arrTestIcons = [];
   let arrTestKind = [];
@@ -89,6 +110,15 @@
   }
 
   function submit() {
+    const invalidFields = invalidNumericFields();
+    if (invalidFields.length > 0) {
+      errorTitle = ERR_SAVE;
+      errorMessage =
+        "The following fields must contain a number: " +
+        invalidFields.map(([, label]) => label).join(", ");
+      errorModal = true;
+      return;
+    }
     inputDisabled = true;
     // The grace period input is a DOM string; the strict Go config
     // decoder rejects strings, so coerce it to an integer before
