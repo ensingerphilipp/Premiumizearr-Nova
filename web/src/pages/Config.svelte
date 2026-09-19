@@ -35,16 +35,18 @@
     DownloadSpeedLimit: 100,
     EnableTlsCheck: false,
     TransferOnlyMode: false,
+    EnableArrSubfolders: false,
     Arrs: [],
   };
   const ERR_SAVE = "Error Saving Config";
   const ERR_TEST = "Error Testing *arr client";
-
+  
   // Numeric inputs that must hold a finite number before saving. A cleared
   // type="number" input binds null, which the backend decodes into the zero
   // value and would silently save 0 (issue #89). The grace period input is
   // exempt: clearing it is the documented way to reset it to the default.
   // Server-side counterpart: numericConfigFields in
+
   // internal/service/web_service_config_routes.go.
   const numericFields = [
     ["ArrHistoryUpdateIntervalSeconds", "Arr Update History Interval (seconds)"],
@@ -59,7 +61,15 @@
       return value === null || value === undefined || value === "" || !Number.isFinite(Number(value));
     });
   }
+  
+  function slugify(value) {
+    return value.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  }
 
+  function trimSlugEdges(value) {
+    return value.replace(/^-+|-+$/g, "");
+  }
+  
   let arrTesting = [];
   let arrTestIcons = [];
   let arrTestKind = [];
@@ -151,7 +161,7 @@
 
   function AddArr() {
     config.Arrs.push({
-      Name: "New Arr",
+      Name: `new-arr-${config.Arrs.length + 1}`,
       URL: "http://127.0.0.1:1234",
       APIKey: "xxxxxxxx",
       Type: "Sonarr",
@@ -253,7 +263,11 @@
                 bind:value={arr.Name}
                 disabled={inputDisabled}
                 on:input={() => {
+                  arr.Name = slugify(arr.Name);
                   UntestArr(i);
+                }}
+                on:blur={() => {
+                  arr.Name = trimSlugEdges(arr.Name);
                 }}
               />
               <TextInput
@@ -386,6 +400,11 @@
           disabled={inputDisabled}
           bind:toggled={config.EnableTlsCheck}
           labelText="Check TLS-Certificate at Download (enabling can break certain CDNs)"
+        />
+        <Toggle
+          disabled={inputDisabled}
+          bind:toggled={config.EnableArrSubfolders}
+          labelText="Use per-Arr subfolders (Blackhole/Downloads/premiumize.me), based on each Arr's Name"
         />
         <TextInput
           type="number"

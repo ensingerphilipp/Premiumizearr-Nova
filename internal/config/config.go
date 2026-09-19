@@ -45,6 +45,13 @@ func LoadOrCreateConfig(altConfigLocation string, _appCallback AppCallback) (Con
 	config.appCallback = _appCallback
 	config.altConfigLocation = altConfigLocation
 
+	if config.EnableArrSubfolders {
+		if err := ValidateArrs(config.Arrs); err != nil {
+			log.Errorf("Invalid Arrs configuration: %s. EnableArrSubfolders requires every Arr Name to be a lowercase slug (letters, digits, hyphens only) since it is used as the subfolder name. Fix the Arr names in config.yaml (or in the web UI) and restart, or set EnableArrSubfolders back to false.", err)
+			return config, ErrInvalidArrConfig
+		}
+	}
+
 	config.Save()
 
 	return config, nil
@@ -143,6 +150,12 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 		updated = true
 	}
 
+	if configInterface["EnableArrSubfolders"] == nil {
+		log.Info("EnableArrSubfolders not set, setting to false")
+		config.EnableArrSubfolders = false
+		updated = true
+	}
+
 	if configInterface["PollBlackholeIntervalMinutes"] == nil {
 		log.Info("PollBlackholeIntervalMinutes not set, setting to 10")
 		config.PollBlackholeIntervalMinutes = 10
@@ -185,9 +198,9 @@ func defaultConfig() Config {
 	return Config{
 		PremiumizemeAPIKey: "xxxxxxxxx",
 		Arrs: []ArrConfig{
-			{Name: "Sonarr", URL: "http://127.0.0.1:8989", APIKey: "xxxxxxxxx", Type: Sonarr},
-			{Name: "Radarr", URL: "http://127.0.0.1:7878", APIKey: "xxxxxxxxx", Type: Radarr},
-			{Name: "Lidarr", URL: "http://127.0.0.1:8686", APIKey: "xxxxxxxxx", Type: Lidarr},
+			{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "xxxxxxxxx", Type: Sonarr},
+			{Name: "radarr", URL: "http://127.0.0.1:7878", APIKey: "xxxxxxxxx", Type: Radarr},
+			{Name: "lidarr", URL: "http://127.0.0.1:8686", APIKey: "xxxxxxxxx", Type: Lidarr},
 		},
 		BlackholeDirectory:                      "",
 		PollBlackholeDirectory:                  false,
@@ -201,6 +214,7 @@ func defaultConfig() Config {
 		DownloadSpeedLimit:                      100,
 		EnableTlsCheck:                          false,
 		TransferOnlyMode:                        false,
+		EnableArrSubfolders:                     false,
 		ArrHistoryUpdateIntervalSeconds:         20,
 		ErroredTransferDeleteGracePeriodSeconds: 300,
 	}

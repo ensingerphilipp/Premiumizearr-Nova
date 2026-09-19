@@ -12,10 +12,41 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/stringqueue"
 	log "github.com/sirupsen/logrus"
 )
+
+func TestResolveTargetFolderID(t *testing.T) {
+	blackholeDir := "/blackhole"
+	mainFolderID := "main-folder-id"
+	arrFolders := map[string]string{
+		"sonarr": "sonarr-folder-id",
+	}
+
+	tests := []struct {
+		name     string
+		filePath string
+		wantID   string
+		wantOK   bool
+		wantSlug string
+	}{
+		{"file in main folder", "/blackhole/movie.torrent", mainFolderID, true, ""},
+		{"file in resolved Arr subfolder", "/blackhole/sonarr/episode.nzb", "sonarr-folder-id", true, "sonarr"},
+		{"file in unresolved subfolder", "/blackhole/radarr/movie.magnet", "", false, "radarr"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id, ok, slug := resolveTargetFolderID(tt.filePath, blackholeDir, mainFolderID, arrFolders)
+			if id != tt.wantID || ok != tt.wantOK || slug != tt.wantSlug {
+				t.Fatalf("resolveTargetFolderID(%q) = (%q, %v, %q), want (%q, %v, %q)",
+					tt.filePath, id, ok, slug, tt.wantID, tt.wantOK, tt.wantSlug)
+			}
+		})
+	}
+}
 
 func TestProcessUploadCycleQuotaBehavior(t *testing.T) {
 	tests := []struct {
@@ -187,7 +218,7 @@ func TestProcessUploadCycleChecksQuotaOnceForMultipleFiles(t *testing.T) {
 	defer server.Close()
 
 	service, _ := newQuotaTestService(t, server, "test-key", "first.magnet")
-	secondFile := filepath.Join(t.TempDir(), "second.magnet")
+	secondFile := filepath.Join(service.config.BlackholeDirectory, "second.magnet")
 	if err := os.WriteFile(secondFile, []byte("magnet:?xt=urn:btih:second"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -281,6 +312,7 @@ func newQuotaTestService(t *testing.T, server *httptest.Server, apiKey, fileName
 	service.Queue = stringqueue.NewStringQueue()
 	service.Queue.Add(filePath)
 	service.downloadsFolderID = "folder-id"
+	service.config = &config.Config{BlackholeDirectory: filepath.Dir(filePath)}
 	return &service, filePath
 }
 
@@ -326,7 +358,7 @@ func TestUploadBatchPreservesTransferPacing(t *testing.T) {
 	}))
 	defer server.Close()
 	svc, _ := newQuotaTestService(t, server, "test-key", "first.magnet")
-	second := filepath.Join(t.TempDir(), "second.magnet")
+	second := filepath.Join(svc.config.BlackholeDirectory, "second.magnet")
 	if err := os.WriteFile(second, []byte("magnet:?xt=urn:btih:second"), 0600); err != nil {
 		t.Fatal(err)
 	}

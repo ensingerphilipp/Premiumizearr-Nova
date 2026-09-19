@@ -63,6 +63,16 @@ func (w *WatchDirectory) Watch() error {
 	return nil
 }
 
+// AddWatchPath watches an additional directory on top of the root Path
+func (w *WatchDirectory) AddWatchPath(path string) error {
+	return w.Watcher.Add(filepath.Clean(path))
+}
+
+// RemoveWatchPath stops watching a directory previously added via AddWatchPath
+func (w *WatchDirectory) RemoveWatchPath(path string) error {
+	return w.Watcher.Remove(filepath.Clean(path))
+}
+
 func (w *WatchDirectory) UpdatePath(path string) error {
 	w.Watcher.Remove(w.Path)
 	w.Path = path

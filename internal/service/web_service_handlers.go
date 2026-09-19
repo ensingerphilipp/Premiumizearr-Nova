@@ -31,6 +31,7 @@ func (s *WebServerService) TransfersHandler(w http.ResponseWriter, r *http.Reque
 type BlackholeFile struct {
 	ID   int    `json:"id"`
 	Name string `json:"name"`
+	Arr  string `json:"arr"`
 }
 type BlackholeResponse struct {
 	BlackholeFiles []BlackholeFile `json:"data"`
@@ -96,9 +97,14 @@ func (s *WebServerService) BlackholeHandler(w http.ResponseWriter, r *http.Reque
 	} else {
 		for i, n := range s.directoryWatcherService.Queue.GetQueue() {
 			name := path.Base(n)
+			arr := ""
+			if path.Dir(n) != path.Clean(s.config.BlackholeDirectory) {
+				arr = path.Base(path.Dir(n))
+			}
 			resp.BlackholeFiles = append(resp.BlackholeFiles, BlackholeFile{
 				ID:   i,
 				Name: name,
+				Arr:  arr,
 			})
 		}
 

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -46,6 +47,8 @@ type TransferManagerService struct {
 	downloadsFolderID     string
 	failedDownloadsMutex  *sync.Mutex
 	failedDownloads       map[string]time.Time // Maps item name to failure timestamp
+	arrFoldersMutex       *sync.Mutex
+	arrFolders            map[string]string // Arr slug -> premiumize.me subfolder ID
 	erroredTransfersMutex *sync.Mutex
 	erroredTransfers      map[string]*erroredTransferState // Maps premiumize.me transfer ID to grace-period tracking state
 	processingWG          *sync.WaitGroup                  // Tracks in-flight report/delete goroutines so callers can synchronize with them
@@ -66,6 +69,8 @@ func (t TransferManagerService) New() TransferManagerService {
 	t.downloadsFolderID = ""
 	t.failedDownloadsMutex = &sync.Mutex{}
 	t.failedDownloads = make(map[string]time.Time, 0)
+	t.arrFoldersMutex = &sync.Mutex{}
+	t.arrFolders = make(map[string]string, 0)
 	t.erroredTransfersMutex = &sync.Mutex{}
 	t.erroredTransfers = make(map[string]*erroredTransferState, 0)
 	t.processingWG = &sync.WaitGroup{}
@@ -139,21 +144,64 @@ func (t *TransferManagerService) CleanUpDownloadDir() {
 }
 
 func (manager *TransferManagerService) ConfigUpdatedCallback(currentConfig config.Config, newConfig config.Config) {
-	if currentConfig.DownloadsDirectory != newConfig.DownloadsDirectory {
+	downloadsDirChanged := currentConfig.DownloadsDirectory != newConfig.DownloadsDirectory
+	transferChanged := currentConfig.TransferDirectory != newConfig.TransferDirectory
+	arrsChanged := !reflect.DeepEqual(currentConfig.Arrs, newConfig.Arrs)
+	toggleChanged := currentConfig.EnableArrSubfolders != newConfig.EnableArrSubfolders
+
+	if downloadsDirChanged {
 		log.Trace("Inside ConfigUpdatedCallback")
 		manager.CleanUpDownloadDir()
 	}
 
-	if currentConfig.TransferDirectory != newConfig.TransferDirectory {
+	if transferChanged {
 		log.Trace("Updating Transfer Directory in TransferManagerService")
 		newDir := newConfig.TransferDirectory
 		newID := utils.GetDownloadsFolderIDFromPremiumizeme(manager.premiumizemeClient, newDir)
 		manager.downloadsFolderID = newID
 	}
+
+	if downloadsDirChanged || transferChanged || arrsChanged || toggleChanged {
+		manager.resolveArrFolders()
+	}
+}
+
+func (manager *TransferManagerService) clearArrFolders() {
+	manager.arrFoldersMutex.Lock()
+	defer manager.arrFoldersMutex.Unlock()
+	manager.arrFolders = make(map[string]string, 0)
+}
+
+func (manager *TransferManagerService) resolveArrFolders() {
+	if !manager.config.EnableArrSubfolders {
+		manager.clearArrFolders()
+		return
+	}
+
+	newFolders := make(map[string]string, len(manager.config.Arrs))
+
+	for _, arr := range manager.config.Arrs {
+		id, err := utils.GetOrCreateSubfolderID(manager.premiumizemeClient, manager.downloadsFolderID, arr.Name)
+		if err != nil {
+			log.Errorf("Cannot resolve premiumize.me subfolder for Arr %s: %s", arr.Name, err)
+			continue
+		}
+		newFolders[arr.Name] = id
+
+		local := filepath.Join(manager.config.DownloadsDirectory, arr.Name)
+		if err := os.MkdirAll(local, os.ModePerm); err != nil {
+			log.Errorf("Cannot create downloads subfolder for Arr %s: %s", arr.Name, err)
+		}
+	}
+
+	manager.arrFoldersMutex.Lock()
+	manager.arrFolders = newFolders
+	manager.arrFoldersMutex.Unlock()
 }
 
 func (manager *TransferManagerService) Run(interval time.Duration) {
 	manager.downloadsFolderID = utils.GetDownloadsFolderIDFromPremiumizeme(manager.premiumizemeClient, manager.config.TransferDirectory)
+	manager.resolveArrFolders()
 	for {
 		manager.runningTask = true
 		manager.TaskUpdateTransfersList()
@@ -536,13 +584,46 @@ func (manager *TransferManagerService) TaskCheckPremiumizeDownloadsFolder() {
 		return
 	}
 
-	items, err := manager.premiumizemeClient.ListFolder(manager.downloadsFolderID)
-	if err != nil {
-		log.Errorf("Error listing downloads folder: %s", err.Error())
+	var arrFolders map[string]string
+	if manager.config.EnableArrSubfolders {
+		manager.arrFoldersMutex.Lock()
+		arrFolders = make(map[string]string, len(manager.arrFolders))
+		for slug, folderID := range manager.arrFolders {
+			arrFolders[slug] = folderID
+		}
+		manager.arrFoldersMutex.Unlock()
+	}
+
+	excludeNames := make(map[string]bool, len(arrFolders))
+	for slug := range arrFolders {
+		excludeNames[slug] = true
+	}
+
+	if !manager.checkFolder(manager.downloadsFolderID, manager.config.DownloadsDirectory, excludeNames) {
 		return
 	}
 
+	for slug, folderID := range arrFolders {
+		localDir := filepath.Join(manager.config.DownloadsDirectory, slug)
+		if !manager.checkFolder(folderID, localDir, nil) {
+			return // SimultaneousDownloads cap reached
+		}
+	}
+}
+
+func (manager *TransferManagerService) checkFolder(premiumizeFolderID, localDir string, excludeNames map[string]bool) bool {
+	items, err := manager.premiumizemeClient.ListFolder(premiumizeFolderID)
+	if err != nil {
+		log.Errorf("Error listing downloads folder: %s", err.Error())
+		return true
+	}
+
 	for _, item := range items {
+		// Skip the Arr container folders themselves - they are scanned separately.
+		if excludeNames[item.Name] {
+			continue
+		}
+
 		// Skip items that are currently downloading
 		if manager.downloadExists(item.Name) {
 			log.Tracef("Item %s is already downloading", item.Name)
@@ -555,16 +636,16 @@ func (manager *TransferManagerService) TaskCheckPremiumizeDownloadsFolder() {
 			continue
 		}
 
-		if manager.countDownloads() < manager.config.SimultaneousDownloads {
-			log.Debugf("Processing completed item: %s", item.Name)
-			manager.HandleFinishedItem(item, manager.config.DownloadsDirectory)
-			//Sleep for one Second to let Asynchronous Downloads Start and Update
-			time.Sleep(time.Second * 1)
-		} else {
+		if manager.countDownloads() >= manager.config.SimultaneousDownloads {
 			log.Debugf("Not processing any more transfers, %d are running and cap is %d", manager.countDownloads(), manager.config.SimultaneousDownloads)
-			break
+			return false
 		}
+
+		log.Debugf("Processing completed item: %s", item.Name)
+		manager.HandleFinishedItem(item, localDir, premiumizeFolderID)
+		time.Sleep(time.Second * 1)
 	}
+	return true
 }
 
 func (manager *TransferManagerService) updateTransfers(transfers []premiumizeme.Transfer) {
@@ -641,7 +722,7 @@ func (manager *TransferManagerService) isDownloadInCooldown(itemName string) boo
 	return false
 }
 
-func (manager *TransferManagerService) HandleFinishedItem(item premiumizeme.Item, downloadDirectory string) {
+func (manager *TransferManagerService) HandleFinishedItem(item premiumizeme.Item, downloadDirectory string, premiumizeParentFolderID string) {
 	if manager.downloadExists(item.Name) {
 		log.Tracef("Transfer %s is already downloading", item.Name)
 		return
@@ -651,7 +732,7 @@ func (manager *TransferManagerService) HandleFinishedItem(item premiumizeme.Item
 	if item.Type == "file" {
 		log.Tracef("Handling Item Type File in finished Transfer %s", item.Name)
 
-		id, err := manager.premiumizemeClient.CreateFolder(item.Name+".folder", &manager.downloadsFolderID)
+		id, err := manager.premiumizemeClient.CreateFolder(item.Name+".folder", &premiumizeParentFolderID)
 		if err != nil {
 			log.Errorf("cannot create Folder for Single File Download! %+v", err)
 			return

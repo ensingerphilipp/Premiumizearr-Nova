@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -26,6 +27,7 @@ type DirectoryWatcherService struct {
 	quotaCheckFailed   bool
 	downloadsFolderID  string
 	watchDirectory     *directory_watcher.WatchDirectory
+	arrFolders         map[string]string // Arr slug -> pme subfolder ID
 }
 
 const (
@@ -49,20 +51,35 @@ func (dw *DirectoryWatcherService) Init(premiumizemeClient *premiumizeme.Premium
 }
 
 func (dw *DirectoryWatcherService) ConfigUpdatedCallback(currentConfig config.Config, newConfig config.Config) {
-	if currentConfig.BlackholeDirectory != newConfig.BlackholeDirectory {
+	blackholeChanged := currentConfig.BlackholeDirectory != newConfig.BlackholeDirectory
+	transferChanged := currentConfig.TransferDirectory != newConfig.TransferDirectory
+	arrsChanged := !reflect.DeepEqual(currentConfig.Arrs, newConfig.Arrs)
+	toggleChanged := currentConfig.EnableArrSubfolders != newConfig.EnableArrSubfolders
+
+	if blackholeChanged {
 		log.Info("Blackhole directory changed, restarting directory watcher...")
 		log.Info("Running initial directory scan...")
 		go dw.directoryScan(dw.config.BlackholeDirectory)
 		dw.watchDirectory.UpdatePath(newConfig.BlackholeDirectory)
+
+		if dw.watchDirectory != nil {
+			for slug := range dw.arrFolders {
+				dw.watchDirectory.RemoveWatchPath(filepath.Join(currentConfig.BlackholeDirectory, slug))
+			}
+		}
 	}
 
-	if currentConfig.TransferDirectory != newConfig.TransferDirectory {
+	if transferChanged {
 		log.Info("TransferDirectory directory changed, changing directory watcher...")
 		dw.setTransferDirectory(newConfig.TransferDirectory)
 	}
 
 	if currentConfig.PollBlackholeDirectory != newConfig.PollBlackholeDirectory {
 		log.Info("Poll blackhole directory changed, restarting directory watcher...")
+	}
+
+	if blackholeChanged || transferChanged || arrsChanged || toggleChanged {
+		dw.resolveArrFolders()
 	}
 }
 
@@ -106,6 +123,7 @@ func (dw *DirectoryWatcherService) Start() {
 				time.Sleep(time.Duration(dw.config.PollBlackholeIntervalMinutes) * time.Minute)
 				log.Infof("Running directory scan of %s", dw.config.BlackholeDirectory)
 				dw.directoryScan(dw.config.BlackholeDirectory)
+				dw.scanArrFolders()
 				log.Infof("Scan complete, next scan in %d minutes", dw.config.PollBlackholeIntervalMinutes)
 			}
 		}()
@@ -117,6 +135,90 @@ func (dw *DirectoryWatcherService) Start() {
 			dw.addFileToQueue,
 		)
 		dw.watchDirectory.Watch()
+	}
+
+	dw.resolveArrFolders()
+}
+
+// clearArrFolders stops watching all known Arr subfolders and forgets their
+// pme IDs, without deleting anything on disk or on pme.
+func (dw *DirectoryWatcherService) clearArrFolders() {
+	dw.mu.Lock()
+	oldFolders := dw.arrFolders
+	dw.arrFolders = nil
+	dw.mu.Unlock()
+
+	if dw.watchDirectory != nil {
+		for slug := range oldFolders {
+			dw.watchDirectory.RemoveWatchPath(filepath.Join(dw.config.BlackholeDirectory, slug))
+		}
+	}
+}
+
+// resolveArrFolders ensures each configured Arr has a local blackhole subfolder
+// and a matching pme subfolder, and watches/scans it for existing files.
+func (dw *DirectoryWatcherService) resolveArrFolders() {
+	if !dw.config.EnableArrSubfolders {
+		dw.clearArrFolders()
+		return
+	}
+
+	newFolders := make(map[string]string, len(dw.config.Arrs))
+
+	for _, arr := range dw.config.Arrs {
+		id, err := utils.GetOrCreateSubfolderID(dw.premiumizemeClient, dw.downloadsFolderID, arr.Name)
+		if err != nil {
+			log.Errorf("Cannot resolve premiumize.me subfolder for Arr %s: %s", arr.Name, err)
+			continue
+		}
+		newFolders[arr.Name] = id
+
+		local := filepath.Join(dw.config.BlackholeDirectory, arr.Name)
+		if err := os.MkdirAll(local, os.ModePerm); err != nil {
+			log.Errorf("Cannot create blackhole subfolder for Arr %s: %s", arr.Name, err)
+			continue
+		}
+
+		if dw.watchDirectory != nil {
+			if err := dw.watchDirectory.AddWatchPath(local); err != nil {
+				log.Errorf("Cannot watch blackhole subfolder %s: %s", local, err)
+			}
+		}
+		dw.directoryScan(local)
+	}
+
+	dw.mu.Lock()
+	oldFolders := dw.arrFolders
+	dw.arrFolders = newFolders
+	dw.mu.Unlock()
+
+	configuredSlugs := make(map[string]bool, len(dw.config.Arrs))
+	for _, arr := range dw.config.Arrs {
+		configuredSlugs[arr.Name] = true
+	}
+
+	for slug := range oldFolders {
+		if configuredSlugs[slug] {
+			continue
+		}
+		if dw.watchDirectory != nil {
+			dw.watchDirectory.RemoveWatchPath(filepath.Join(dw.config.BlackholeDirectory, slug))
+		}
+		log.Infof("Arr %s no longer configured, local/premiumize subfolder is kept but no longer watched", slug)
+	}
+}
+
+func (dw *DirectoryWatcherService) scanArrFolders() {
+	if !dw.config.EnableArrSubfolders {
+		return
+	}
+
+	for _, arr := range dw.config.Arrs {
+		local := filepath.Join(dw.config.BlackholeDirectory, arr.Name)
+		if _, err := os.Stat(local); err != nil {
+			continue
+		}
+		dw.directoryScan(local)
 	}
 }
 
@@ -146,6 +248,10 @@ func (dw *DirectoryWatcherService) checkFile(path string) int {
 	}
 
 	if fi.IsDir() {
+		if dw.isConfiguredArrSlug(filepath.Base(path)) {
+			log.Tracef("Directory %s is a configured Arr subfolder, handled separately", path)
+			return 0
+		}
 		log.Errorf("Directory created in blackhole %s ignoring (Warning premiumizearrd does not look in subfolders!)", path)
 		return 2
 	}
@@ -158,11 +264,54 @@ func (dw *DirectoryWatcherService) checkFile(path string) int {
 	}
 }
 
+func (dw *DirectoryWatcherService) isConfiguredArrSlug(slug string) bool {
+	if !dw.config.EnableArrSubfolders {
+		return false
+	}
+	for _, arr := range dw.config.Arrs {
+		if arr.Name == slug {
+			return true
+		}
+	}
+	return false
+}
+
 func (dw *DirectoryWatcherService) addFileToQueue(path string) {
 	if !dw.Queue.AddIfAbsent(path) {
 		return
 	}
 	log.Infof("File created in blackhole %s added to Queue. Queue length %d", path, dw.Queue.Len())
+}
+
+func (dw *DirectoryWatcherService) resolveSingleArrFolder(slug string) (string, bool) {
+	if !dw.config.EnableArrSubfolders {
+		return "", false
+	}
+
+	id, err := utils.GetOrCreateSubfolderID(dw.premiumizemeClient, dw.downloadsFolderID, slug)
+	if err != nil {
+		log.Errorf("Cannot resolve premiumize.me subfolder for Arr %s: %s", slug, err)
+		return "", false
+	}
+
+	dw.mu.Lock()
+	if dw.arrFolders == nil {
+		dw.arrFolders = map[string]string{}
+	}
+	dw.arrFolders[slug] = id
+	dw.mu.Unlock()
+
+	return id, true
+}
+
+func resolveTargetFolderID(filePath, blackholeDir, mainFolderID string, arrFolders map[string]string) (folderID string, ok bool, slug string) {
+	if filepath.Dir(filePath) == filepath.Clean(blackholeDir) {
+		return mainFolderID, true, ""
+	}
+
+	slug = filepath.Base(filepath.Dir(filePath))
+	id, found := arrFolders[slug]
+	return id, found, slug
 }
 
 func (dw *DirectoryWatcherService) processUploads() {
@@ -258,8 +407,15 @@ func (dw *DirectoryWatcherService) submissionsAllowed() bool {
 func (dw *DirectoryWatcherService) processUpload(filePath string) bool {
 	log.Debugf("Processing %s", filePath)
 	dw.mu.RLock()
-	folderID := dw.downloadsFolderID
+	folderID, ok, slug := resolveTargetFolderID(filePath, dw.config.BlackholeDirectory, dw.downloadsFolderID, dw.arrFolders)
 	dw.mu.RUnlock()
+	if !ok && slug != "" {
+		folderID, ok = dw.resolveSingleArrFolder(slug)
+	}
+	if !ok {
+		log.Errorf("No resolved target folder for %s, skipping upload", filePath)
+		return false
+	}
 
 	err := dw.premiumizemeClient.CreateTransfer(filePath, folderID)
 	if err != nil {
