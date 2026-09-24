@@ -146,7 +146,43 @@ func (s *WebServerService) ConfigHandler(w http.ResponseWriter, r *http.Request)
 			})
 			return
 		}
-		s.config.UpdateConfig(newConfig)
+		// Mirror the startup gate in LoadOrCreateConfig: slug validation
+		// applies only with the feature on, so an upgrade whose legacy
+		// config.yaml still carries capitalized names can save unrelated
+		// changes without being forced to retype every Arr name.
+		if newConfig.EnableArrSubfolders {
+			if err := config.ValidateArrs(newConfig.Arrs); err != nil {
+				EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
+					Succeeded: false,
+					Status:    err.Error(),
+				})
+				return
+			}
+			// Mirror the startup gate as well: an empty blackhole
+			// directory is unusable for per-Arr subfolders (local folders
+			// and uploads would resolve to relative paths, findings
+			// S-19/S-29), so the save is rejected with a clear message
+			// instead of being silently accepted.
+			if newConfig.BlackholeDirectory == "" {
+				EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
+					Succeeded: false,
+					Status:    config.ErrEmptyBlackholeDirectory.Error(),
+				})
+				return
+			}
+		}
+		// The persistence error is reported instead of a blanket success:
+		// the config was validated above, so a save failure is a real
+		// problem the user needs to see (finding C-4f). The reconfiguration
+		// of the services is asynchronous and its failures are logged and
+		// retried by the services without undoing the saved config.
+		if err := s.config.UpdateConfig(newConfig); err != nil {
+			EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
+				Succeeded: false,
+				Status:    fmt.Sprintf("Config was validated but could not be saved: %s", err.Error()),
+			})
+			return
+		}
 		EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
 			Succeeded: true,
 			Status:    "Config updated",

@@ -20,21 +20,22 @@ func TestCountDownloadsActiveTopLevelJobs(t *testing.T) {
 	// Two concurrently active top-level folder jobs: the state
 	// HandleFinishedItem leaves in downloadList right after admitting both,
 	// before any child-file entry exists (e.g. both jobs still listing).
-	m.addDownload(&premiumizeme.Item{Name: "Show.S01"}, true)
-	m.addDownload(&premiumizeme.Item{Name: "Show.S02"}, true)
+	m.addDownload(&premiumizeme.Item{Name: "Show.S01"}, "main-id", true)
+	m.addDownload(&premiumizeme.Item{Name: "Show.S02"}, "main-id", true)
 	if got := m.countDownloads(); got != 2 {
 		t.Fatalf("two active top-level jobs: countDownloads() = %d, want 2", got)
 	}
 
 	// A transient child-file entry (one job mid-wget) must not change the
-	// count; child entries are keyed by bare file name, as in production.
-	m.addDownload(&premiumizeme.Item{Name: "01.mkv"}, false)
+	// count; child entries are keyed by folder ID plus file name, as in
+	// production.
+	m.addDownload(&premiumizeme.Item{Name: "01.mkv"}, "show-id", false)
 	if got := m.countDownloads(); got != 2 {
 		t.Fatalf("with transient child-file entry: countDownloads() = %d, want 2", got)
 	}
 
 	// Job completion removes exactly its own top-level entry.
-	m.removeDownload("Show.S01")
+	m.removeDownload("main-id", "Show.S01")
 	if got := m.countDownloads(); got != 1 {
 		t.Fatalf("after one job completed: countDownloads() = %d, want 1", got)
 	}
@@ -42,7 +43,7 @@ func TestCountDownloadsActiveTopLevelJobs(t *testing.T) {
 	// Zero-value guard: entries added without the top-level marker (all
 	// transient child-file tracking) count as no active jobs.
 	n := TransferManagerService{}.New()
-	n.addDownload(&premiumizeme.Item{Name: "02.mkv"}, false)
+	n.addDownload(&premiumizeme.Item{Name: "02.mkv"}, "show-id", false)
 	if got := n.countDownloads(); got != 0 {
 		t.Fatalf("child-file entries only: countDownloads() = %d, want 0", got)
 	}
@@ -66,10 +67,11 @@ func TestTransferManagerServiceDownloadListConcurrency(t *testing.T) {
 			defer wg.Done()
 			<-release
 			for i := 0; i < iterations; i++ {
+				folderID := fmt.Sprintf("folder%d", w)
 				name := fmt.Sprintf("worker%d-%d", w, i)
-				m.addDownload(&premiumizeme.Item{Name: name}, true)
+				m.addDownload(&premiumizeme.Item{Name: name}, folderID, true)
 				m.countDownloads()
-				m.removeDownload(name)
+				m.removeDownload(folderID, name)
 			}
 		}(w)
 	}

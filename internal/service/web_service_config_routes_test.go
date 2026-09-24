@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -71,11 +72,11 @@ func newConfigRouteTestService(t *testing.T) (*WebServerService, *config.Config)
 // UI-shaped payload with every config field present, as submitted by
 // Config.svelte after the "Simultaneous Downloads" input has been cleared
 // (carbon-components-svelte binds null for a cleared number input).
-const nullSimultaneousDownloadsPayload = `{"PremiumizemeAPIKey":"xxxxxxxxx","Arrs":[],"BlackholeDirectory":"/blackhole","PollBlackholeDirectory":false,"PollBlackholeIntervalMinutes":10,"DownloadsDirectory":"/downloads","TransferDirectory":"arrDownloads","BindIP":"0.0.0.0","BindPort":"8182","WebRoot":"","SimultaneousDownloads":null,"DownloadSpeedLimit":100,"EnableTlsCheck":false,"TransferOnlyMode":false,"ArrHistoryUpdateIntervalSeconds":20,"ErroredTransferDeleteGracePeriodSeconds":300}`
+const nullSimultaneousDownloadsPayload = `{"PremiumizemeAPIKey":"xxxxxxxxx","Arrs":[],"BlackholeDirectory":"/blackhole","PollBlackholeDirectory":false,"PollBlackholeIntervalMinutes":10,"DownloadsDirectory":"/downloads","TransferDirectory":"arrDownloads","BindIP":"0.0.0.0","BindPort":"8182","WebRoot":"","SimultaneousDownloads":null,"DownloadSpeedLimit":100,"EnableTlsCheck":false,"TransferOnlyMode":false,"EnableArrSubfolders":false,"ArrHistoryUpdateIntervalSeconds":20,"ErroredTransferDeleteGracePeriodSeconds":300}`
 
 // Same payload with explicit zeros: 0 is a legitimate value the user can
 // still save (e.g. speed limit 0 = unlimited).
-const zeroNumericFieldsPayload = `{"PremiumizemeAPIKey":"xxxxxxxxx","Arrs":[],"BlackholeDirectory":"/blackhole","PollBlackholeDirectory":false,"PollBlackholeIntervalMinutes":0,"DownloadsDirectory":"/downloads","TransferDirectory":"arrDownloads","BindIP":"0.0.0.0","BindPort":"8182","WebRoot":"","SimultaneousDownloads":0,"DownloadSpeedLimit":0,"EnableTlsCheck":false,"TransferOnlyMode":false,"ArrHistoryUpdateIntervalSeconds":0,"ErroredTransferDeleteGracePeriodSeconds":0}`
+const zeroNumericFieldsPayload = `{"PremiumizemeAPIKey":"xxxxxxxxx","Arrs":[],"BlackholeDirectory":"/blackhole","PollBlackholeDirectory":false,"PollBlackholeIntervalMinutes":0,"DownloadsDirectory":"/downloads","TransferDirectory":"arrDownloads","BindIP":"0.0.0.0","BindPort":"8182","WebRoot":"","SimultaneousDownloads":0,"DownloadSpeedLimit":0,"EnableTlsCheck":false,"TransferOnlyMode":false,"EnableArrSubfolders":false,"ArrHistoryUpdateIntervalSeconds":0,"ErroredTransferDeleteGracePeriodSeconds":0}`
 
 // TestConfigHandlerRejectsNullNumericField is the regression test for issue
 // #89: a cleared numeric UI input sends null, which Go's json decoder treats
@@ -150,6 +151,59 @@ func TestConfigHandlerRejectsNullBody(t *testing.T) {
 		t.Errorf("config was modified by a rejected null payload: PremiumizemeAPIKey=%q SimultaneousDownloads=%d",
 			cfg.PremiumizemeAPIKey, cfg.SimultaneousDownloads)
 	}
+}
+
+// TestConfigHandlerValidatesArrsOnlyWhenFeatureEnabled is the regression
+// test for review finding R1-1: the route must validate the Arrs slug format
+// when EnableArrSubfolders is on (a save with a capitalized name like
+// "Sonarr" would otherwise be accepted at the route while
+// LoadOrCreateConfig rejects it, so the service and the persisted config
+// silently diverge), but must stay permissive with the historical names when
+// the feature is off.
+func TestConfigHandlerValidatesArrsOnlyWhenFeatureEnabled(t *testing.T) {
+	const base = `{"PremiumizemeAPIKey":"xxxxxxxxx","Arrs":[{"Name":"Sonarr","URL":"http://127.0.0.1:8989","APIKey":"k","Type":"Sonarr"}],"BlackholeDirectory":"/blackhole","PollBlackholeDirectory":false,"PollBlackholeIntervalMinutes":10,"DownloadsDirectory":"/downloads","TransferDirectory":"arrDownloads","BindIP":"0.0.0.0","BindPort":"8182","WebRoot":"","SimultaneousDownloads":5,"DownloadSpeedLimit":100,"EnableTlsCheck":false,"TransferOnlyMode":false,"EnableArrSubfolders":%s,"ArrHistoryUpdateIntervalSeconds":20,"ErroredTransferDeleteGracePeriodSeconds":300}`
+
+	t.Run("feature off keeps historical names storable", func(t *testing.T) {
+		ws, cfg := newConfigRouteTestService(t)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(fmt.Sprintf(base, "false")))
+		rec := httptest.NewRecorder()
+		ws.ConfigHandler(rec, req)
+
+		var resp ConfigChangeResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshaling response %q: %v", rec.Body.String(), err)
+		}
+		if !resp.Succeeded {
+			t.Fatalf("succeeded = false, want true for the legacy names with the feature off: %s", resp.Status)
+		}
+		if len(cfg.Arrs) != 1 || cfg.Arrs[0].Name != "Sonarr" {
+			t.Fatalf("Arrs = %+v, want the capitalized historical name persisted", cfg.Arrs)
+		}
+	})
+
+	t.Run("feature on rejects a non-slug name", func(t *testing.T) {
+		ws, cfg := newConfigRouteTestService(t)
+		arrsBefore := cfg.Arrs
+
+		req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(fmt.Sprintf(base, "true")))
+		rec := httptest.NewRecorder()
+		ws.ConfigHandler(rec, req)
+
+		var resp ConfigChangeResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshaling response %q: %v", rec.Body.String(), err)
+		}
+		if resp.Succeeded {
+			t.Fatalf("succeeded = true, want false for a non-slug Arr name with the feature on")
+		}
+		if !strings.Contains(resp.Status, "not a valid slug") {
+			t.Errorf("status = %q, want the slug validation error", resp.Status)
+		}
+		if len(cfg.Arrs) != len(arrsBefore) || cfg.Arrs[0].Name != arrsBefore[0].Name {
+			t.Fatalf("config was modified by the rejected payload: Arrs before = %+v, after = %+v", arrsBefore, cfg.Arrs)
+		}
+	})
 }
 
 // TestConfigHandlerRejectsOversizedBody is the regression test for review
@@ -387,6 +441,7 @@ func TestConfigHandlerNumericFieldNullRejectedZeroAccepted(t *testing.T) {
 		"DownloadSpeedLimit":                      0,
 		"EnableTlsCheck":                          false,
 		"TransferOnlyMode":                        false,
+		"EnableArrSubfolders":                     false,
 		"ArrHistoryUpdateIntervalSeconds":         0,
 		"ErroredTransferDeleteGracePeriodSeconds": 0,
 	}

@@ -35,16 +35,18 @@
     DownloadSpeedLimit: 100,
     EnableTlsCheck: false,
     TransferOnlyMode: false,
+    EnableArrSubfolders: false,
     Arrs: [],
   };
   const ERR_SAVE = "Error Saving Config";
   const ERR_TEST = "Error Testing *arr client";
-
+  
   // Numeric inputs that must hold a finite number before saving. A cleared
   // type="number" input binds null, which the backend decodes into the zero
   // value and would silently save 0 (issue #89). The grace period input is
   // exempt: clearing it is the documented way to reset it to the default.
   // Server-side counterpart: numericConfigFields in
+
   // internal/service/web_service_config_routes.go.
   const numericFields = [
     ["ArrHistoryUpdateIntervalSeconds", "Arr Update History Interval (seconds)"],
@@ -59,7 +61,15 @@
       return value === null || value === undefined || value === "" || !Number.isFinite(Number(value));
     });
   }
+  
+  function slugify(value) {
+    return value.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  }
 
+  function trimSlugEdges(value) {
+    return value.replace(/^-+|-+$/g, "");
+  }
+  
   let arrTesting = [];
   let arrTestIcons = [];
   let arrTestKind = [];
@@ -150,8 +160,15 @@
   }
 
   function AddArr() {
+    // Skip names already in use: the length+1 counter can collide after
+    // a row deletion (e.g. rows [1,2] -> delete 1 -> next is "new-arr-2").
+    const used = new Set(config.Arrs.map((a) => a.Name));
+    let n = config.Arrs.length + 1;
+    while (used.has(`new-arr-${n}`)) {
+      n++;
+    }
     config.Arrs.push({
-      Name: "New Arr",
+      Name: `new-arr-${n}`,
       URL: "http://127.0.0.1:1234",
       APIKey: "xxxxxxxx",
       Type: "Sonarr",
@@ -254,6 +271,15 @@
                 disabled={inputDisabled}
                 on:input={() => {
                   UntestArr(i);
+                }}
+                on:blur={() => {
+                  // Normalize on blur, not on input: rewriting the bound
+                  // value while typing moves the caret. Only while the
+                  // per-Arr subfolders feature is on: the slug form is
+                  // only meaningful for it.
+                  if (config.EnableArrSubfolders) {
+                    arr.Name = trimSlugEdges(slugify(arr.Name));
+                  }
                 }}
               />
               <TextInput
@@ -386,6 +412,11 @@
           disabled={inputDisabled}
           bind:toggled={config.EnableTlsCheck}
           labelText="Check TLS-Certificate at Download (enabling can break certain CDNs)"
+        />
+        <Toggle
+          disabled={inputDisabled}
+          bind:toggled={config.EnableArrSubfolders}
+          labelText="Use per-Arr subfolders (Blackhole/Downloads/premiumize.me), based on each Arr's Name"
         />
         <TextInput
           type="number"

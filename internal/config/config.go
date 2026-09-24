@@ -45,6 +45,24 @@ func LoadOrCreateConfig(altConfigLocation string, _appCallback AppCallback) (Con
 	config.appCallback = _appCallback
 	config.altConfigLocation = altConfigLocation
 
+	if config.EnableArrSubfolders {
+		if err := ValidateArrs(config.Arrs); err != nil {
+			// This failure happens before any service starts (app.Start
+			// panics on it), so the web UI is unreachable - only point at
+			// paths that work from here.
+			log.Errorf("Invalid Arrs configuration: %s. EnableArrSubfolders requires every Arr Name to be a lowercase slug (letters, digits, hyphens only) since it is used as the subfolder name. Fix the Arr names in config.yaml and restart, or set EnableArrSubfolders back to false.", err)
+			return config, ErrInvalidArrConfig
+		}
+		// An empty blackhole directory is unusable for per-Arr subfolders:
+		// local folders and uploads would resolve to relative paths
+		// (findings S-19/S-29). Docker installs were backfilled above, so
+		// this only triggers for an explicit local config.
+		if config.BlackholeDirectory == "" {
+			log.Errorf("Invalid config: %s. Set BlackholeDirectory in config.yaml and restart, or set EnableArrSubfolders back to false.", ErrEmptyBlackholeDirectory)
+			return config, ErrEmptyBlackholeDirectory
+		}
+	}
+
 	config.Save()
 
 	return config, nil
@@ -143,6 +161,12 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 		updated = true
 	}
 
+	if configInterface["EnableArrSubfolders"] == nil {
+		log.Info("EnableArrSubfolders not set, setting to false")
+		config.EnableArrSubfolders = false
+		updated = true
+	}
+
 	if configInterface["PollBlackholeIntervalMinutes"] == nil {
 		log.Info("PollBlackholeIntervalMinutes not set, setting to 10")
 		config.PollBlackholeIntervalMinutes = 10
@@ -185,9 +209,9 @@ func defaultConfig() Config {
 	return Config{
 		PremiumizemeAPIKey: "xxxxxxxxx",
 		Arrs: []ArrConfig{
-			{Name: "Sonarr", URL: "http://127.0.0.1:8989", APIKey: "xxxxxxxxx", Type: Sonarr},
-			{Name: "Radarr", URL: "http://127.0.0.1:7878", APIKey: "xxxxxxxxx", Type: Radarr},
-			{Name: "Lidarr", URL: "http://127.0.0.1:8686", APIKey: "xxxxxxxxx", Type: Lidarr},
+			{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "xxxxxxxxx", Type: Sonarr},
+			{Name: "radarr", URL: "http://127.0.0.1:7878", APIKey: "xxxxxxxxx", Type: Radarr},
+			{Name: "lidarr", URL: "http://127.0.0.1:8686", APIKey: "xxxxxxxxx", Type: Lidarr},
 		},
 		BlackholeDirectory:                      "",
 		PollBlackholeDirectory:                  false,
@@ -201,6 +225,7 @@ func defaultConfig() Config {
 		DownloadSpeedLimit:                      100,
 		EnableTlsCheck:                          false,
 		TransferOnlyMode:                        false,
+		EnableArrSubfolders:                     false,
 		ArrHistoryUpdateIntervalSeconds:         20,
 		ErroredTransferDeleteGracePeriodSeconds: 300,
 	}
