@@ -1,8 +1,32 @@
 <script>
   import APITable from "../components/APITable.svelte";
-  import { Row, Column } from "carbon-components-svelte";
+  import { Row, Column, Button } from "carbon-components-svelte";
+  import { CalculateAPIPath } from "../Utilities/web_root";
 
   let dlSpeed = 0;
+  let pollingBlackhole = false;
+  let pollBlackholeMessage = "";
+
+  async function pollBlackholeNow() {
+    pollingBlackhole = true;
+    pollBlackholeMessage = "";
+
+    try {
+      const response = await fetch(CalculateAPIPath("api/blackhole/poll"), {
+        method: "POST",
+      });
+      if (!response.ok) {
+        throw new Error((await response.text()).trim() || response.statusText);
+      }
+
+      const data = await response.json();
+      pollBlackholeMessage = `Queued ${data.queued} file${data.queued === 1 ? "" : "s"}.`;
+    } catch (error) {
+      pollBlackholeMessage = `Poll failed: ${error.message || error}`;
+    } finally {
+      pollingBlackhole = false;
+    }
+  }
 
   function parseDLSpeedFromMessage(m) {
     if (m == "Loading..." || m == undefined) return 0;
@@ -167,6 +191,17 @@
     <Row>
       <Column md={4} >
         <h3>Blackhole</h3>
+        <Button
+          size="sm"
+          kind="secondary"
+          disabled={pollingBlackhole}
+          on:click={pollBlackholeNow}
+        >
+          {pollingBlackhole ? "Polling..." : "Poll now"}
+        </Button>
+        {#if pollBlackholeMessage}
+          <p>{pollBlackholeMessage}</p>
+        {/if}
         <APITable
           headers={[
             { key: "id", value: "Pos" },
