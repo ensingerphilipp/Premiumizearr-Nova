@@ -3,12 +3,15 @@ package directclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
 )
@@ -114,6 +117,61 @@ func TestDownloadCloudFolderRejectsTraversalBeforeGeneratingLinks(t *testing.T) 
 	if linkRequests != 0 {
 		t.Errorf("generated %d links after traversal was detected", linkRequests)
 	}
+}
+
+// TestDownloadCloudFolderInterruptsHungFolderListing is the regression test
+// for the finding that a Premiumize folder listing could hang forever with
+// no way to interrupt the download (ListFolder had no context parameter).
+func TestDownloadCloudFolderInterruptsHungFolderListing(t *testing.T) {
+	parked := make(chan struct{})
+	release := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/folder/list" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		parked <- struct{}{}
+		// Never respond on its own: the request must be interrupted by the
+		// client side. The release (sent at the test's end) keeps the
+		// handler terminating so the server close cannot wait on it.
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+
+	pm := premiumizeme.NewPremiumizemeClient("test-secret")
+	pm.APIBaseURL = server.URL + "/api/"
+	pm.HTTPClient = server.Client()
+
+	output := filepath.Join(t.TempDir(), "download")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() {
+		errc <- DownloadCloudFolder(ctx, &pm, "folder-1", output, true, 0, nil)
+	}()
+	select {
+	case <-parked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the folder listing was never attempted; DownloadCloudFolder bailed out before the listing")
+	}
+	cancel()
+	select {
+	case err := <-errc:
+		// The client redacts request errors into plain strings (the API
+		// key rides in the URL), so a cancellation arrives as the message
+		// "context canceled" rather than the unwrappable sentinel; accept
+		// either shape.
+		if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context canceled") {
+			t.Fatalf("DownloadCloudFolder err = %v, want a cancellation error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("DownloadCloudFolder did not return after the context was cancelled")
+	}
+	release <- struct{}{}
 }
 
 func serverURL(r *http.Request) string {

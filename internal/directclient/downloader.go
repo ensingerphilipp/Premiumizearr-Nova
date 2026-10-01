@@ -169,7 +169,7 @@ func collectCloudFiles(ctx context.Context, pm *premiumizeme.Premiumizeme, folde
 		return fmt.Errorf("Premiumize folder tree contains a cycle at %q", folderID)
 	}
 	visited[folderID] = true
-	items, err := pm.ListFolder(folderID)
+	items, err := pm.ListFolderContext(ctx, folderID)
 	if err != nil {
 		return fmt.Errorf("list Premiumize folder: %w", err)
 	}

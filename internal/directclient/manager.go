@@ -51,6 +51,8 @@ type Manager struct {
 	jobs       map[string]*Job
 	categories map[string]bool
 	active     map[string]context.CancelFunc
+	rootMu     sync.Mutex // guards rootDir/rootID: submit may race the poll loop
+	rootDir    string
 	rootID     string
 	stop       chan struct{}
 }
@@ -371,27 +373,48 @@ func (m *Manager) remove(id string, deleteFiles bool) error {
 		return nil // Cleanup runs when the downloader releases this job.
 	}
 	job := *j
-	delete(m.jobs, id)
-	if err := m.saveLocked(); err != nil {
-		m.jobs[id] = j
-		m.mu.Unlock()
-		return err
-	}
 	m.mu.Unlock()
+
+	// The remote transfer and folder are deleted BEFORE the durable row:
+	// a failure in between must not leave a Premiumize object that the
+	// registry no longer knows about and nothing will ever retry. While the
+	// cleanup is pending the row stays, marked failed with a retry flag the
+	// next poll's deletion pass (or a repeated *arr removal) re-attempts.
 	if job.TransferID != "" {
 		if err := m.pm.DeleteTransfer(job.TransferID); err != nil {
 			log.Warnf("Could not delete direct transfer %s: %v", job.TransferID, err)
+			m.markCleanupPending(id, deleteFiles, "Remote cleanup pending: the Premiumize transfer was not deleted; the removal will be retried")
+			return err
 		}
+		job.TransferID = ""
 	}
 	if job.CloudFolder != "" {
 		if err := m.pm.DeleteFolder(job.CloudFolder); err != nil {
 			log.Warnf("Could not delete direct cloud folder for %s: %v", id, err)
+			m.markCleanupPending(id, deleteFiles, "Remote cleanup pending: the Premiumize folder was not deleted; the removal will be retried")
+			return err
 		}
+		job.CloudFolder = ""
 	}
+	m.mu.Lock()
+	if cur := m.jobs[id]; cur != nil {
+		cur.TransferID, cur.CloudFolder = "", ""
+		delete(m.jobs, id)
+	}
+	if err := m.saveLocked(); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	m.mu.Unlock()
 	if deleteFiles {
 		// The only permissible deletion target is the dedicated job directory.
 		if filepath.Base(job.OutputPath) == id && filepath.Base(filepath.Dir(job.OutputPath)) == "direct" {
 			if err := os.RemoveAll(job.OutputPath); err != nil {
+				return err
+			}
+			// The staging sibling holds the in-flight bytes of an
+			// interrupted download; it is removed with the published tree.
+			if err := os.RemoveAll(job.OutputPath + ".partial"); err != nil {
 				return err
 			}
 		}
@@ -400,6 +423,19 @@ func (m *Manager) remove(id string, deleteFiles bool) error {
 		return err
 	}
 	return nil
+}
+
+// markCleanupPending keeps the durable row (with a retry flag) after a
+// failed remote cleanup. Call with m.mu NOT held.
+func (m *Manager) markCleanupPending(id string, deleteFiles bool, message string) {
+	m.mu.Lock()
+	if cur := m.jobs[id]; cur != nil {
+		cur.Phase, cur.Error = "failed", message
+		cur.DeleteRequested = true
+		cur.DeleteFiles = deleteFiles
+		_ = m.saveLocked()
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) Start() {
@@ -446,12 +482,16 @@ func (m *Manager) PollOnce(ctx context.Context) {
 	m.mu.RUnlock()
 	if len(queued) > 0 {
 		account, err := m.pm.GetAccountInfo()
-		if err == nil && account.QuotaExhausted() {
-			return
-		}
-		for _, j := range queued {
-			if err := m.submit(ctx, j.ID); err != nil {
-				log.Warnf("Direct transfer %s could not be submitted: %v", j.ID, err)
+		// The quota gate conditions the queued-submission loop only: an
+		// exhausted account must not submit new jobs, but the GetTransfers
+		// pass below must still run or already-submitted jobs in the cloud
+		// phase would never reach their downloads while the quota stays
+		// exhausted (which, on a small account, is the normal state).
+		if !(err == nil && account.QuotaExhausted()) {
+			for _, j := range queued {
+				if err := m.submit(ctx, j.ID); err != nil {
+					log.Warnf("Direct transfer %s could not be submitted: %v", j.ID, err)
+				}
 			}
 		}
 	}
@@ -495,6 +535,27 @@ func clampProgress(p float64) float64 {
 	return p
 }
 
+// resolveRootFolder returns the memoized direct-download root folder ID.
+// The memo is a (directory, ID) pair under rootMu and is re-resolved when
+// the runtime-mutable TransferDirectory setting changes: a setting change
+// must land new jobs in the new <dir>-direct folder instead of silently
+// reusing the old one forever. Resolution stays lazy — the config update
+// fan-out issues no API calls (minimal-sync policy).
+func (m *Manager) resolveRootFolder() (string, error) {
+	dir := m.config.TransferDirectory
+	m.rootMu.Lock()
+	defer m.rootMu.Unlock()
+	if m.rootID == "" || m.rootDir != dir {
+		id := utils.GetDownloadsFolderIDFromPremiumizeme(m.pm, dir+"-direct")
+		if id == "" {
+			m.rootID, m.rootDir = "", ""
+			return "", errors.New("direct cloud folder is unavailable")
+		}
+		m.rootID, m.rootDir = id, dir
+	}
+	return m.rootID, nil
+}
+
 func (m *Manager) submit(ctx context.Context, id string) error {
 	m.mu.Lock()
 	j := m.jobs[id]
@@ -504,14 +565,13 @@ func (m *Manager) submit(ctx context.Context, id string) error {
 	}
 	job := *j
 	m.mu.Unlock()
-	if m.rootID == "" {
-		m.rootID = utils.GetDownloadsFolderIDFromPremiumizeme(m.pm, m.config.TransferDirectory+"-direct")
-		if m.rootID == "" {
-			return errors.New("direct cloud folder is unavailable")
-		}
+
+	rootID, err := m.resolveRootFolder()
+	if err != nil {
+		return err
 	}
 	if job.CloudFolder == "" {
-		folder, err := m.pm.CreateFolder(id, &m.rootID)
+		folder, err := m.pm.CreateFolder(id, &rootID)
 		if err != nil {
 			return err
 		}
@@ -528,21 +588,51 @@ func (m *Manager) submit(ctx context.Context, id string) error {
 	}
 	data, err := os.ReadFile(filepath.Join(m.stateDir, id+".source"))
 	if err != nil {
+		// A concurrent removal may have taken the durable row between the
+		// job folder creation above and now. The job cannot be submitted
+		// without its source, so the cloud folder it reserved would
+		// otherwise outlive the registry with nothing left to clean it.
+		if job.CloudFolder != "" {
+			if err := m.pm.DeleteFolder(job.CloudFolder); err != nil {
+				log.Warnf("Could not delete cloud folder of un-submittable job %s: %v", id, err)
+			}
+		}
 		m.fail(id, "Source data missing from direct job registry")
 		return err
 	}
+	// The in-flight submission registers in active[] BEFORE the request
+	// goes out: remove() must take the cancel path for a submitting job,
+	// and the completion handling below deletes a transfer that a
+	// concurrent removal outlived (otherwise the request races the row
+	// deletion and Premiumize keeps a transfer nobody owns).
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	m.mu.Lock()
-	if j := m.jobs[id]; j != nil {
-		j.Phase = "submitting"
-		if err := m.saveLocked(); err != nil {
-			m.mu.Unlock()
-			return err
+	if j := m.jobs[id]; j == nil {
+		// The job was removed between the snapshot above and now: do not
+		// create a transfer for it, and do not let the job folder outlive it.
+		m.mu.Unlock()
+		if job.CloudFolder != "" {
+			if err := m.pm.DeleteFolder(job.CloudFolder); err != nil {
+				log.Warnf("Could not delete cloud folder of concurrently removed job %s: %v", id, err)
+			}
 		}
+		return nil
+	}
+	j.Phase = "submitting"
+	m.active[id] = cancel
+	if err := m.saveLocked(); err != nil {
+		m.mu.Unlock()
+		return err
 	}
 	m.mu.Unlock()
+
 	kind := premiumizeme.TransferSourceKind(job.Kind)
-	res, err := m.pm.CreateTransferFromBytes(ctx, kind, data, job.SourceName, job.CloudFolder)
+	res, err := m.pm.CreateTransferFromBytes(subCtx, kind, data, job.SourceName, job.CloudFolder)
 	if err != nil {
+		m.mu.Lock()
+		delete(m.active, id)
+		m.mu.Unlock()
 		if strings.Contains(strings.ToLower(err.Error()), "limit of transfers reached") || strings.Contains(strings.ToLower(err.Error()), "account_limit_reached") {
 			m.mu.Lock()
 			if j := m.jobs[id]; j != nil {
@@ -556,15 +646,42 @@ func (m *Manager) submit(ctx context.Context, id string) error {
 		return err
 	}
 	m.mu.Lock()
+	deleteRequested := false
 	if j := m.jobs[id]; j != nil {
 		j.TransferID = res.ID
 		j.Phase = "cloud"
+		deleteRequested = j.DeleteRequested
 		if err := m.saveLocked(); err != nil {
+			delete(m.active, id)
 			m.mu.Unlock()
 			return err
 		}
 	}
+	delete(m.active, id)
 	m.mu.Unlock()
+	if deleteRequested {
+		// remove() raced the in-flight submission: the row stayed marked
+		// DeleteRequested (the active branch) while the transfer was
+		// being created. Delete the transfer and the job folder now, and
+		// drop the row, before anything can reference unowned objects.
+		if err := m.pm.DeleteTransfer(res.ID); err != nil {
+			log.Warnf("Could not delete transfer of concurrently removed job %s: %v", id, err)
+		}
+		if job.CloudFolder != "" {
+			if err := m.pm.DeleteFolder(job.CloudFolder); err != nil {
+				log.Warnf("Could not delete cloud folder of concurrently removed job %s: %v", id, err)
+			}
+		}
+		m.mu.Lock()
+		if j := m.jobs[id]; j != nil {
+			delete(m.jobs, id)
+			_ = m.saveLocked()
+		}
+		m.mu.Unlock()
+		if err := os.Remove(filepath.Join(m.stateDir, id+".source")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Warnf("Could not delete direct source %s: %v", id, err)
+		}
+	}
 	return nil
 }
 
