@@ -12,6 +12,7 @@ import (
 
 	"os"
 	"path"
+	"path/filepath"
 
 	"gopkg.in/yaml.v2"
 )
@@ -62,7 +63,12 @@ func LoadOrCreateConfig(altConfigLocation string, _appCallback AppCallback) (Con
 	return config, nil
 }
 
-// Save - Saves the config to disk
+// Save - Saves the config to disk. The new content goes to a 0600 temp
+// file in the destination directory and is renamed over the previous
+// config: a legacy config may still be world-readable (the tightening used
+// to happen only after the write, so a freshly generated API key sat in a
+// 0644 file in between), and a crash or error mid-save must not leave a
+// truncated file where the last good config was.
 func (c *Config) Save() error {
 	log.Trace("Marshaling & saving config")
 	data, err := yaml.Marshal(*c)
@@ -77,12 +83,38 @@ func (c *Config) Save() error {
 	}
 
 	log.Tracef("Writing config to %s", savePath)
-	err = ioutil.WriteFile(savePath, data, 0600)
+	tmp, err := os.CreateTemp(filepath.Dir(savePath), ".config-*.tmp")
 	if err != nil {
 		log.Errorf("Failed to save config file: %+v", err)
 		return err
 	}
-	if err := os.Chmod(savePath, 0600); err != nil {
+	tmpPath := tmp.Name()
+	// Any failure before the rename leaves no debris behind.
+	defer func() {
+		if _, statErr := os.Stat(tmpPath); statErr == nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0600); err != nil {
+		log.Errorf("Failed to save config file: %+v", err)
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		log.Errorf("Failed to save config file: %+v", err)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		log.Errorf("Failed to save config file: %+v", err)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		log.Errorf("Failed to save config file: %+v", err)
+		return err
+	}
+	if err := os.Rename(tmpPath, savePath); err != nil {
+		log.Errorf("Failed to save config file: %+v", err)
 		return err
 	}
 
