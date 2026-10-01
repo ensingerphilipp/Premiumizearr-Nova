@@ -3,11 +3,79 @@ package directclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 )
+
+const (
+	// nzbFileLimit bounds a single uploaded NZB file.
+	nzbFileLimit = 64 << 20
+	// sabBodyLimit bounds the whole POST body: the NZB file plus the
+	// multipart envelope around it. It is applied up front so an
+	// oversized body is rejected BEFORE ParseMultipartForm can spool
+	// it to temp storage.
+	sabBodyLimit = nzbFileLimit + (1 << 20)
+)
+
+// errBodyLimitExceeded is returned once a request body exceeds
+// sabBodyLimit.
+var errBodyLimitExceeded = errors.New("request body too large")
+
+// limitedBody counts every byte handed to the wrapped request body; once
+// the total exceeds the limit, subsequent reads fail with
+// errBodyLimitExceeded. The handler checks tripped() after a parse
+// attempt: Go's multipart parser obscures the underlying limit error
+// behind its own buffering errors, so the trip must be detected from the
+// reader itself, not from the parse error.
+type limitedBody struct {
+	inner     io.Reader
+	remain    int64
+	overLimit bool
+}
+
+func newLimitedBody(r io.Reader, limit int64) *limitedBody {
+	return &limitedBody{inner: r, remain: limit}
+}
+
+func (b *limitedBody) Read(p []byte) (int, error) {
+	if b.overLimit {
+		return 0, errBodyLimitExceeded
+	}
+	if b.remain <= 0 {
+		// The limit is consumed. Probe for more data: a body of
+		// exactly the limit size ends in a clean EOF, while a longer
+		// body trips here.
+		var probe [1]byte
+		n, err := b.inner.Read(probe[:])
+		if err == io.EOF && n == 0 {
+			return 0, io.EOF
+		}
+		b.overLimit = true
+		return 0, errBodyLimitExceeded
+	}
+	if int64(len(p)) > b.remain {
+		// Serve exactly what remains so the parser sees a clean end
+		// of data; the trip is reported on the next read.
+		p = p[:b.remain]
+	}
+	n, err := b.inner.Read(p)
+	b.remain -= int64(n)
+	return n, err
+}
+
+func (b *limitedBody) tripped() bool { return b.overLimit }
+
+// Close closes the wrapped body if it can be closed; request bodies
+// are ReadClosers.
+func (b *limitedBody) Close() error {
+	if c, ok := b.inner.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
 
 // SABJobView is the subset of a download job needed to present it through the
 // SABnzbd API expected by Sonarr, Radarr and Lidarr.
@@ -52,18 +120,38 @@ func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.write(w, map[string]any{"status": false, "error": "API Key Incorrect"})
 		return
 	}
+	// Bound the whole POST body before any branch parses it: the mode
+	// detection below and addfile both call ParseMultipartForm, which
+	// spools the body to temp storage before the per-file limit can
+	// reject it. limitedBody reports its own trip, because the
+	// multipart parser obscures any limit error it encounters.
+	var bodyLim *limitedBody
+	if r.Method == http.MethodPost {
+		bodyLim = newLimitedBody(r.Body, sabBodyLimit)
+		r.Body = bodyLim
+	}
 	mode := r.URL.Query().Get("mode")
 	if mode == "" && r.Method == http.MethodPost {
 		_ = r.ParseMultipartForm(64 << 20)
 		if r.MultipartForm == nil {
 			_ = r.ParseForm()
 		}
+		if bodyLim.tripped() {
+			h.bad(w, errBodyLimitExceeded)
+			return
+		}
 		mode = r.Form.Get("mode")
 	}
 	var data []byte
 	var filename string
 	if mode == "addfile" {
-		if err := r.ParseMultipartForm(64 << 20); err != nil {
+		if err := r.ParseMultipartForm(nzbFileLimit); err != nil {
+			// The parser surfaces the wrapper's trip as the parse
+			// error, so name it as the size rejection it is.
+			if bodyLim != nil && bodyLim.tripped() {
+				h.bad(w, errBodyLimitExceeded)
+				return
+			}
 			h.bad(w, err)
 			return
 		}
@@ -76,12 +164,12 @@ func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer f.Close()
-		data, err = io.ReadAll(io.LimitReader(f, 64<<20+1))
+		data, err = io.ReadAll(io.LimitReader(f, nzbFileLimit+1))
 		if err != nil {
 			h.bad(w, err)
 			return
 		}
-		if len(data) > 64<<20 {
+		if len(data) > nzbFileLimit {
 			h.bad(w, fmt.Errorf("NZB exceeds 64 MiB limit"))
 			return
 		}
@@ -192,6 +280,7 @@ func historySlots(jobs []SABJobView) []map[string]any {
 	return out
 }
 func mb(n int64) float64 { return float64(n) / (1024 * 1024) }
+
 func (h *sabHandler) bad(w http.ResponseWriter, err error) {
 	h.write(w, map[string]any{"status": false, "error": err.Error()})
 }

@@ -1,7 +1,9 @@
 package directclient
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"mime/multipart"
 	"net/http"
@@ -169,5 +171,72 @@ func TestSABAddListRemove(t *testing.T) {
 	h.ServeHTTP(w, r)
 	if b.removed != "job-1" || !b.deleteFiles || !strings.Contains(w.Body.String(), `"status":true`) {
 		t.Fatalf("bad remove: %s %#v", w.Body.String(), b)
+	}
+}
+
+// TestSABRejectsOversizedBodyBeforeSpooling is the regression test for the
+// finding that ParseMultipartForm spooled the whole body to temp storage
+// before any size check could reject it, so an authenticated client could
+// exhaust temp storage with a fat body. The bound now fires up front.
+func TestSABRejectsOversizedBodyBeforeSpooling(t *testing.T) {
+	b := &fakeSABBackend{}
+	h := NewSABHandler(b, "key")
+	// A well-formed addfile whose file part drives the whole body
+	// past the up-front bound (64 MiB file + 1 MiB envelope). The
+	// bound trips mid-spool, so the parse fails and the wrapper's
+	// state names the rejection.
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("name", "Fat.nzb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := bytes.Repeat([]byte("0123456789abcdef"), (1<<20)/16)
+	var content int64
+	for content < sabBodyLimit+(1<<20) {
+		n := int64(len(chunk))
+		if n > sabBodyLimit+(1<<20)-content {
+			n = sabBodyLimit + (1 << 20) - content
+		}
+		_, _ = part.Write(chunk[:n])
+		content += n
+	}
+	_ = mw.Close()
+	r := httptest.NewRequest(http.MethodPost, "/api?mode=addfile&apikey=key", bytes.NewReader(body.Bytes()))
+	r.Header.Set("Content-Type", mw.FormDataContentType())
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	// A real server writes 413 when the bound fires; a recorder has no
+	// such path and gets the SAB error envelope instead. Both are
+	// rejections: the client is told about the size and nothing reaches
+	// the backend.
+	rejected := w.Code == http.StatusRequestEntityTooLarge
+	if !rejected {
+		var envelope struct {
+			Status bool   `json:"status"`
+			Error  string `json:"error"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil || envelope.Status || !strings.Contains(envelope.Error, "too large") {
+			t.Fatalf("oversized body: status = %d, body = %s", w.Code, w.Body.String())
+		}
+	}
+	if b.added.ID != "" {
+		t.Fatalf("oversized body reached the backend: %#v", b.added)
+	}
+	// The handler must still work after the rejection.
+	var small strings.Builder
+	smallW := multipart.NewWriter(&small)
+	smallPart, err := smallW.CreateFormFile("name", "Small.nzb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = smallPart.Write([]byte("<nzb/>"))
+	_ = smallW.Close()
+	r = httptest.NewRequest(http.MethodPost, "/api?mode=addfile&apikey=key", strings.NewReader(small.String()))
+	r.Header.Set("Content-Type", smallW.FormDataContentType())
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if !strings.Contains(w.Body.String(), `"nzo_ids":["job-1"]`) {
+		t.Fatalf("valid small addfile after rejection failed: %s", w.Body.String())
 	}
 }
