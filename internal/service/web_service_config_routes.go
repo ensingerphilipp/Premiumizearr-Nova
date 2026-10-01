@@ -150,6 +150,16 @@ func (s *WebServerService) ConfigHandler(w http.ResponseWriter, r *http.Request)
 			EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{Succeeded: false, Status: "DirectClientAPIKey must not be empty"})
 			return
 		}
+		// The compat API prefixes are fixed root routes; reserve them here,
+		// before the whole-struct replace, so a rejected WebRoot cannot be
+		// saved and then trip the validation on the restart path.
+		if _, err := validateWebRoot(newConfig.WebRoot); err != nil {
+			EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
+				Succeeded: false,
+				Status:    fmt.Sprintf("Config failed to update: %s", err.Error()),
+			})
+			return
+		}
 		s.config.UpdateConfig(newConfig)
 		EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
 			Succeeded: true,

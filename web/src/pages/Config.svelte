@@ -380,6 +380,7 @@
         <TextInput
           disabled={inputDisabled}
           labelText="Web Root"
+          helperText="Serves the UI under this path. /qbit and /sab are reserved for the built-in *arr compat APIs and cannot be used."
           bind:value={config.WebRoot}
         />
       </FormGroup>

@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -344,6 +345,56 @@ func TestConfigHandlerRejectsWrongTypedField(t *testing.T) {
 		t.Fatalf("succeeded = true for a wrongly typed field: %s", resp.Status)
 	}
 	assertConfigUnchanged(t, cfg, apiKeyBefore, sdBefore)
+}
+
+// TestConfigHandlerReservesCompatAPIPrefixesForWebRoot is the regression
+// test for review finding E2: the direct *arr compat handlers are mounted
+// at the fixed root prefixes /qbit/ and /sab/, so a WebRoot on one of those
+// prefixes must be rejected at the config route before the whole-struct
+// replace — not merely trip the validation on the next restart.
+func TestConfigHandlerReservesCompatAPIPrefixesForWebRoot(t *testing.T) {
+	for _, tc := range []struct {
+		webRoot  string
+		rejected bool
+	}{
+		{webRoot: "/qbit", rejected: true},
+		{webRoot: "/qbit/anything", rejected: true},
+		{webRoot: "/sab", rejected: true},
+		{webRoot: "/sab/x", rejected: true},
+		{webRoot: "/qbitfoo", rejected: false}, // prefix neighbour, not the prefix
+	} {
+		t.Run(tc.webRoot, func(t *testing.T) {
+			ws, cfg := newConfigRouteTestService(t)
+
+			body := strings.Replace(zeroNumericFieldsPayload, `"WebRoot":""`, fmt.Sprintf(`"WebRoot":%q`, tc.webRoot), 1)
+			req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			ws.ConfigHandler(rec, req)
+
+			var resp ConfigChangeResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("unmarshaling response %q: %v", rec.Body.String(), err)
+			}
+			if tc.rejected {
+				if resp.Succeeded {
+					t.Fatalf("succeeded = true for reserved WebRoot %q", tc.webRoot)
+				}
+				if !strings.Contains(resp.Status, "reserved") {
+					t.Errorf("status = %q, want it to name the reserved prefix", resp.Status)
+				}
+				if cfg.WebRoot != "" {
+					t.Errorf("WebRoot = %q, want unchanged (rejected payload must not replace the config)", cfg.WebRoot)
+				}
+			} else {
+				if !resp.Succeeded {
+					t.Fatalf("succeeded = false for non-conflicting WebRoot %q: %s", tc.webRoot, resp.Status)
+				}
+				if cfg.WebRoot != tc.webRoot {
+					t.Errorf("WebRoot = %q, want %q", cfg.WebRoot, tc.webRoot)
+				}
+			}
+		})
+	}
 }
 
 // configIntField reads an exported int field of config.Config by name for
