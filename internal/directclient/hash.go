@@ -52,13 +52,26 @@ func magnetDisplayName(magnet string) (string, error) {
 
 // torrentHash hashes the original bencoded "info" dictionary, as required
 // by the BitTorrent infohash contract. Re-encoding that dictionary could
-// change its bytes and therefore its hash.
+// change its bytes and therefore its hash. The whole top-level dictionary
+// must be parsed and closed before a hash is accepted, so truncated or
+// garbage-suffixed files are rejected instead of queued.
 func torrentHash(data []byte) (string, error) {
 	if len(data) == 0 || data[0] != 'd' {
 		return "", errors.New("torrent has no top-level dictionary")
 	}
 	pos := 1
-	for pos < len(data) && data[pos] != 'e' {
+	infoStart, infoEnd := -1, -1
+	for {
+		if pos >= len(data) {
+			return "", errors.New("torrent is truncated: the top-level dictionary is not closed")
+		}
+		if data[pos] == 'e' {
+			pos++
+			if pos != len(data) {
+				return "", errors.New("torrent has data after the closing top-level dictionary")
+			}
+			break
+		}
 		key, end, err := bstring(data, pos)
 		if err != nil {
 			return "", err
@@ -70,14 +83,20 @@ func torrentHash(data []byte) (string, error) {
 			return "", err
 		}
 		if key == "info" {
+			if infoStart != -1 {
+				return "", errors.New("torrent has multiple info dictionaries")
+			}
 			if data[start] != 'd' {
 				return "", errors.New("torrent info is not a dictionary")
 			}
-			sum := sha1.Sum(data[start:pos])
-			return hex.EncodeToString(sum[:]), nil
+			infoStart, infoEnd = start, pos
 		}
 	}
-	return "", errors.New("torrent has no info dictionary")
+	if infoStart == -1 {
+		return "", errors.New("torrent has no info dictionary")
+	}
+	sum := sha1.Sum(data[infoStart:infoEnd])
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func bstring(data []byte, pos int) (string, int, error) {
