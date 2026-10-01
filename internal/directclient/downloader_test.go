@@ -17,11 +17,14 @@ import (
 )
 
 func TestDownloadCloudFolderRecursivelyPublishesOnlyCompletedFiles(t *testing.T) {
+	// These are hard requirements of the production downloader, not
+	// optional: a silent skip would report unverified download behavior
+	// as passing on a host that lacks the tools.
 	if _, err := exec.LookPath("wget"); err != nil {
-		t.Skip("wget is required by the production downloader")
+		t.Fatal("wget is required by the production downloader; install it (e.g. 'apt-get install wget') to run this test")
 	}
 	if _, err := exec.LookPath("stdbuf"); err != nil {
-		t.Skip("stdbuf is required by the production downloader")
+		t.Fatal("stdbuf is required by the production downloader; install it (e.g. 'apt-get install coreutils') to run this test")
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

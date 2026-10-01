@@ -26,5 +26,13 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
+      - name: Ensure downloader tools (wget, stdbuf)
+        run: |
+          if ! command -v wget >/dev/null 2>&1 || ! command -v stdbuf >/dev/null 2>&1; then
+            sudo apt-get update -qq
+          fi
+          command -v wget >/dev/null 2>&1 || sudo apt-get install -y -qq wget
+          command -v stdbuf >/dev/null 2>&1 || sudo apt-get install -y -qq coreutils
+
       - name: Run verification gate
         run: bash scripts/verify
