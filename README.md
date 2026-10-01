@@ -138,7 +138,34 @@ location /premiumizearr/ {
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection $http_connection;
 }
+
+# The built-in *arr compat APIs are mounted at fixed root paths outside the
+# WebRoot (/qbit and /sab). To reach them through this proxy, map the proxied
+# paths to those root paths and use the mapped URL Base in each *arr:
+# /premiumizearr/qbit (qBittorrent) and /premiumizearr/sab (SABnzbd).
+location /premiumizearr/qbit/ {
+    proxy_pass http://127.0.0.1:8182/qbit/;
+    proxy_set_header Host $proxy_host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+}
+
+location /premiumizearr/sab/ {
+    proxy_pass http://127.0.0.1:8182/sab/;
+    proxy_set_header Host $proxy_host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+}
 ```
+
+> The direct *arr endpoints always live outside the WebRoot at the fixed root
+> paths `/qbit` and `/sab` (WebRoots under those prefixes are rejected), so
+> *arr clients on the same host can also point straight at port `8182` with
+> URL Base `/qbit` or `/sab` and bypass the reverse proxy entirely.
 
 ## License
 
