@@ -26,6 +26,7 @@ type DirectoryWatcherService struct {
 	quotaCheckFailed   bool
 	downloadsFolderID  string
 	watchDirectory     *directory_watcher.WatchDirectory
+	polling            bool
 }
 
 const (
@@ -50,12 +51,28 @@ func (dw *DirectoryWatcherService) Init(premiumizemeClient *premiumizeme.Premium
 
 func (dw *DirectoryWatcherService) ConfigUpdatedCallback(currentConfig config.Config, newConfig config.Config) {
 	if currentConfig.BlackholeDirectory != newConfig.BlackholeDirectory {
-		log.Info("Blackhole directory changed, restarting directory watcher...")
-		log.Info("Running initial directory scan...")
-		go dw.directoryScan(dw.config.BlackholeDirectory)
-		if dw.watchDirectory != nil {
-			if err := dw.watchDirectory.UpdatePath(newConfig.BlackholeDirectory); err != nil {
-				log.Warnf("Could not update blackhole watcher: %v", err)
+		newDir := newConfig.BlackholeDirectory
+		if _, err := os.Stat(newDir); err != nil {
+			// No watcher can run on a missing directory; it starts
+			// through the same path once a later update points at an
+			// existing one.
+			log.Info("Blackhole directory is unavailable; the directory watcher will start once it exists")
+		} else {
+			log.Info("Blackhole directory changed, restarting directory watcher...")
+			dw.mu.RLock()
+			watcher := dw.watchDirectory
+			dw.mu.RUnlock()
+			if watcher == nil {
+				// The directory was missing at Start, so no watcher ever
+				// ran; now that it exists, run the usual initial scan
+				// plus watcher (or poller) start.
+				dw.startBlackholeWatch(newDir)
+			} else {
+				log.Info("Running initial directory scan...")
+				go dw.directoryScan(newDir)
+				if err := watcher.UpdatePath(newDir); err != nil {
+					log.Warnf("Could not update blackhole watcher: %v", err)
+				}
 			}
 		}
 	}
@@ -92,8 +109,19 @@ func (dw *DirectoryWatcherService) Start() {
 		return
 	}
 
+	dw.startBlackholeWatch(dw.config.BlackholeDirectory)
+}
+
+// startBlackholeWatch runs the initial scan of dir and then starts either
+// the inotify watcher or the poll-mode scan loop for it. Start uses it at
+// boot and ConfigUpdatedCallback uses it for a blackhole directory that
+// only appears later, so the two stay in lockstep.
+func (dw *DirectoryWatcherService) startBlackholeWatch(dir string) {
+	dw.mu.Lock()
+	defer dw.mu.Unlock()
+
 	log.Info("Running initial directory scan...")
-	go dw.directoryScan(dw.config.BlackholeDirectory)
+	go dw.directoryScan(dir)
 
 	if dw.watchDirectory != nil {
 		log.Info("Stopping directory watcher...")
@@ -104,22 +132,30 @@ func (dw *DirectoryWatcherService) Start() {
 	}
 
 	if dw.config.PollBlackholeDirectory {
-		log.Info("Starting directory poller...")
-		go func() {
-			for {
-				if !dw.config.PollBlackholeDirectory {
-					log.Info("Directory poller stopped")
-					break
+		if !dw.polling {
+			dw.polling = true
+			log.Info("Starting directory poller...")
+			go func() {
+				defer func() {
+					dw.mu.Lock()
+					dw.polling = false
+					dw.mu.Unlock()
+				}()
+				for {
+					if !dw.config.PollBlackholeDirectory {
+						log.Info("Directory poller stopped")
+						break
+					}
+					time.Sleep(time.Duration(dw.config.PollBlackholeIntervalMinutes) * time.Minute)
+					log.Infof("Running directory scan of %s", dw.config.BlackholeDirectory)
+					dw.directoryScan(dw.config.BlackholeDirectory)
+					log.Infof("Scan complete, next scan in %d minutes", dw.config.PollBlackholeIntervalMinutes)
 				}
-				time.Sleep(time.Duration(dw.config.PollBlackholeIntervalMinutes) * time.Minute)
-				log.Infof("Running directory scan of %s", dw.config.BlackholeDirectory)
-				dw.directoryScan(dw.config.BlackholeDirectory)
-				log.Infof("Scan complete, next scan in %d minutes", dw.config.PollBlackholeIntervalMinutes)
-			}
-		}()
+			}()
+		}
 	} else {
 		log.Info("Starting directory watcher...")
-		dw.watchDirectory = directory_watcher.NewDirectoryWatcher(dw.config.BlackholeDirectory,
+		dw.watchDirectory = directory_watcher.NewDirectoryWatcher(dir,
 			true,
 			dw.checkFile,
 			dw.addFileToQueue,
