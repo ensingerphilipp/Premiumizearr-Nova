@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // TorrentView is the qBittorrent-shaped view of a Premiumizearr download.
@@ -45,8 +46,10 @@ type QBitOutputRoot interface {
 }
 
 type qbitHandler struct {
-	backend                 QBitBackend
-	username, password, sid string
+	backend            QBitBackend
+	username, password string
+	sidMu              sync.Mutex // guards sid: rotated on logout
+	sid                string
 }
 
 // NewQBitHandler serves the qBittorrent Web API v2 subset used by Sonarr, Radarr and Lidarr.
@@ -56,6 +59,23 @@ func NewQBitHandler(backend QBitBackend, username, password string) http.Handler
 		panic("unable to create qBittorrent session token")
 	}
 	return &qbitHandler{backend: backend, username: username, password: password, sid: hex.EncodeToString(token[:])}
+}
+
+func newSessionToken() string {
+	var token [24]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		panic("unable to create qBittorrent session token")
+	}
+	return hex.EncodeToString(token[:])
+}
+
+// outputRoot resolves the *arr-visible download root advertised by the
+// backend's preferences endpoints.
+func (h *qbitHandler) outputRoot() string {
+	if b, ok := h.backend.(QBitOutputRoot); ok {
+		return b.QBitOutputRoot()
+	}
+	return ""
 }
 
 func (h *qbitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -73,7 +93,10 @@ func (h *qbitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Fails.", http.StatusForbidden)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{Name: "SID", Value: h.sid, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
+		h.sidMu.Lock()
+		sid := h.sid
+		h.sidMu.Unlock()
+		http.SetCookie(w, &http.Cookie{Name: "SID", Value: sid, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
 		writeQBitText(w, "Ok.")
 		return
 	}
@@ -86,6 +109,12 @@ func (h *qbitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if path == "/api/v2/auth/logout" {
+		// Rotate the session so a cookie presented after logout (stolen or
+		// replayed) no longer authenticates; the client must log in again.
+		h.sidMu.Lock()
+		h.sid = newSessionToken()
+		h.sidMu.Unlock()
+		http.SetCookie(w, &http.Cookie{Name: "SID", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
 		writeQBitText(w, "Ok.")
 		return
 	}
@@ -95,17 +124,10 @@ func (h *qbitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/api/v2/app/version":
 		writeQBitText(w, "v4.3.3")
 	case "/api/v2/app/preferences":
-		root := ""
-		if b, ok := h.backend.(QBitOutputRoot); ok {
-			root = b.QBitOutputRoot()
-		}
+		root := h.outputRoot()
 		writeQBitJSON(w, map[string]any{"save_path": root, "temp_path": root, "temp_path_enabled": false, "auto_tmm_enabled": false, "create_subfolder_enabled": false, "start_paused_enabled": false, "web_ui_username": h.username, "dht": true, "queueing_enabled": true})
 	case "/api/v2/app/defaultSavePath":
-		root := ""
-		if b, ok := h.backend.(QBitOutputRoot); ok {
-			root = b.QBitOutputRoot()
-		}
-		writeQBitText(w, root)
+		writeQBitText(w, h.outputRoot())
 	case "/api/v2/torrents/categories":
 		cats := map[string]any{}
 		if b, ok := h.backend.(qbitCategories); ok {
@@ -145,7 +167,13 @@ func (h *qbitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 func (h *qbitHandler) authenticated(r *http.Request) bool {
 	c, err := r.Cookie("SID")
-	return err == nil && equalSecret(c.Value, h.sid)
+	if err != nil {
+		return false
+	}
+	h.sidMu.Lock()
+	sid := h.sid
+	h.sidMu.Unlock()
+	return equalSecret(c.Value, sid)
 }
 func equalSecret(a, b string) bool {
 	return len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
@@ -265,16 +293,20 @@ func containsPipeValue(s, v string) bool {
 	}
 	return false
 }
-func (h *qbitHandler) remove(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
+
+// eachHash parses the pipe-delimited "hashes" form field shared by the
+// torrent mutation endpoints and applies op to every hash. A POST that
+// fails for one hash aborts with 500, matching qBittorrent's all-or-nothing
+// response for these calls.
+func (h *qbitHandler) eachHash(w http.ResponseWriter, r *http.Request, op func(hash string) error) {
+	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", 405)
 		return
 	}
 	_ = r.ParseForm()
-	del := r.Form.Get("deleteFiles") == "true"
 	for _, hash := range strings.Split(r.Form.Get("hashes"), "|") {
 		if hash != "" {
-			if err := h.backend.RemoveTorrent(hash, del); err != nil {
+			if err := op(hash); err != nil {
 				http.Error(w, err.Error(), 500)
 				return
 			}
@@ -282,20 +314,13 @@ func (h *qbitHandler) remove(w http.ResponseWriter, r *http.Request) {
 	}
 	writeQBitText(w, "Ok.")
 }
+func (h *qbitHandler) remove(w http.ResponseWriter, r *http.Request) {
+	h.eachHash(w, r, func(hash string) error {
+		return h.backend.RemoveTorrent(hash, r.Form.Get("deleteFiles") == "true")
+	})
+}
 func (h *qbitHandler) setCategory(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", 405)
-		return
-	}
-	_ = r.ParseForm()
-	cat := r.Form.Get("category")
-	for _, hash := range strings.Split(r.Form.Get("hashes"), "|") {
-		if hash != "" {
-			if err := h.backend.SetCategory(hash, cat); err != nil {
-				http.Error(w, err.Error(), 500)
-				return
-			}
-		}
-	}
-	writeQBitText(w, "Ok.")
+	h.eachHash(w, r, func(hash string) error {
+		return h.backend.SetCategory(hash, r.Form.Get("category"))
+	})
 }
