@@ -29,6 +29,7 @@ const (
 	TransferSourceNZB         TransferSourceKind = "nzb"
 	maxTransferSourceSize                        = 100 << 20
 	transferSubmissionTimeout                    = 2 * time.Minute
+	folderListTimeout                            = 2 * time.Minute
 )
 
 type Premiumizeme struct {
@@ -169,9 +170,22 @@ func (pm *Premiumizeme) GetTransfers() ([]Transfer, error) {
 	return res.Transfers, nil
 }
 
+// ListFolder lists the items of one Premiumize folder. It keeps the
+// historical signature for existing callers; call sites that own a context
+// should use ListFolderContext so a hung listing can be interrupted.
 func (pm *Premiumizeme) ListFolder(folderID string) ([]Item, error) {
+	return pm.ListFolderContext(context.Background(), folderID)
+}
+
+// ListFolderContext is the context-aware variant of ListFolder: cancelling
+// the context interrupts a hanging listing, and the request additionally
+// carries a bounded timeout because a hang is not a slow response.
+func (pm *Premiumizeme) ListFolderContext(ctx context.Context, folderID string) ([]Item, error) {
 	if pm.APIKey == "" {
 		return nil, ErrAPIKeyNotSet
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	var ret []Item
@@ -184,7 +198,9 @@ func (pm *Premiumizeme) ListFolder(folderID string) ([]Item, error) {
 	q.Set("id", folderID)
 	url.RawQuery = q.Encode()
 
-	request, err := http.NewRequest("GET", url.String(), nil)
+	requestContext, cancel := context.WithTimeout(ctx, folderListTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestContext, "GET", url.String(), nil)
 	if err != nil {
 		return ret, err
 	}
@@ -506,13 +522,12 @@ func (pm *Premiumizeme) CreateFolder(folderName string, parentID *string) (strin
 	}
 	url.RawQuery = q.Encode()
 
-	client := &http.Client{}
 	request, err := http.NewRequest("POST", url.String(), nil)
 	if err != nil {
 		return "", err
 	}
 
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return "", pm.redactRequestError(err)
 	}
@@ -772,9 +787,8 @@ func (pm *Premiumizeme) generateZip(ID string, srcType SRCType) (string, error) 
 	request.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Add("Content-Length", strconv.Itoa(len(data.Encode())))
 
-	//Fire request
-	client := &http.Client{}
-	resp, err := client.Do(request)
+	// Fire request
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return "", pm.redactRequestError(err)
 	}
