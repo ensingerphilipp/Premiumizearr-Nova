@@ -106,22 +106,15 @@ func safeID(id string) bool {
 	return true
 }
 
-// safePathComponent reports whether s is usable as a single path
-// component: non-empty, no path separator and no parent-directory
-// reference.
-func safePathComponent(s string) bool {
-	if s == "" {
-		return false
-	}
-	return !strings.Contains(s, "/") && !strings.Contains(s, "\\") && !strings.Contains(s, "..")
-}
-
 // jobSourcePath returns the on-disk path of a job's retained source
-// payload. The job ID must be a safe single path component and the joined
-// path must stay inside the state directory; otherwise the file operation
-// could reach outside the direct namespace.
+// payload. The job ID is derived from request data and becomes a file-name
+// component, so it must be a safe single path component (no path separator,
+// no parent-directory reference) and the joined path must stay inside the
+// state directory; otherwise the file operation could reach outside the
+// direct namespace.
 func (m *Manager) jobSourcePath(id string) (string, error) {
-	if !safePathComponent(id) {
+	if len(id) == 0 || len(id) > 80 ||
+		strings.Contains(id, "/") || strings.Contains(id, "\\") || strings.Contains(id, "..") {
 		return "", fmt.Errorf("invalid direct job ID %q", id)
 	}
 	path := filepath.Join(m.stateDir, id+".source")
@@ -208,7 +201,8 @@ func (m *Manager) add(kind string, data []byte, filename, category string) (Job,
 	// The job ID becomes a file-name component of the on-disk source file
 	// and the published directory; it is derived from request data, so it
 	// must be a safe single path component before any path is built from it.
-	if !safeID(id) || !safePathComponent(id) {
+	if len(id) == 0 || len(id) > 80 ||
+		strings.Contains(id, "/") || strings.Contains(id, "\\") || strings.Contains(id, "..") {
 		return Job{}, errors.New("invalid or unsafe direct job ID")
 	}
 	name := filepath.Base(filename)
