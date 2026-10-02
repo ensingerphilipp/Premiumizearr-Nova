@@ -186,6 +186,8 @@ func TestManagerSubmissionRestartProgressAndCompletedDownload(t *testing.T) {
 	if strings.Contains(completed[0].ContentPath, ".partial") {
 		t.Fatalf("published content path is still staged: %q", completed[0].ContentPath)
 	}
+	waitQuiescent(t, manager)
+	waitQuiescent(t, restarted)
 }
 
 func TestManagerQuotaExhaustionKeepsJobQueued(t *testing.T) {
@@ -214,6 +216,7 @@ func TestManagerQuotaExhaustionKeepsJobQueued(t *testing.T) {
 	if createCalls.Load() != 0 {
 		t.Fatalf("transfer/create calls = %d, want 0", createCalls.Load())
 	}
+	waitQuiescent(t, manager)
 }
 
 func TestManagerFailedPremiumizeSubmissionStatus(t *testing.T) {
@@ -248,6 +251,7 @@ func TestManagerFailedPremiumizeSubmissionStatus(t *testing.T) {
 	if createCalls.Load() != 1 {
 		t.Fatalf("transfer/create calls = %d, want 1", createCalls.Load())
 	}
+	waitQuiescent(t, manager)
 }
 
 func TestManagerCompletedJobRemovalLocalDataPolicy(t *testing.T) {
@@ -311,6 +315,7 @@ func TestManagerCompletedJobRemovalLocalDataPolicy(t *testing.T) {
 			if len(manager.ListTorrents("tv")) != 0 {
 				t.Errorf("removed job remains in torrent list")
 			}
+			waitQuiescent(t, manager)
 		})
 	}
 }
@@ -339,6 +344,8 @@ func TestManagerRestartMarksInterruptedSubmissionUnknown(t *testing.T) {
 	if len(jobs) != 1 || jobs[0].State != "failed" || !strings.Contains(jobs[0].Error, "outcome unknown") {
 		t.Fatalf("job after interrupted submission restart = %#v, want failed with unknown outcome", jobs)
 	}
+	waitQuiescent(t, manager)
+	waitQuiescent(t, restarted)
 }
 
 const testMagnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Example.Release"
@@ -364,6 +371,30 @@ func newTestManager(t *testing.T, pm *premiumizeme.Premiumizeme, configDir strin
 		t.Fatal(err)
 	}
 	return manager
+}
+
+// waitQuiescent fails the test if a manager goroutine (download work
+// spawned by PollOnce) is still running when the deadline expires. A
+// download goroutine performs its last state save before it releases its
+// active slot, so an empty active map also means no manager write can
+// still land in the test's TempDir after the test returns; without the
+// wait, the t.TempDir cleanup races a lingering saveLocked into
+// "directory not empty" failures on slow runners (CI).
+func waitQuiescent(t *testing.T, m *Manager) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		m.mu.RLock()
+		n := len(m.active)
+		m.mu.RUnlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("manager goroutines did not quiesce (active = %d)", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // TestManagerRemovalRetriesFailedRemoteCleanup is the regression test for
@@ -427,6 +458,7 @@ func TestManagerRemovalRetriesFailedRemoteCleanup(t *testing.T) {
 	if got := manager.ListTorrents("tv"); len(got) != 0 {
 		t.Fatalf("job row remains after the successful retry: %#v", got)
 	}
+	waitQuiescent(t, manager)
 }
 
 // TestManagerRemovalDeletesStagingSibling is the regression test for the
@@ -488,6 +520,7 @@ func TestManagerRemovalDeletesStagingSibling(t *testing.T) {
 	if _, err := os.Stat(foreign); err != nil {
 		t.Fatalf("foreign sibling directory was deleted: %v", err)
 	}
+	waitQuiescent(t, manager)
 }
 
 // TestManagerQuotaExhaustionKeepsCloudJobsPolling is the regression test for
@@ -562,6 +595,7 @@ func TestManagerQuotaExhaustionKeepsCloudJobsPolling(t *testing.T) {
 	// goroutine unwind on its own.
 	<-detailsParked
 	releaseDetails <- struct{}{}
+	waitQuiescent(t, manager)
 }
 
 // TestManagerRootFolderFollowsTransferDirectory is the regression test for
@@ -621,6 +655,7 @@ func TestManagerRootFolderFollowsTransferDirectory(t *testing.T) {
 	if len(jobParents) != 2 || jobParents[1] != "root-second" {
 		t.Fatalf("second job folder parents = %v, want [root-first root-second]", jobParents)
 	}
+	waitQuiescent(t, manager)
 }
 
 // TestManagerSubmittingJobRemovalLeavesNoOrphan is the regression test for
@@ -702,6 +737,7 @@ func TestManagerSubmittingJobRemovalLeavesNoOrphan(t *testing.T) {
 		if got := folderDeletes.Load(); got != 1 {
 			t.Fatalf("folder delete calls = %d, want 1 (the job folder must not outlive the removal)", got)
 		}
+		waitQuiescent(t, manager)
 	})
 	t.Run("removal while the request is in flight", func(t *testing.T) {
 		releaseTransfer := make(chan struct{}, 1)
@@ -802,5 +838,36 @@ func TestManagerSubmittingJobRemovalLeavesNoOrphan(t *testing.T) {
 		if got := folderDeletes.Load(); got != 1 {
 			t.Fatalf("folder delete calls = %d, want 1 (the job folder must not outlive the removal)", got)
 		}
+		waitQuiescent(t, manager)
 	})
+}
+
+func TestJobSourcePathKeepsJobInsideStateDir(t *testing.T) {
+	m := &Manager{stateDir: t.TempDir()}
+
+	for _, id := range []string{"", "../escape", "a/b", `a\b`, "a..b"} {
+		if _, err := m.jobSourcePath(id); err == nil {
+			t.Fatalf("jobSourcePath(%q) succeeded, want rejection", id)
+		}
+	}
+
+	const validID = "0123456789abcdef0123456789abcdef"
+	path, err := m.jobSourcePath(validID)
+	if err != nil {
+		t.Fatalf("jobSourcePath(%q) = %v, want success", validID, err)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatalf("Abs(%q) = %v", path, err)
+	}
+	base, err := filepath.Abs(m.stateDir)
+	if err != nil {
+		t.Fatalf("Abs(%q) = %v", m.stateDir, err)
+	}
+	if !strings.HasPrefix(abs, base) {
+		t.Fatalf("source path %q escapes the state directory %q", abs, base)
+	}
+	if !strings.HasSuffix(abs, ".source") {
+		t.Fatalf("source path %q does not end in .source", abs)
+	}
 }

@@ -96,7 +96,11 @@ func (h *qbitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.sidMu.Lock()
 		sid := h.sid
 		h.sidMu.Unlock()
-		http.SetCookie(w, &http.Cookie{Name: "SID", Value: sid, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
+		// qBittorrent marks its session cookie Secure only over SSL. A
+		// forced Secure attribute would not be returned by *arr clients
+		// (Sonarr/Radarr/Lidarr) that authenticate over plain HTTP, so the
+		// attribute follows the transport instead.
+		http.SetCookie(w, &http.Cookie{Name: "SID", Value: sid, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil})
 		writeQBitText(w, "Ok.")
 		return
 	}
@@ -114,7 +118,8 @@ func (h *qbitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.sidMu.Lock()
 		h.sid = newSessionToken()
 		h.sidMu.Unlock()
-		http.SetCookie(w, &http.Cookie{Name: "SID", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+		// Secure follows the transport, as on login: see the login comment.
+		http.SetCookie(w, &http.Cookie{Name: "SID", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil})
 		writeQBitText(w, "Ok.")
 		return
 	}

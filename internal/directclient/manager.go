@@ -106,6 +106,39 @@ func safeID(id string) bool {
 	return true
 }
 
+// safePathComponent reports whether s is usable as a single path
+// component: non-empty, no path separator and no parent-directory
+// reference.
+func safePathComponent(s string) bool {
+	if s == "" {
+		return false
+	}
+	return !strings.Contains(s, "/") && !strings.Contains(s, "\\") && !strings.Contains(s, "..")
+}
+
+// jobSourcePath returns the on-disk path of a job's retained source
+// payload. The job ID must be a safe single path component and the joined
+// path must stay inside the state directory; otherwise the file operation
+// could reach outside the direct namespace.
+func (m *Manager) jobSourcePath(id string) (string, error) {
+	if !safePathComponent(id) {
+		return "", fmt.Errorf("invalid direct job ID %q", id)
+	}
+	path := filepath.Join(m.stateDir, id+".source")
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	base, err := filepath.Abs(m.stateDir)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(abs, base) {
+		return "", fmt.Errorf("direct job source path escapes the state directory")
+	}
+	return path, nil
+}
+
 // saveLocked writes the entire registry atomically. Call with m.mu held.
 func (m *Manager) saveLocked() error {
 	jobs := make([]Job, 0, len(m.jobs))
@@ -172,6 +205,12 @@ func (m *Manager) add(kind string, data []byte, filename, category string) (Job,
 	if err != nil {
 		return Job{}, err
 	}
+	// The job ID becomes a file-name component of the on-disk source file
+	// and the published directory; it is derived from request data, so it
+	// must be a safe single path component before any path is built from it.
+	if !safeID(id) || !safePathComponent(id) {
+		return Job{}, errors.New("invalid or unsafe direct job ID")
+	}
 	name := filepath.Base(filename)
 	if name == "." || name == string(filepath.Separator) || name == "" {
 		name = id
@@ -196,7 +235,11 @@ func (m *Manager) add(kind string, data []byte, filename, category string) (Job,
 	}
 	outputRoot := filepath.Join(m.outputRoot(), "direct")
 	job := &Job{ID: id, Kind: kind, Name: name, Category: category, SourceName: filename, Phase: "queued", OutputPath: filepath.Join(outputRoot, id), Created: time.Now()}
-	if err := os.WriteFile(filepath.Join(m.stateDir, id+".source"), data, 0600); err != nil {
+	sourcePath, err := m.jobSourcePath(id)
+	if err != nil {
+		return Job{}, err
+	}
+	if err := os.WriteFile(sourcePath, data, 0600); err != nil {
 		return Job{}, err
 	}
 	m.jobs[id] = job
@@ -205,7 +248,9 @@ func (m *Manager) add(kind string, data []byte, filename, category string) (Job,
 	}
 	if err := m.saveLocked(); err != nil {
 		delete(m.jobs, id)
-		os.Remove(filepath.Join(m.stateDir, id+".source"))
+		if sp, perr := m.jobSourcePath(id); perr == nil {
+			os.Remove(sp)
+		}
 		return Job{}, err
 	}
 	return *job, nil
@@ -419,7 +464,11 @@ func (m *Manager) remove(id string, deleteFiles bool) error {
 			}
 		}
 	}
-	if err := os.Remove(filepath.Join(m.stateDir, id+".source")); err != nil && !errors.Is(err, os.ErrNotExist) {
+	sourcePath, err := m.jobSourcePath(id)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
@@ -586,7 +635,11 @@ func (m *Manager) submit(ctx context.Context, id string) error {
 		m.mu.Unlock()
 		job.CloudFolder = folder
 	}
-	data, err := os.ReadFile(filepath.Join(m.stateDir, id+".source"))
+	sourcePath, err := m.jobSourcePath(id)
+	var data []byte
+	if err == nil {
+		data, err = os.ReadFile(sourcePath)
+	}
 	if err != nil {
 		// A concurrent removal may have taken the durable row between the
 		// job folder creation above and now. The job cannot be submitted
@@ -678,8 +731,10 @@ func (m *Manager) submit(ctx context.Context, id string) error {
 			_ = m.saveLocked()
 		}
 		m.mu.Unlock()
-		if err := os.Remove(filepath.Join(m.stateDir, id+".source")); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Warnf("Could not delete direct source %s: %v", id, err)
+		if sourcePath, perr := m.jobSourcePath(id); perr == nil {
+			if err := os.Remove(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.Warnf("Could not delete direct source %s: %v", id, err)
+			}
 		}
 	}
 	return nil
@@ -764,8 +819,10 @@ func (m *Manager) startDownload(id string) {
 			}
 		}
 		m.mu.Unlock()
-		if err := os.Remove(filepath.Join(m.stateDir, id+".source")); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Warnf("Could not delete direct source %s: %v", id, err)
+		if sourcePath, perr := m.jobSourcePath(id); perr == nil {
+			if err := os.Remove(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.Warnf("Could not delete direct source %s: %v", id, err)
+			}
 		}
 		// The Premiumize folder is temporary once all files are safely on
 		// disk. Preserve the completed local job until *arr imports it.
