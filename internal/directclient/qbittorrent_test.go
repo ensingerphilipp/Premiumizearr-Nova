@@ -322,3 +322,36 @@ func TestQBitErrorBranches(t *testing.T) {
 		})
 	}
 }
+
+// TestQBitAddMagnetWithSpacesSurvivesURLSplit is the regression test for
+// the finding that "urls" was split on arbitrary whitespace (strings.Fields),
+// shredding a magnet that carries a space into a non-magnet token (400)
+// while persisting the truncated first token as a job. qBittorrent splits
+// the field on newlines only.
+func TestQBitAddMagnetWithSpacesSurvivesURLSplit(t *testing.T) {
+	f := &qbitFake{}
+	h := NewQBitHandler(f, "arr", "secret")
+	cc := login(t, h)
+	magnet := "magnet:?xt=urn:btih:abc&dn=My Release"
+	w := request(h, "POST", "/api/v2/torrents/add", "urls="+url.QueryEscape(magnet)+"&category=tv", "application/x-www-form-urlencoded", cc)
+	if w.Code != http.StatusOK {
+		t.Fatalf("add status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if f.addedMagnet != magnet+":tv" {
+		t.Fatalf("AddMagnet received %q, want the full magnet %q (no whitespace split)", f.addedMagnet, magnet+":tv")
+	}
+	// CRLF-delimited URLs are the qBittorrent multi-URL form: the split
+	// must drop the trailing \r of each line without touching the
+	// spaces inside a magnet.
+	f = &qbitFake{}
+	h = NewQBitHandler(f, "arr", "secret")
+	cc = login(t, h)
+	multi := "magnet:?xt=urn:btih:a&dn=One Two\r\nmagnet:?xt=urn:btih:b&dn=Three Four"
+	w = request(h, "POST", "/api/v2/torrents/add", "urls="+url.QueryEscape(multi), "application/x-www-form-urlencoded", cc)
+	if w.Code != http.StatusOK {
+		t.Fatalf("multi-url add status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if f.addedMagnet != "magnet:?xt=urn:btih:b&dn=Three Four:" {
+		t.Fatalf("AddMagnet received %q, want the second magnet intact", f.addedMagnet)
+	}
+}

@@ -207,7 +207,15 @@ func (h *qbitHandler) add(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	category := r.FormValue("category")
-	for _, magnet := range strings.Fields(r.FormValue("urls")) {
+	// qBittorrent accepts several URLs separated by newlines in "urls".
+	// Split on newlines only: a magnet is a single opaque URL and
+	// splitting on arbitrary whitespace would truncate magnets that carry
+	// spaces in their parameters.
+	for _, magnet := range strings.Split(r.FormValue("urls"), "\n") {
+		magnet = strings.TrimSpace(magnet)
+		if magnet == "" {
+			continue
+		}
 		if !strings.HasPrefix(strings.ToLower(magnet), "magnet:") {
 			http.Error(w, "Invalid torrent URL", 400)
 			return

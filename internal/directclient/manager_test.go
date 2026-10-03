@@ -842,6 +842,156 @@ func TestManagerSubmittingJobRemovalLeavesNoOrphan(t *testing.T) {
 	})
 }
 
+func TestManagerRegistrationSaveFailureReleasesActiveSlot(t *testing.T) {
+	var createCalls atomic.Int32
+	pm := managerTestPremiumize(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/account/info":
+			fmt.Fprint(w, `{"status":"success","limit_used":0,"booster_points":100}`)
+		case "/api/folder/list":
+			fmt.Fprint(w, `{"status":"success","content":[]}`)
+		case "/api/folder/create":
+			fmt.Fprint(w, `{"status":"success","id":"folder-1"}`)
+		case "/api/transfer/create":
+			createCalls.Add(1)
+			fmt.Fprint(w, `{"status":"success","id":"transfer-1"}`)
+		case "/api/transfer/list":
+			fmt.Fprint(w, `{"status":"success","transfers":[]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	configDir := t.TempDir()
+	manager := newTestManager(t, &pm, configDir)
+	if err := manager.AddMagnet(context.Background(), testMagnet, "tv"); err != nil {
+		t.Fatal(err)
+	}
+	// Make the registry unwritable so the "submitting" registration save
+	// in submit() fails (EACCES).
+	stateDir := filepath.Join(configDir, "direct-jobs")
+	t.Cleanup(func() { _ = os.Chmod(stateDir, 0700) })
+	if err := os.Chmod(stateDir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	manager.PollOnce(context.Background())
+	const jobID = "0123456789abcdef0123456789abcdef01234567"
+	manager.mu.RLock()
+	phase := ""
+	if j := manager.jobs[jobID]; j != nil {
+		phase = j.Phase
+	}
+	active := len(manager.active)
+	manager.mu.RUnlock()
+	if active != 0 {
+		t.Fatalf("active slots after failed registration save = %d, want 0 (the slot must be released, not held for the process's life)", active)
+	}
+	if phase != "queued" {
+		t.Fatalf("phase after failed registration save = %q, want queued (no transfer exists, so the queued pass may retry)", phase)
+	}
+	if createCalls.Load() != 0 {
+		t.Fatalf("transfer/create calls = %d, want 0 (the request must not go out once registration failed)", createCalls.Load())
+	}
+	waitQuiescent(t, manager)
+}
+
+func TestManagerCompletedJobCleanupRetriesFolderDeletion(t *testing.T) {
+	var folderDeletes atomic.Int32
+	pm := managerTestPremiumize(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/account/info":
+			fmt.Fprint(w, `{"status":"success","limit_used":0,"booster_points":100}`)
+		case "/api/transfer/list":
+			fmt.Fprint(w, `{"status":"success","transfers":[]}`)
+		case "/api/folder/delete":
+			if folderDeletes.Add(1) == 1 {
+				fmt.Fprint(w, `{"status":"error","message":"premiumize 500"}`)
+			} else {
+				fmt.Fprint(w, `{"status":"success"}`)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	configDir := t.TempDir()
+	manager := newTestManager(t, &pm, configDir)
+	if err := manager.AddMagnet(context.Background(), testMagnet, "tv"); err != nil {
+		t.Fatal(err)
+	}
+	const jobID = "0123456789abcdef0123456789abcdef01234567"
+	manager.mu.Lock()
+	if j := manager.jobs[jobID]; j != nil {
+		// Simulate the completion path: the download finished, the folder
+		// deletion failed once, so the row is completed with a
+		// cleanup-pending flag and the folder reference intact.
+		j.Phase, j.CloudFolder, j.CleanupPending = "completed", "folder-1", true
+	}
+	manager.mu.Unlock()
+	// First retry fails again: the flag and the reference stay.
+	manager.PollOnce(context.Background())
+	manager.mu.RLock()
+	j := manager.jobs[jobID]
+	kept := j != nil && j.CleanupPending && j.CloudFolder == "folder-1"
+	manager.mu.RUnlock()
+	if !kept {
+		t.Fatalf("after the failed cleanup retry the row must keep its pending flag and folder reference: %#v", manager.jobs[jobID])
+	}
+	// Second retry succeeds: reference and flag clear, the row itself stays.
+	manager.PollOnce(context.Background())
+	manager.mu.RLock()
+	j = manager.jobs[jobID]
+	cleared := j != nil && !j.CleanupPending && j.CloudFolder == "" && j.Phase == "completed"
+	manager.mu.RUnlock()
+	if !cleared {
+		t.Fatalf("after the successful cleanup retry the row must stay (completed, cleared): %#v", manager.jobs[jobID])
+	}
+	if folderDeletes.Load() != 2 {
+		t.Fatalf("folder delete calls = %d, want 2", folderDeletes.Load())
+	}
+}
+
+func TestManagerRemovalConvergesWhenCloudFolderAlreadyGone(t *testing.T) {
+	var transferDeletes, folderDeletes atomic.Int32
+	pm := managerTestPremiumize(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/transfer/delete":
+			transferDeletes.Add(1)
+			fmt.Fprint(w, `{"status":"success"}`)
+		case "/api/folder/delete":
+			folderDeletes.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"status":"error","message":"folder not found"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	configDir := t.TempDir()
+	manager := newTestManager(t, &pm, configDir)
+	if err := manager.AddMagnet(context.Background(), testMagnet, "tv"); err != nil {
+		t.Fatal(err)
+	}
+	const jobID = "0123456789abcdef0123456789abcdef01234567"
+	manager.mu.Lock()
+	if j := manager.jobs[jobID]; j != nil {
+		// The completion path deleted the folder but its clear-save failed
+		// (or the folder was deleted out-of-band): the durable row is
+		// completed with both remote references still set.
+		j.Phase, j.TransferID, j.CloudFolder = "completed", "transfer-1", "folder-1"
+	}
+	manager.mu.Unlock()
+	if err := manager.RemoveTorrent(jobID, false); err != nil {
+		t.Fatalf("remove acked the *arr deletion as an error: %v", err)
+	}
+	if jobs := manager.ListTorrents("tv"); len(jobs) != 0 {
+		t.Fatalf("removed job remains listed: %#v", jobs)
+	}
+	if transferDeletes.Load() != 1 || folderDeletes.Load() != 1 {
+		t.Fatalf("transfer deletes = %d, folder deletes = %d, want 1 and 1", transferDeletes.Load(), folderDeletes.Load())
+	}
+}
+
 func TestJobSourcePathKeepsJobInsideStateDir(t *testing.T) {
 	m := &Manager{stateDir: t.TempDir()}
 

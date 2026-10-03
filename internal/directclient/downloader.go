@@ -105,7 +105,13 @@ func DownloadCloudFolder(ctx context.Context, pm *premiumizeme.Premiumizeme, fol
 		if err != nil {
 			return fmt.Errorf("generate Premiumize link for %q: %w", file.relativePath, err)
 		}
-		partialPath := target + ".partial"
+		// The in-progress name must be unique per file: a cloud entry whose
+		// name is a sibling file's name plus ".partial" would otherwise make
+		// wget -c resume against the sibling's completed content. The
+		// Premiumize file ID is stable across restarts, so a legitimately
+		// interrupted transfer still resumes, and no listed name can match
+		// <name>.<opaque-id>.partial short of self-reference.
+		partialPath := fmt.Sprintf("%s.%s.partial", target, file.id)
 		monitorStop := make(chan struct{})
 		if progress != nil && total > 0 {
 			go func(base int64) {

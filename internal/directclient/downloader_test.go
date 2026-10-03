@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -179,4 +181,75 @@ func TestDownloadCloudFolderInterruptsHungFolderListing(t *testing.T) {
 
 func serverURL(r *http.Request) string {
 	return "http://" + r.Host
+}
+
+// TestDownloadCloudFolderPartialNameCannotCollideWithSibling is the
+// regression test for the finding that a cloud entry named
+// <sibling>.partial made the downloader resume (wget -c) against the
+// sibling's completed staging file, publishing the sibling's content under
+// the sibling's name. The in-progress name is now unique per file ID.
+func TestDownloadCloudFolderPartialNameCannotCollideWithSibling(t *testing.T) {
+	if _, err := exec.LookPath("wget"); err != nil {
+		t.Fatal("wget is required by the production downloader; install it (e.g. 'apt-get install wget') to run this test")
+	}
+	if _, err := exec.LookPath("stdbuf"); err != nil {
+		t.Fatal("stdbuf is required by the production downloader; install it (e.g. 'apt-get install coreutils') to run this test")
+	}
+	const (
+		aContent = "AAAAAAAAAAAAAAAAAAAA"           // file "x" (id fa)
+		bContent = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" // file "x.partial" (id fb)
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/folder/list":
+			// Listing order matters: the entry whose name is the
+			// sibling's staging target is published BEFORE the sibling,
+			// which is when the collision was exploitable.
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "success", "content": []map[string]string{
+				{"id": "fb", "name": "x.partial", "type": "file"},
+				{"id": "fa", "name": "x", "type": "file"},
+			}})
+		case "/api/item/details":
+			id := r.URL.Query().Get("id")
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "success", "type": "file", "id": id, "name": id, "link": serverURL(r) + "/blob/" + id})
+		case "/blob/fa", "/blob/fb":
+			content := map[string][]byte{"/blob/fa": []byte(aContent), "/blob/fb": []byte(bContent)}[r.URL.Path]
+			if rng := r.Header.Get("Range"); strings.HasPrefix(rng, "bytes=") {
+				start, err := strconv.Atoi(strings.TrimSuffix(rng[len("bytes="):], "-"))
+				if err == nil && start < len(content) {
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(content)-1, len(content)))
+					w.WriteHeader(http.StatusPartialContent)
+					_, _ = w.Write(content[start:])
+					return
+				}
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", len(content)))
+				http.Error(w, "Range Not Satisfiable", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			_, _ = w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	pm := premiumizeme.NewPremiumizemeClient("test-secret")
+	pm.APIBaseURL = server.URL + "/api/"
+	pm.HTTPClient = server.Client()
+
+	output := filepath.Join(t.TempDir(), "download")
+	if err := DownloadCloudFolder(context.Background(), &pm, "root", output, true, 0, nil); err != nil {
+		t.Fatalf("DownloadCloudFolder() error = %v", err)
+	}
+	for name, want := range map[string]string{"x": aContent, "x.partial": bContent} {
+		got, err := os.ReadFile(filepath.Join(output, name))
+		if err != nil {
+			t.Fatalf("published %q missing: %v", name, err)
+		}
+		if string(got) != want {
+			t.Errorf("published %q = %q, want exactly %q (a sibling's content must not leak into another file)", name, got, want)
+		}
+	}
 }

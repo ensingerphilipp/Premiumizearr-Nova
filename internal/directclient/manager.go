@@ -22,22 +22,27 @@ import (
 // Job is the durable link between one *arr download ID, its Premiumize
 // transfer, and the local directory from which *arr imports the result.
 type Job struct {
-	ID              string    `json:"id"`
-	Kind            string    `json:"kind"`
-	Name            string    `json:"name"`
-	Category        string    `json:"category"`
-	SourceName      string    `json:"source_name"`
-	Phase           string    `json:"phase"`
-	Progress        float64   `json:"progress"`
-	TotalBytes      int64     `json:"total_bytes,omitempty"`
-	Downloaded      int64     `json:"downloaded,omitempty"`
-	TransferID      string    `json:"transfer_id"`
-	CloudFolder     string    `json:"cloud_folder"`
-	OutputPath      string    `json:"output_path"`
-	Error           string    `json:"error"`
-	DeleteRequested bool      `json:"delete_requested,omitempty"`
-	DeleteFiles     bool      `json:"delete_files,omitempty"`
-	Created         time.Time `json:"created"`
+	ID              string  `json:"id"`
+	Kind            string  `json:"kind"`
+	Name            string  `json:"name"`
+	Category        string  `json:"category"`
+	SourceName      string  `json:"source_name"`
+	Phase           string  `json:"phase"`
+	Progress        float64 `json:"progress"`
+	TotalBytes      int64   `json:"total_bytes,omitempty"`
+	Downloaded      int64   `json:"downloaded,omitempty"`
+	TransferID      string  `json:"transfer_id"`
+	CloudFolder     string  `json:"cloud_folder"`
+	OutputPath      string  `json:"output_path"`
+	Error           string  `json:"error"`
+	DeleteRequested bool    `json:"delete_requested,omitempty"`
+	DeleteFiles     bool    `json:"delete_files,omitempty"`
+	// CleanupPending marks a completed job whose Premiumize folder could
+	// not be deleted at completion time. The poll deletion pass retries
+	// the folder deletion for such jobs until it succeeds, without
+	// deleting the job row itself.
+	CleanupPending bool      `json:"cleanup_pending,omitempty"`
+	Created        time.Time `json:"created"`
 }
 
 // Manager owns the direct-download namespace. The existing blackhole path
@@ -130,6 +135,27 @@ func (m *Manager) jobSourcePath(id string) (string, error) {
 		return "", fmt.Errorf("direct job source path escapes the state directory")
 	}
 	return path, nil
+}
+
+// folderDeleteGone reports whether a DeleteFolder failure means the folder
+// no longer exists on Premiumize (already deleted by the completion path,
+// out-of-band, or by the account holder) rather than a transient or
+// permission fault. A missing folder must converge to success on the
+// retry side: re-issuing the delete against an absent folder can never
+// succeed, so treating the absence as success is the only exit.
+func folderDeleteGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, " (404)") {
+		return true
+	}
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "not found") ||
+		strings.Contains(lower, "does not exist") ||
+		strings.Contains(lower, "no such folder") ||
+		strings.Contains(lower, "unknown folder")
 }
 
 // saveLocked writes the entire registry atomically. Call with m.mu held.
@@ -429,9 +455,16 @@ func (m *Manager) remove(id string, deleteFiles bool) error {
 	}
 	if job.CloudFolder != "" {
 		if err := m.pm.DeleteFolder(job.CloudFolder); err != nil {
-			log.Warnf("Could not delete direct cloud folder for %s: %v", id, err)
-			m.markCleanupPending(id, deleteFiles, "Remote cleanup pending: the Premiumize folder was not deleted; the removal will be retried")
-			return err
+			if !folderDeleteGone(err) {
+				log.Warnf("Could not delete direct cloud folder for %s: %v", id, err)
+				m.markCleanupPending(id, deleteFiles, "Remote cleanup pending: the Premiumize folder was not deleted; the removal will be retried")
+				return err
+			}
+			// The folder is already gone (the completion path cleaned it
+			// but its clear-save failed, or it was deleted out-of-band):
+			// treat the delete as done and continue to the row deletion,
+			// instead of retrying against an absent folder forever.
+			log.Warnf("Cloud folder of direct job %s is already deleted; clearing the reference", id)
 		}
 		job.CloudFolder = ""
 	}
@@ -514,6 +547,40 @@ func (m *Manager) PollOnce(ctx context.Context) {
 	m.mu.RUnlock()
 	for _, j := range deleting {
 		_ = m.remove(j.ID, j.DeleteFiles)
+	}
+	// A completed job whose folder deletion failed at completion keeps a
+	// cleanup-pending flag: retry the folder deletion until it succeeds,
+	// WITHOUT deleting the job row (the download is delivered and *arr may
+	// still be tracking it).
+	m.mu.RLock()
+	cleanup := make([]Job, 0)
+	for _, j := range m.jobs {
+		if j.CleanupPending && !j.DeleteRequested && j.CloudFolder != "" {
+			cleanup = append(cleanup, *j)
+		}
+	}
+	m.mu.RUnlock()
+	for _, j := range cleanup {
+		cleared := false
+		if err := m.pm.DeleteFolder(j.CloudFolder); err != nil {
+			if !folderDeleteGone(err) {
+				log.Warnf("Direct job %s cloud folder cleanup failed again: %v", j.ID, err)
+				continue
+			}
+			// Already deleted out-of-band: clear the reference.
+			cleared = true
+		} else {
+			cleared = true
+		}
+		m.mu.Lock()
+		if cur := m.jobs[j.ID]; cur != nil {
+			if cleared {
+				cur.CloudFolder = ""
+			}
+			cur.CleanupPending = false
+			_ = m.saveLocked()
+		}
+		m.mu.Unlock()
 	}
 	m.mu.RLock()
 	queued := make([]Job, 0)
@@ -669,6 +736,15 @@ func (m *Manager) submit(ctx context.Context, id string) error {
 	j.Phase = "submitting"
 	m.active[id] = cancel
 	if err := m.saveLocked(); err != nil {
+		// A failed registration save must not leak the active slot: the
+		// downloader never starts for this job, so nothing would ever
+		// release the entry and the quota gate would pin every other
+		// download until restart. Release the slot and roll the phase
+		// back to "queued" (the on-disk row is still "queued", so no
+		// re-save is needed and the queued pass may retry); no
+		// TransferID exists yet, so nothing remote is orphaned.
+		delete(m.active, id)
+		j.Phase = "queued"
 		m.mu.Unlock()
 		return err
 	}
@@ -821,7 +897,16 @@ func (m *Manager) startDownload(id string) {
 		// The Premiumize folder is temporary once all files are safely on
 		// disk. Preserve the completed local job until *arr imports it.
 		if err := m.pm.DeleteFolder(job.CloudFolder); err != nil {
+			// A failure here must not orphan the folder forever: mark the
+			// row cleanup-pending and let the poll deletion pass retry the
+			// folder deletion for this completed job until it succeeds.
 			log.Warnf("Could not clean cloud folder of direct job %s: %v", id, err)
+			m.mu.Lock()
+			if j := m.jobs[id]; j != nil {
+				j.CleanupPending = true
+				_ = m.saveLocked()
+			}
+			m.mu.Unlock()
 		} else {
 			m.mu.Lock()
 			if j := m.jobs[id]; j != nil {

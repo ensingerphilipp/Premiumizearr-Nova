@@ -176,7 +176,22 @@ func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		filename = hdr.Filename
 	}
 	if r.Method == http.MethodPost && mode != "addfile" { // SAB commonly submits mode in POST form fields.
+		// Parse the body in full so an oversized multipart body trips the
+		// limit even when the mode arrived via the query string:
+		// ParseForm alone does not read a multipart body, so without the
+		// forced multipart parse the trip would never be observed and the
+		// mode switch below would answer success for an oversized body.
+		_ = r.ParseMultipartForm(sabBodyLimit)
 		_ = r.ParseForm()
+		if bodyLim != nil && bodyLim.tripped() {
+			h.bad(w, errBodyLimitExceeded)
+			return
+		}
+		if r.MultipartForm != nil {
+			// The handler is done with any spooled file parts in these
+			// modes; remove them instead of leaving temp files behind.
+			defer r.MultipartForm.RemoveAll()
+		}
 		if mode == "" {
 			mode = r.Form.Get("mode")
 		}
@@ -205,6 +220,13 @@ func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if id == "" {
 				id = r.URL.Query().Get("id")
 			}
+			// An empty resolved id must not answer success: the backend
+			// treats an unknown id as an idempotent no-op, so delegating
+			// would record a deletion that never happened.
+			if id == "" {
+				h.bad(w, errors.New("missing delete id"))
+				return
+			}
 			if err := h.backend.RemoveNZB(id, r.URL.Query().Get("del_files") == "1"); err != nil {
 				h.bad(w, err)
 				return
@@ -216,7 +238,18 @@ func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.write(w, map[string]any{"queue": map[string]any{"version": "4.5.0", "paused": false, "pause_int": "0", "paused_all": false, "speed": "0", "mbleft": "0", "mb": "0", "sizeleft": "0 B", "size": "0 B", "noofslots_total": len(jobs), "noofslots": len(jobs), "status": queueStatus(jobs), "timeleft": "0:00:00", "start": 0, "limit": 0, "slots": queueSlots(jobs)}})
 	case "history":
 		if r.URL.Query().Get("name") == "delete" {
-			if err := h.backend.RemoveNZB(r.URL.Query().Get("value"), r.URL.Query().Get("del_files") == "1"); err != nil {
+			// SABnzbd's canonical history delete addresses slots by id;
+			// accept "value" (this handler's convention) with the same
+			// id fallback the queue branch provides.
+			id := r.URL.Query().Get("value")
+			if id == "" {
+				id = r.URL.Query().Get("id")
+			}
+			if id == "" {
+				h.bad(w, errors.New("missing delete id"))
+				return
+			}
+			if err := h.backend.RemoveNZB(id, r.URL.Query().Get("del_files") == "1"); err != nil {
 				h.bad(w, err)
 				return
 			}

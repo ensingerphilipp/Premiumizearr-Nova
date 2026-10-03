@@ -240,3 +240,87 @@ func TestSABRejectsOversizedBodyBeforeSpooling(t *testing.T) {
 		t.Fatalf("valid small addfile after rejection failed: %s", w.Body.String())
 	}
 }
+
+// TestSABQueryModeRejectsOversizedBodyBeforeAnswering is the regression
+// test for the finding that a POST carrying the mode in the query string
+// (e.g. ?mode=version) skipped the up-front bound entirely: ParseForm
+// does not read a multipart body, so the trip was never observed and the
+// mode switch answered success for an oversized body.
+func TestSABQueryModeRejectsOversizedBodyBeforeAnswering(t *testing.T) {
+	b := &fakeSABBackend{}
+	h := NewSABHandler(b, "key")
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("file", "big.nzb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := bytes.Repeat([]byte("0123456789abcdef"), (1<<20)/16)
+	var content int64
+	for content < sabBodyLimit+(1<<20) {
+		n := int64(len(chunk))
+		if n > sabBodyLimit+(1<<20)-content {
+			n = sabBodyLimit + (1 << 20) - content
+		}
+		_, _ = part.Write(chunk[:n])
+		content += n
+	}
+	_ = mw.Close()
+	r := httptest.NewRequest(http.MethodPost, "/api?mode=version&apikey=key", bytes.NewReader(body.Bytes()))
+	r.Header.Set("Content-Type", mw.FormDataContentType())
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if strings.Contains(w.Body.String(), `"version"`) {
+		t.Fatalf("oversized query-mode body still received the success envelope: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"error":"request body too large"`) {
+		t.Fatalf("oversized query-mode body answered %s, want the size rejection", w.Body.String())
+	}
+	if b.added.ID != "" {
+		t.Fatalf("oversized body reached the backend: %#v", b.added)
+	}
+	// A small body in the same shape must still be answered normally.
+	var small bytes.Buffer
+	smallW := multipart.NewWriter(&small)
+	_ = smallW.WriteField("action", "version")
+	_ = smallW.Close()
+	r = httptest.NewRequest(http.MethodPost, "/api?mode=version&apikey=key", bytes.NewReader(small.Bytes()))
+	r.Header.Set("Content-Type", smallW.FormDataContentType())
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if !strings.Contains(w.Body.String(), `"version":"4.5.0"`) {
+		t.Fatalf("small query-mode body answered %s, want the version envelope", w.Body.String())
+	}
+}
+
+// TestSABDeleteBranchesResolveIDAndRejectEmpty is the regression test for
+// the finding that the history-delete branch resolved its target from
+// "value" only (missing the "id" fallback the queue branch provides) and
+// both branches answered success for an empty resolved id, which the
+// backend treats as an idempotent no-op.
+func TestSABDeleteBranchesResolveIDAndRejectEmpty(t *testing.T) {
+	b := &fakeSABBackend{}
+	h := NewSABHandler(b, "key")
+	r := httptest.NewRequest(http.MethodGet, "/api?mode=history&name=delete&id=job-1&apikey=key", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if b.removed != "job-1" || !strings.Contains(w.Body.String(), `"status":true`) {
+		t.Fatalf("history delete by id: removed=%q response=%s, want job-1 deleted", b.removed, w.Body.String())
+	}
+	for _, q := range []string{
+		"/api?mode=history&name=delete&apikey=key",
+		"/api?mode=queue&name=delete&apikey=key",
+	} {
+		b = &fakeSABBackend{}
+		h = NewSABHandler(b, "key")
+		r = httptest.NewRequest(http.MethodGet, q, nil)
+		w = httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if b.removed != "" {
+			t.Fatalf("%s: backend removed %q, want no deletion call", q, b.removed)
+		}
+		if !strings.Contains(w.Body.String(), `"error":"missing delete id"`) {
+			t.Fatalf("%s: response=%s, want the missing-delete-id rejection", q, w.Body.String())
+		}
+	}
+}
