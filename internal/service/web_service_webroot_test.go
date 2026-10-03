@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
+	"github.com/ensingerphilipp/premiumizearr-nova/internal/directclient"
 )
 
 // TestNormalizeWebRoot verifies the canonical form of the configured
@@ -453,5 +454,44 @@ func TestWebServerRestartBindFailureAndRecovery(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET %s after recovery status = %d, want %d", newBase+"/nova/", resp.StatusCode, http.StatusOK)
+	}
+}
+
+// TestNewResetsDirectManager is the regression test for review finding
+// E1: New() re-zeroed every WebServerService field except directManager, so
+// re-initializing a configured service kept serving the previous direct
+// manager (and its credentials) on the compat endpoints.
+func TestNewResetsDirectManager(t *testing.T) {
+	s := WebServerService{}.New()
+	previous := &directclient.Manager{}
+	s.SetDirectManager(previous)
+	if s.directManager != previous {
+		t.Fatal("SetDirectManager did not set the manager")
+	}
+	fresh := s.New()
+	if fresh.directManager != nil {
+		t.Fatalf("New() left the previous directManager set: %#v", fresh.directManager)
+	}
+}
+
+// TestValidateWebRootReservesCompatAPIPrefixes is the regression test for
+// review finding E2: the direct *arr compat handlers are mounted at the
+// fixed root prefixes /qbit/ and /sab/, so a WebRoot on one of those
+// prefixes would make the UI and the API collide on the same paths.
+// "/qbitfoo" does not collide (mux PathPrefix matches "/qbit/" not "/qbit*").
+func TestValidateWebRootReservesCompatAPIPrefixes(t *testing.T) {
+	for _, rejected := range []string{"/qbit", "/qbit.", "/qbit/anything", "/sab", "/sab.", "/sab/anything"} {
+		if got, err := validateWebRoot(rejected); err == nil {
+			t.Errorf("validateWebRoot(%q) = %q, want a rejection naming the reserved prefix", rejected, got)
+		} else if !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("validateWebRoot(%q) error = %v, want it to name the reservation", rejected, err)
+		}
+	}
+	for _, accepted := range []string{"/qbitfoo", "/sabfoo", "/apps/nova"} {
+		if got, err := validateWebRoot(accepted); err != nil {
+			t.Errorf("validateWebRoot(%q) error = %v, want accepted", accepted, err)
+		} else if got == "" {
+			t.Errorf("validateWebRoot(%q) returned an empty canonical root", accepted)
+		}
 	}
 }

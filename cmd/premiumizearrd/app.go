@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
+	"github.com/ensingerphilipp/premiumizearr-nova/internal/directclient"
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/service"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
 	"github.com/orandin/lumberjackrus"
@@ -19,6 +20,7 @@ type App struct {
 	directoryWatcher   service.DirectoryWatcherService
 	webServer          service.WebServerService
 	arrsManager        service.ArrsManagerService
+	directManager      *directclient.Manager
 }
 
 // Makes go vet error - prevents copies
@@ -92,6 +94,10 @@ func (app *App) Start(logLevel string, configFile string, loggingDirectory strin
 	app.directoryWatcher = service.NewDirectoryWatcherService()
 	app.webServer = service.WebServerService{}.New()
 	app.arrsManager = service.ArrsManagerService{}.New()
+	app.directManager, err = directclient.NewManager(&app.premiumizemeClient, &app.config, configFile)
+	if err != nil {
+		return err
+	}
 
 	// Initialise Services
 	app.arrsManager.Init(&app.config)
@@ -99,11 +105,15 @@ func (app *App) Start(logLevel string, configFile string, loggingDirectory strin
 
 	// Must come after arrsManager
 	app.transferManager.Init(&app.premiumizemeClient, &app.arrsManager, &app.config)
+	app.transferManager.SetDirectManager(app.directManager)
 	// Must come after transfer, arrManager and directory
 	app.webServer.Init(&app.transferManager, &app.directoryWatcher, &app.arrsManager, &app.config)
+	app.webServer.SetDirectManager(app.directManager)
 
 	app.arrsManager.Start()
+	app.directManager.SetTorrentFailureReporter(app.arrsManager.ReportDirectTorrentFailure)
 	app.webServer.Start()
+	app.directManager.Start()
 	app.directoryWatcher.Start()
 	//Block until the program is terminated
 	app.transferManager.Run(15 * time.Second)

@@ -79,6 +79,24 @@ if [[ -z "${CC_BIN}" ]]; then
 fi
 echo "C compiler:              ${CC_BIN}"
 
+# wget/stdbuf: required by the production cloud-folder downloader and its
+# tests; a host without them must fail the gate with an install path
+# instead of letting the download behavior be silently skipped.
+if ! command -v wget >/dev/null 2>&1; then
+  fail "wget not found. The production downloader shells out to wget; install it (e.g. 'apt-get install wget')."
+fi
+echo "wget:                    $(wget --version 2>/dev/null | head -n1)"
+if ! command -v stdbuf >/dev/null 2>&1; then
+  if [[ "$(uname -s 2>/dev/null)" == "Linux" ]]; then
+    fail "stdbuf not found. The production downloader line-buffers wget through stdbuf (GNU coreutils); install it (e.g. 'apt-get install coreutils')."
+  fi
+  # Non-GNU host (e.g. macOS): no supported install path can provide a
+  # GNU coreutils stdbuf here, so name the real requirement instead of an
+  # install command that cannot work on this platform.
+  fail "stdbuf not found. This gate requires a GNU userland: the production downloader line-buffers wget through stdbuf (GNU coreutils), and this platform has no supported install path for it (on macOS, Homebrew's 'gstdbuf' is a different binary). Run 'bash scripts/verify' on a GNU/Linux host (CI runs on ubuntu-22.04)."
+fi
+echo "stdbuf:                  $(stdbuf --version 2>/dev/null | head -n1)"
+
 # --- Mandatory checks (the gate fails on the first failure) ------------------
 
 step "Check 1/6: gofmt clean (tracked Go files)"

@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -71,11 +72,11 @@ func newConfigRouteTestService(t *testing.T) (*WebServerService, *config.Config)
 // UI-shaped payload with every config field present, as submitted by
 // Config.svelte after the "Simultaneous Downloads" input has been cleared
 // (carbon-components-svelte binds null for a cleared number input).
-const nullSimultaneousDownloadsPayload = `{"PremiumizemeAPIKey":"xxxxxxxxx","Arrs":[],"BlackholeDirectory":"/blackhole","PollBlackholeDirectory":false,"PollBlackholeIntervalMinutes":10,"DownloadsDirectory":"/downloads","TransferDirectory":"arrDownloads","BindIP":"0.0.0.0","BindPort":"8182","WebRoot":"","SimultaneousDownloads":null,"DownloadSpeedLimit":100,"EnableTlsCheck":false,"TransferOnlyMode":false,"ArrHistoryUpdateIntervalSeconds":20,"ErroredTransferDeleteGracePeriodSeconds":300}`
+const nullSimultaneousDownloadsPayload = `{"PremiumizemeAPIKey":"xxxxxxxxx","DirectClientAPIKey":"test-direct-key","Arrs":[],"BlackholeDirectory":"/blackhole","PollBlackholeDirectory":false,"PollBlackholeIntervalMinutes":10,"DownloadsDirectory":"/downloads","TransferDirectory":"arrDownloads","BindIP":"0.0.0.0","BindPort":"8182","WebRoot":"","SimultaneousDownloads":null,"DownloadSpeedLimit":100,"EnableTlsCheck":false,"TransferOnlyMode":false,"ArrHistoryUpdateIntervalSeconds":20,"ErroredTransferDeleteGracePeriodSeconds":300}`
 
 // Same payload with explicit zeros: 0 is a legitimate value the user can
 // still save (e.g. speed limit 0 = unlimited).
-const zeroNumericFieldsPayload = `{"PremiumizemeAPIKey":"xxxxxxxxx","Arrs":[],"BlackholeDirectory":"/blackhole","PollBlackholeDirectory":false,"PollBlackholeIntervalMinutes":0,"DownloadsDirectory":"/downloads","TransferDirectory":"arrDownloads","BindIP":"0.0.0.0","BindPort":"8182","WebRoot":"","SimultaneousDownloads":0,"DownloadSpeedLimit":0,"EnableTlsCheck":false,"TransferOnlyMode":false,"ArrHistoryUpdateIntervalSeconds":0,"ErroredTransferDeleteGracePeriodSeconds":0}`
+const zeroNumericFieldsPayload = `{"PremiumizemeAPIKey":"xxxxxxxxx","DirectClientAPIKey":"test-direct-key","Arrs":[],"BlackholeDirectory":"/blackhole","PollBlackholeDirectory":false,"PollBlackholeIntervalMinutes":0,"DownloadsDirectory":"/downloads","TransferDirectory":"arrDownloads","BindIP":"0.0.0.0","BindPort":"8182","WebRoot":"","SimultaneousDownloads":0,"DownloadSpeedLimit":0,"EnableTlsCheck":false,"TransferOnlyMode":false,"ArrHistoryUpdateIntervalSeconds":0,"ErroredTransferDeleteGracePeriodSeconds":0}`
 
 // TestConfigHandlerRejectsNullNumericField is the regression test for issue
 // #89: a cleared numeric UI input sends null, which Go's json decoder treats
@@ -346,6 +347,56 @@ func TestConfigHandlerRejectsWrongTypedField(t *testing.T) {
 	assertConfigUnchanged(t, cfg, apiKeyBefore, sdBefore)
 }
 
+// TestConfigHandlerReservesCompatAPIPrefixesForWebRoot is the regression
+// test for review finding E2: the direct *arr compat handlers are mounted
+// at the fixed root prefixes /qbit/ and /sab/, so a WebRoot on one of those
+// prefixes must be rejected at the config route before the whole-struct
+// replace — not merely trip the validation on the next restart.
+func TestConfigHandlerReservesCompatAPIPrefixesForWebRoot(t *testing.T) {
+	for _, tc := range []struct {
+		webRoot  string
+		rejected bool
+	}{
+		{webRoot: "/qbit", rejected: true},
+		{webRoot: "/qbit/anything", rejected: true},
+		{webRoot: "/sab", rejected: true},
+		{webRoot: "/sab/x", rejected: true},
+		{webRoot: "/qbitfoo", rejected: false}, // prefix neighbour, not the prefix
+	} {
+		t.Run(tc.webRoot, func(t *testing.T) {
+			ws, cfg := newConfigRouteTestService(t)
+
+			body := strings.Replace(zeroNumericFieldsPayload, `"WebRoot":""`, fmt.Sprintf(`"WebRoot":%q`, tc.webRoot), 1)
+			req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			ws.ConfigHandler(rec, req)
+
+			var resp ConfigChangeResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("unmarshaling response %q: %v", rec.Body.String(), err)
+			}
+			if tc.rejected {
+				if resp.Succeeded {
+					t.Fatalf("succeeded = true for reserved WebRoot %q", tc.webRoot)
+				}
+				if !strings.Contains(resp.Status, "reserved") {
+					t.Errorf("status = %q, want it to name the reserved prefix", resp.Status)
+				}
+				if cfg.WebRoot != "" {
+					t.Errorf("WebRoot = %q, want unchanged (rejected payload must not replace the config)", cfg.WebRoot)
+				}
+			} else {
+				if !resp.Succeeded {
+					t.Fatalf("succeeded = false for non-conflicting WebRoot %q: %s", tc.webRoot, resp.Status)
+				}
+				if cfg.WebRoot != tc.webRoot {
+					t.Errorf("WebRoot = %q, want %q", cfg.WebRoot, tc.webRoot)
+				}
+			}
+		})
+	}
+}
+
 // configIntField reads an exported int field of config.Config by name for
 // the per-field table tests.
 func configIntField(t *testing.T, cfg *config.Config, name string) int {
@@ -374,6 +425,7 @@ func cloneStringAnyMap(m map[string]any) map[string]any {
 func TestConfigHandlerNumericFieldNullRejectedZeroAccepted(t *testing.T) {
 	base := map[string]any{
 		"PremiumizemeAPIKey":                      "xxxxxxxxx",
+		"DirectClientAPIKey":                      "test-direct-key",
 		"Arrs":                                    []any{},
 		"BlackholeDirectory":                      "/blackhole",
 		"PollBlackholeDirectory":                  false,

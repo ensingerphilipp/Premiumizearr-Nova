@@ -23,6 +23,7 @@
   import { CalculateAPIPath } from "../Utilities/web_root";
 
   let config = {
+    DirectClientAPIKey: "",
     BlackholeDirectory: "",
     PollBlackholeDirectory: false,
     PollBlackholeIntervalMinutes: 10,
@@ -333,6 +334,13 @@
       <FormGroup>
         <TextInput
           disabled={inputDisabled}
+          labelText="Direct *arr client key (SABnzbd API key / qBittorrent password)"
+          bind:value={config.DirectClientAPIKey}
+        />
+      </FormGroup>
+      <FormGroup>
+        <TextInput
+          disabled={inputDisabled}
           labelText="Blackhole Directory"
           bind:value={config.BlackholeDirectory}
         />
@@ -372,6 +380,7 @@
         <TextInput
           disabled={inputDisabled}
           labelText="Web Root"
+          helperText="Serves the UI under this path. /qbit and /sab are reserved for the built-in *arr compat APIs and cannot be used."
           bind:value={config.WebRoot}
         />
       </FormGroup>
