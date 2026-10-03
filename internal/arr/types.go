@@ -56,6 +56,9 @@ type IArr interface {
 	// cache refreshes on ArrHistoryUpdateIntervalSeconds), so decisions
 	// that delete a transfer must be based on a fresh lookup.
 	HistoryContainsFresh(name string) (id int64, found bool, err error)
+	// Direct clients use their torrent hash as download ID; never match a
+	// failed direct job to another grab merely because the release names agree.
+	HistoryContainsDownloadIDFresh(downloadID string) (id int64, found bool, err error)
 	MarkHistoryItemAsFailed(int64) error
 	HandleErrorTransfer(*premiumizeme.Transfer, int64, *premiumizeme.Premiumizeme) error
 	GetArrName() string

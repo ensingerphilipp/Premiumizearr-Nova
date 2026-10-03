@@ -94,7 +94,7 @@ func TestQBitAuthAndInfo(t *testing.T) {
 	}
 	f := &qbitFake{torrents: []TorrentView{{Hash: "abc", Name: "Film", Category: "movies", State: "downloading", Progress: .5, Size: 100, AmountLeft: 50}}}
 	h := NewQBitHandler(f, "arr", "secret")
-	if w := request(h, "GET", "/api/v2/torrents/info", "", "", ""); w.Code != 401 {
+	if w := request(h, "GET", "/api/v2/torrents/info", "", "", ""); w.Code != http.StatusForbidden {
 		t.Fatalf("unauth status=%d", w.Code)
 	}
 	bad := request(h, "POST", "/api/v2/auth/login", "username=arr&password=bad", "application/x-www-form-urlencoded", "")
@@ -223,8 +223,8 @@ func TestQBitLogoutRevokesSession(t *testing.T) {
 	if w := request(h, "POST", "/api/v2/auth/logout", "", "", c); w.Code != 200 {
 		t.Fatalf("logout status = %d, want 200", w.Code)
 	}
-	if w := request(h, "GET", "/api/v2/torrents/info", "", "", c); w.Code != http.StatusUnauthorized {
-		t.Fatalf("replayed cookie after logout = %d, want 401", w.Code)
+	if w := request(h, "GET", "/api/v2/torrents/info", "", "", c); w.Code != http.StatusForbidden {
+		t.Fatalf("replayed cookie after logout = %d, want 403", w.Code)
 	}
 	c2 := login(t, h)
 	if w := request(h, "GET", "/api/v2/torrents/info", "", "", c2); w.Code != 200 {

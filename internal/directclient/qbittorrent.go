@@ -109,7 +109,8 @@ func (h *qbitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.authenticated(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		// *arr retries login on qBittorrent's 403 response for an expired SID.
+		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
 	if path == "/api/v2/auth/logout" {

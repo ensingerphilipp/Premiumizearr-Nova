@@ -111,6 +111,7 @@ func (app *App) Start(logLevel string, configFile string, loggingDirectory strin
 	app.webServer.SetDirectManager(app.directManager)
 
 	app.arrsManager.Start()
+	app.directManager.SetTorrentFailureReporter(app.arrsManager.ReportDirectTorrentFailure)
 	app.webServer.Start()
 	app.directManager.Start()
 	app.directoryWatcher.Start()

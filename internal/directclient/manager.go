@@ -22,21 +22,22 @@ import (
 // Job is the durable link between one *arr download ID, its Premiumize
 // transfer, and the local directory from which *arr imports the result.
 type Job struct {
-	ID              string  `json:"id"`
-	Kind            string  `json:"kind"`
-	Name            string  `json:"name"`
-	Category        string  `json:"category"`
-	SourceName      string  `json:"source_name"`
-	Phase           string  `json:"phase"`
-	Progress        float64 `json:"progress"`
-	TotalBytes      int64   `json:"total_bytes,omitempty"`
-	Downloaded      int64   `json:"downloaded,omitempty"`
-	TransferID      string  `json:"transfer_id"`
-	CloudFolder     string  `json:"cloud_folder"`
-	OutputPath      string  `json:"output_path"`
-	Error           string  `json:"error"`
-	DeleteRequested bool    `json:"delete_requested,omitempty"`
-	DeleteFiles     bool    `json:"delete_files,omitempty"`
+	ID               string   `json:"id"`
+	Kind             string   `json:"kind"`
+	Name             string   `json:"name"`
+	Category         string   `json:"category"`
+	SourceName       string   `json:"source_name"`
+	Phase            string   `json:"phase"`
+	Progress         float64  `json:"progress"`
+	TotalBytes       int64    `json:"total_bytes,omitempty"`
+	Downloaded       int64    `json:"downloaded,omitempty"`
+	TransferID       string   `json:"transfer_id"`
+	CloudFolder      string   `json:"cloud_folder"`
+	OutputPath       string   `json:"output_path"`
+	Error            string   `json:"error"`
+	DeleteRequested  bool     `json:"delete_requested,omitempty"`
+	DeleteFiles      bool     `json:"delete_files,omitempty"`
+	ReportedFailures []string `json:"reported_failures,omitempty"`
 	// CleanupPending marks a completed job whose Premiumize folder could
 	// not be deleted at completion time. The poll deletion pass retries
 	// the folder deletion for such jobs until it succeeds, without
@@ -48,18 +49,20 @@ type Job struct {
 // Manager owns the direct-download namespace. The existing blackhole path
 // uses a different Premiumize folder and remains independent.
 type Manager struct {
-	mu         sync.RWMutex
-	pollMu     sync.Mutex
-	pm         *premiumizeme.Premiumizeme
-	config     *config.Config
-	stateDir   string
-	jobs       map[string]*Job
-	categories map[string]bool
-	active     map[string]context.CancelFunc
-	rootMu     sync.Mutex // guards rootDir/rootID: submit may race the poll loop
-	rootDir    string
-	rootID     string
-	stop       chan struct{}
+	mu              sync.RWMutex
+	pollMu          sync.Mutex
+	pm              *premiumizeme.Premiumizeme
+	config          *config.Config
+	stateDir        string
+	jobs            map[string]*Job
+	categories      map[string]bool
+	active          map[string]context.CancelFunc
+	removing        map[string]bool
+	failureReporter func(Job) ([]string, error)
+	rootMu          sync.Mutex // guards rootDir/rootID: submit may race the poll loop
+	rootDir         string
+	rootID          string
+	stop            chan struct{}
 }
 
 func NewManager(pm *premiumizeme.Premiumizeme, cfg *config.Config, configDir string) (*Manager, error) {
@@ -70,7 +73,7 @@ func NewManager(pm *premiumizeme.Premiumizeme, cfg *config.Config, configDir str
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return nil, err
 	}
-	m := &Manager{pm: pm, config: cfg, stateDir: stateDir, jobs: make(map[string]*Job), categories: make(map[string]bool), active: make(map[string]context.CancelFunc), stop: make(chan struct{})}
+	m := &Manager{pm: pm, config: cfg, stateDir: stateDir, jobs: make(map[string]*Job), categories: make(map[string]bool), active: make(map[string]context.CancelFunc), removing: make(map[string]bool), stop: make(chan struct{})}
 	data, err := os.ReadFile(filepath.Join(stateDir, "jobs.json"))
 	if err == nil {
 		var stored []Job
@@ -156,6 +159,16 @@ func folderDeleteGone(err error) bool {
 		strings.Contains(lower, "does not exist") ||
 		strings.Contains(lower, "no such folder") ||
 		strings.Contains(lower, "unknown folder")
+}
+
+func transferDeleteGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, " (404)") || strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "does not exist") || strings.Contains(msg, "no such transfer") ||
+		strings.Contains(msg, "unknown transfer")
 }
 
 // saveLocked writes the entire registry atomically. Call with m.mu held.
@@ -426,19 +439,32 @@ func (m *Manager) remove(id string, deleteFiles bool) error {
 		m.mu.Unlock()
 		return nil // Download clients treat repeated removal as idempotent.
 	}
+	if m.removing[id] {
+		m.mu.Unlock()
+		return nil
+	}
+	previousRequested, previousFiles := j.DeleteRequested, j.DeleteFiles
+	j.DeleteRequested = true
+	j.DeleteFiles = deleteFiles || j.DeleteFiles
+	if err := m.saveLocked(); err != nil {
+		j.DeleteRequested, j.DeleteFiles = previousRequested, previousFiles
+		m.mu.Unlock()
+		return err
+	}
 	if cancel := m.active[id]; cancel != nil {
-		j.DeleteRequested = true
-		j.DeleteFiles = deleteFiles
-		if err := m.saveLocked(); err != nil {
-			m.mu.Unlock()
-			return err
-		}
 		cancel()
 		m.mu.Unlock()
 		return nil // Cleanup runs when the downloader releases this job.
 	}
+	m.removing[id] = true
 	job := *j
+	deleteFiles = job.DeleteFiles
 	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.removing, id)
+		m.mu.Unlock()
+	}()
 
 	// The remote transfer and folder are deleted BEFORE the durable row:
 	// a failure in between must not leave a Premiumize object that the
@@ -446,12 +472,15 @@ func (m *Manager) remove(id string, deleteFiles bool) error {
 	// cleanup is pending the row stays, marked failed with a retry flag the
 	// next poll's deletion pass (or a repeated *arr removal) re-attempts.
 	if job.TransferID != "" {
-		if err := m.pm.DeleteTransfer(job.TransferID); err != nil {
+		if err := m.pm.DeleteTransfer(job.TransferID); err != nil && !transferDeleteGone(err) {
 			log.Warnf("Could not delete direct transfer %s: %v", job.TransferID, err)
 			m.markCleanupPending(id, deleteFiles, "Remote cleanup pending: the Premiumize transfer was not deleted; the removal will be retried")
 			return err
 		}
 		job.TransferID = ""
+		if err := m.saveRemovalProgress(id, true); err != nil {
+			return err
+		}
 	}
 	if job.CloudFolder != "" {
 		if err := m.pm.DeleteFolder(job.CloudFolder); err != nil {
@@ -467,17 +496,10 @@ func (m *Manager) remove(id string, deleteFiles bool) error {
 			log.Warnf("Cloud folder of direct job %s is already deleted; clearing the reference", id)
 		}
 		job.CloudFolder = ""
+		if err := m.saveRemovalProgress(id, false); err != nil {
+			return err
+		}
 	}
-	m.mu.Lock()
-	if cur := m.jobs[id]; cur != nil {
-		cur.TransferID, cur.CloudFolder = "", ""
-		delete(m.jobs, id)
-	}
-	if err := m.saveLocked(); err != nil {
-		m.mu.Unlock()
-		return err
-	}
-	m.mu.Unlock()
 	if deleteFiles {
 		// The only permissible deletion target is the dedicated job directory.
 		if filepath.Base(job.OutputPath) == id && filepath.Base(filepath.Dir(job.OutputPath)) == "direct" {
@@ -498,7 +520,30 @@ func (m *Manager) remove(id string, deleteFiles bool) error {
 	if err := os.Remove(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur := m.jobs[id]
+	delete(m.jobs, id)
+	if err := m.saveLocked(); err != nil {
+		m.jobs[id] = cur
+		return err
+	}
 	return nil
+}
+
+// Persist each remote deletion separately so an outage or restart resumes
+// from the remaining work. The row stays pending until local cleanup finishes.
+func (m *Manager) saveRemovalProgress(id string, transfer bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if j := m.jobs[id]; j != nil {
+		if transfer {
+			j.TransferID = ""
+		} else {
+			j.CloudFolder = ""
+		}
+	}
+	return m.saveLocked()
 }
 
 // markCleanupPending keeps the durable row (with a retry flag) after a
@@ -509,7 +554,9 @@ func (m *Manager) markCleanupPending(id string, deleteFiles bool, message string
 		cur.Phase, cur.Error = "failed", message
 		cur.DeleteRequested = true
 		cur.DeleteFiles = deleteFiles
-		_ = m.saveLocked()
+		if err := m.saveLocked(); err != nil {
+			log.Errorf("Could not persist direct job %s cleanup: %v", id, err)
+		}
 	}
 	m.mu.Unlock()
 }
@@ -532,11 +579,64 @@ func (m *Manager) Start() {
 
 func (m *Manager) Stop() { close(m.stop) }
 
+// The callback returns the *arr instances that acknowledged this failure.
+// Acknowledgements survive restarts, while unavailable instances are retried.
+func (m *Manager) SetTorrentFailureReporter(reporter func(Job) ([]string, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failureReporter = reporter
+}
+
+func (m *Manager) reportFailedTorrents() {
+	m.mu.RLock()
+	reporter := m.failureReporter
+	var failed []Job
+	if reporter != nil {
+		for _, j := range m.jobs {
+			if j.Kind != "nzb" && j.Phase == "failed" && !j.DeleteRequested {
+				failed = append(failed, *j)
+			}
+		}
+	}
+	m.mu.RUnlock()
+	for _, job := range failed {
+		acknowledged, err := reporter(job)
+		if err != nil {
+			log.Warnf("Could not report direct torrent %s failure: %v", job.ID, err)
+		}
+		if len(acknowledged) == 0 {
+			continue
+		}
+		m.mu.Lock()
+		if j := m.jobs[job.ID]; j != nil {
+			for _, target := range acknowledged {
+				if !containsReport(j.ReportedFailures, target) {
+					j.ReportedFailures = append(j.ReportedFailures, target)
+				}
+			}
+			if err := m.saveLocked(); err != nil {
+				log.Errorf("Could not persist direct torrent %s failure report: %v", job.ID, err)
+			}
+		}
+		m.mu.Unlock()
+	}
+}
+
+func containsReport(reported []string, target string) bool {
+	for _, previous := range reported {
+		if previous == target {
+			return true
+		}
+	}
+	return false
+}
+
 // PollOnce advances queued and cloud jobs. The method is public to allow
 // deterministic tests without waiting for the service ticker.
 func (m *Manager) PollOnce(ctx context.Context) {
 	m.pollMu.Lock()
 	defer m.pollMu.Unlock()
+	defer m.reportFailedTorrents()
 	m.mu.RLock()
 	deleting := make([]Job, 0)
 	for _, j := range m.jobs {
@@ -585,7 +685,7 @@ func (m *Manager) PollOnce(ctx context.Context) {
 	m.mu.RLock()
 	queued := make([]Job, 0)
 	for _, j := range m.jobs {
-		if j.Phase == "queued" {
+		if j.Phase == "queued" && !j.DeleteRequested {
 			queued = append(queued, *j)
 		}
 	}
@@ -615,6 +715,9 @@ func (m *Manager) PollOnce(ctx context.Context) {
 		var id string
 		for _, j := range m.jobs {
 			if j.TransferID == transfer.ID && j.TransferID != "" {
+				if j.DeleteRequested || j.Phase == "failed" || j.Phase == "completed" {
+					break
+				}
 				id = j.ID
 				if transfer.Status == "error" {
 					j.Phase, j.Error = "failed", transfer.Message
@@ -669,7 +772,7 @@ func (m *Manager) resolveRootFolder() (string, error) {
 func (m *Manager) submit(ctx context.Context, id string) error {
 	m.mu.Lock()
 	j := m.jobs[id]
-	if j == nil || j.Phase != "queued" {
+	if j == nil || j.Phase != "queued" || j.DeleteRequested {
 		m.mu.Unlock()
 		return nil
 	}
@@ -770,10 +873,12 @@ func (m *Manager) submit(ctx context.Context, id string) error {
 	}
 	m.mu.Lock()
 	deleteRequested := false
+	deleteFiles := false
 	if j := m.jobs[id]; j != nil {
 		j.TransferID = res.ID
 		j.Phase = "cloud"
 		deleteRequested = j.DeleteRequested
+		deleteFiles = j.DeleteFiles
 		if err := m.saveLocked(); err != nil {
 			delete(m.active, id)
 			m.mu.Unlock()
@@ -783,29 +888,7 @@ func (m *Manager) submit(ctx context.Context, id string) error {
 	delete(m.active, id)
 	m.mu.Unlock()
 	if deleteRequested {
-		// remove() raced the in-flight submission: the row stayed marked
-		// DeleteRequested (the active branch) while the transfer was
-		// being created. Delete the transfer and the job folder now, and
-		// drop the row, before anything can reference unowned objects.
-		if err := m.pm.DeleteTransfer(res.ID); err != nil {
-			log.Warnf("Could not delete transfer of concurrently removed job %s: %v", id, err)
-		}
-		if job.CloudFolder != "" {
-			if err := m.pm.DeleteFolder(job.CloudFolder); err != nil {
-				log.Warnf("Could not delete cloud folder of concurrently removed job %s: %v", id, err)
-			}
-		}
-		m.mu.Lock()
-		if j := m.jobs[id]; j != nil {
-			delete(m.jobs, id)
-			_ = m.saveLocked()
-		}
-		m.mu.Unlock()
-		if sourcePath, perr := m.jobSourcePath(id); perr == nil {
-			if err := os.Remove(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-				log.Warnf("Could not delete direct source %s: %v", id, err)
-			}
-		}
+		return m.remove(id, deleteFiles)
 	}
 	return nil
 }
@@ -824,7 +907,7 @@ func (m *Manager) fail(id, message string) {
 func (m *Manager) startDownload(id string) {
 	m.mu.Lock()
 	j := m.jobs[id]
-	if j == nil || j.Phase == "completed" || j.Phase == "failed" || m.active[id] != nil || j.CloudFolder == "" {
+	if j == nil || j.DeleteRequested || j.Phase == "completed" || j.Phase == "failed" || m.active[id] != nil || j.CloudFolder == "" {
 		m.mu.Unlock()
 		return
 	}

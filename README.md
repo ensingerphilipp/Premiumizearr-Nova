@@ -113,6 +113,13 @@ The web UI still exposes account keys without authentication. Keep the service
 on a trusted network or behind an authenticated reverse proxy. Its qBittorrent
 and SABnzbd endpoints require the direct client key.
 
+For automatic failure handling of torrents, configure each *arr instance in
+Premiumizearr's Config tab with its URL, type and API key. The qBittorrent
+`error` state is treated as a warning by *arr, so Premiumizearr explicitly
+marks the grabbed history record matching the torrent's download ID as failed.
+Failed reports are retried and successful reports are retained across restarts.
+NZB failures are handled through SABnzbd history without this extra setup.
+
 #### Existing blackhole clients
 
 - Go to your Arr's `Download Client` settings page

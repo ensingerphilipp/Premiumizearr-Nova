@@ -332,6 +332,10 @@ func (f *fakeArr) HistoryContainsFresh(name string) (int64, bool, error) {
 	return f.HistoryContains(name)
 }
 
+func (f *fakeArr) HistoryContainsDownloadIDFresh(id string) (int64, bool, error) {
+	return f.HistoryContainsFresh(id)
+}
+
 func (f *fakeArr) MarkHistoryItemAsFailed(id int64) error {
 	if f.failErr != nil {
 		return f.failErr
