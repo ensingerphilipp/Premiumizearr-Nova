@@ -171,6 +171,16 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 		config.SimultaneousDownloads = 5
 		updated = true
 	}
+	if config.SimultaneousDownloads <= 0 {
+		// Only a missing key is backfilled above; a hand-edited 0 (or a
+		// negative value) sails through the parse and would then pass
+		// load while binding every direct download to a zero slot limit,
+		// stalling them silently forever. Normalize it like the missing
+		// value instead.
+		log.Info("SimultaneousDownloads is zero or negative, resetting to 5")
+		config.SimultaneousDownloads = 5
+		updated = true
+	}
 
 	if configInterface["DownloadSpeedLimit"] == nil {
 		log.Info("DownloadSpeedLimit not set, setting to 100 Megabytes per second")

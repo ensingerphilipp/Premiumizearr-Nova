@@ -64,7 +64,7 @@ func TestDownloadCloudFolderRecursivelyPublishesOnlyCompletedFiles(t *testing.T)
 
 	output := filepath.Join(t.TempDir(), "download")
 	var progressCalls int
-	if err := DownloadCloudFolder(context.Background(), &pm, "root", output, true, 0, func(done, total int64) {
+	if err := DownloadCloudFolder(context.Background(), &pm, "root", output, "job-1", true, 0, func(done, total int64) {
 		progressCalls++
 		if total != 0 {
 			t.Errorf("unknown folder total should be zero, got %d", total)
@@ -90,9 +90,78 @@ func TestDownloadCloudFolderRecursivelyPublishesOnlyCompletedFiles(t *testing.T)
 	if _, err := os.Stat(output + ".partial"); !os.IsNotExist(err) {
 		t.Errorf("staging directory remains after successful publish: %v", err)
 	}
-	// A lost response after the atomic publish must be safe to retry.
-	if err := DownloadCloudFolder(context.Background(), &pm, "root", output, true, 0, nil); err != nil {
+	// A lost response after the atomic publish must be safe to retry: the
+	// published manifest carries the same key, so the retry is idempotent.
+	if err := DownloadCloudFolder(context.Background(), &pm, "root", output, "job-1", true, 0, nil); err != nil {
 		t.Errorf("idempotent retry error = %v", err)
+	}
+	// A different downloader at the same path is not a retry: the
+	// manifest proves the tree belongs to "job-1", so the call must fail
+	// instead of adopting the foreign published content.
+	if err := DownloadCloudFolder(context.Background(), &pm, "root", output, "other-job", true, 0, nil); err == nil {
+		t.Error("a different published key was accepted on an existing output directory")
+	}
+	manifest, err := os.ReadFile(filepath.Join(output, publishedManifestName))
+	if err != nil {
+		t.Fatalf("published manifest missing: %v", err)
+	}
+	if string(manifest) != "job-1" {
+		t.Errorf("published manifest = %q, want the publishing job key", manifest)
+	}
+}
+
+// TestDownloadCloudFolderRejectsForeignPreCreatedDirectory is the regression
+// test for R1-2: the fast path treated ANY existing output directory as a
+// finished publish, so a pre-created (or stale) directory was adopted with
+// zero bytes delivered — and the caller then deleted the cloud folder above
+// content this call never produced. Only the manifest written by the
+// downloader's own atomic publish can prove the directory is finished.
+func TestDownloadCloudFolderRejectsForeignPreCreatedDirectory(t *testing.T) {
+	linkRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/item/details" {
+			linkRequests++
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	pm := premiumizeme.NewPremiumizemeClient("test-secret")
+	pm.APIBaseURL = server.URL + "/api/"
+	pm.HTTPClient = server.Client()
+
+	output := filepath.Join(t.TempDir(), "download")
+	// The directory exists before the call, with foreign content, and no
+	// manifest from this downloader.
+	if err := os.MkdirAll(output, 0755); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(output, "user-file.txt")
+	if err := os.WriteFile(foreign, []byte("foreign content"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := DownloadCloudFolder(context.Background(), &pm, "root", output, "job-1", true, 0, nil)
+	if err == nil {
+		t.Fatal("an existing output directory without this downloader's manifest was accepted as a finished publish")
+	}
+	if !strings.Contains(err.Error(), "not published by this downloader") {
+		t.Fatalf("error = %q, want the foreign-directory diagnosis", err)
+	}
+	if linkRequests != 0 {
+		t.Errorf("generated %d Premiumize links for a directory the call refused to adopt", linkRequests)
+	}
+	// Refusing the directory must not touch its content or write a
+	// manifest into it.
+	if got, err := os.ReadFile(foreign); err != nil || string(got) != "foreign content" {
+		t.Fatalf("foreign content after the refused call = %q (%v), want untouched", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(output, publishedManifestName)); !os.IsNotExist(err) {
+		t.Fatalf("a manifest was written into the foreign directory: %v", err)
+	}
+	// The SAME downloader may still fail the same way: the directory
+	// stays foreign until it is removed, no matter how often it is retried.
+	if err := DownloadCloudFolder(context.Background(), &pm, "root", output, "job-1", true, 0, nil); err == nil {
+		t.Error("a retry adopted the still-foreign directory")
 	}
 }
 
@@ -115,7 +184,7 @@ func TestDownloadCloudFolderRejectsTraversalBeforeGeneratingLinks(t *testing.T) 
 	pm.HTTPClient = server.Client()
 
 	output := filepath.Join(t.TempDir(), "download")
-	err := DownloadCloudFolder(context.Background(), &pm, "root", output, true, 0, nil)
+	err := DownloadCloudFolder(context.Background(), &pm, "root", output, "job-1", true, 0, nil)
 	if err == nil {
 		t.Fatal("expected unsafe item name to be rejected")
 	}
@@ -156,7 +225,7 @@ func TestDownloadCloudFolderInterruptsHungFolderListing(t *testing.T) {
 	defer cancel()
 	errc := make(chan error, 1)
 	go func() {
-		errc <- DownloadCloudFolder(ctx, &pm, "folder-1", output, true, 0, nil)
+		errc <- DownloadCloudFolder(ctx, &pm, "folder-1", output, "job-1", true, 0, nil)
 	}()
 	select {
 	case <-parked:
@@ -240,7 +309,7 @@ func TestDownloadCloudFolderPartialNameCannotCollideWithSibling(t *testing.T) {
 	pm.HTTPClient = server.Client()
 
 	output := filepath.Join(t.TempDir(), "download")
-	if err := DownloadCloudFolder(context.Background(), &pm, "root", output, true, 0, nil); err != nil {
+	if err := DownloadCloudFolder(context.Background(), &pm, "root", output, "job-1", true, 0, nil); err != nil {
 		t.Fatalf("DownloadCloudFolder() error = %v", err)
 	}
 	for name, want := range map[string]string{"x": aContent, "x.partial": bContent} {

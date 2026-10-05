@@ -96,7 +96,13 @@ func (app *App) Start(logLevel string, configFile string, loggingDirectory strin
 	app.arrsManager = service.ArrsManagerService{}.New()
 	app.directManager, err = directclient.NewManager(&app.premiumizemeClient, &app.config, configFile)
 	if err != nil {
-		return err
+		// The main caller discards the return value of Start; a bare
+		// return here would exit 0 with no log line and the daemon would
+		// look like a clean stop to the operator and to systemd/docker.
+		// Match the config-load behaviour above instead: log, then die
+		// loudly.
+		log.Errorf("could not initialise direct download manager: %v", err)
+		panic(err)
 	}
 
 	// Initialise Services
@@ -126,4 +132,9 @@ func (app *App) ConfigUpdatedCallback(currentConfig config.Config, newConfig con
 	app.directoryWatcher.ConfigUpdatedCallback(currentConfig, newConfig)
 	app.webServer.ConfigUpdatedCallback(currentConfig, newConfig)
 	app.arrsManager.ConfigUpdatedCallback(currentConfig, newConfig)
+	// The manager keeps its own value snapshot of this struct; the route
+	// rewrites the shared struct in place, so the snapshot must be
+	// reinstalled here or the poll goroutine would read a half-written
+	// struct (torn string headers) from the HTTP goroutine's write.
+	app.directManager.ConfigUpdatedCallback(currentConfig, newConfig)
 }

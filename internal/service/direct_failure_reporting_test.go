@@ -67,6 +67,11 @@ func TestDirectTorrentFailureReportsExactGrabAndSurvivesRestart(t *testing.T) {
 					fmt.Fprint(w, `{"status":"success","id":"transfer-1"}`)
 				case "/api/transfer/list":
 					fmt.Fprintf(w, `{"status":"success","transfers":[{"id":"transfer-1","status":%q,"message":"invalid source"}]}`, transferStatus.Load())
+				// The failed job's reserved folder is cleaned up by the
+				// poll deletion pass (it must not be orphaned on the
+				// account), so the fake accepts the delete.
+				case "/api/folder/delete":
+					fmt.Fprint(w, `{"status":"success"}`)
 				default:
 					t.Errorf("unexpected Premiumize request: %s", r.URL.Path)
 					http.NotFound(w, r)

@@ -203,6 +203,48 @@ func TestLoadConfigFromDiskKeepsSetArrs(t *testing.T) {
 	}
 }
 
+// TestLoadConfigFromDiskNormalizesZeroSimultaneousDownloads verifies that a
+// hand-edited 0 (or negative) SimultaneousDownloads is normalized to the
+// 5 default on load and written back: a 0 would otherwise pass the
+// load gate and then bind every direct download to a zero slot limit,
+// stalling them silently forever.
+func TestLoadConfigFromDiskNormalizesZeroSimultaneousDownloads(t *testing.T) {
+	for _, input := range []string{"SimultaneousDownloads: 0", "SimultaneousDownloads: -2"} {
+		t.Run(input, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfigFile(t, dir, "PremiumizemeAPIKey: xxxxxxxxx\n"+input+"\n")
+
+			cfg, err := loadConfigFromDisk(dir)
+			if err != nil {
+				t.Fatalf("loadConfigFromDisk() error = %v, want nil", err)
+			}
+			if cfg.SimultaneousDownloads != 5 {
+				t.Fatalf("SimultaneousDownloads = %d, want 5 (normalized on load)", cfg.SimultaneousDownloads)
+			}
+			file := readConfigFile(t, dir)
+			if !strings.Contains(file, "SimultaneousDownloads: 5") {
+				t.Fatalf("config file does not contain the normalized limit:\n%s", file)
+			}
+		})
+	}
+}
+
+// TestLoadConfigFromDiskKeepsSetSimultaneousDownloads verifies that an
+// explicitly set positive SimultaneousDownloads is preserved on load
+// instead of being overwritten by the default.
+func TestLoadConfigFromDiskKeepsSetSimultaneousDownloads(t *testing.T) {
+	dir := t.TempDir()
+	writeConfigFile(t, dir, "PremiumizemeAPIKey: xxxxxxxxx\nSimultaneousDownloads: 3\n")
+
+	cfg, err := loadConfigFromDisk(dir)
+	if err != nil {
+		t.Fatalf("loadConfigFromDisk() error = %v, want nil", err)
+	}
+	if cfg.SimultaneousDownloads != 3 {
+		t.Fatalf("SimultaneousDownloads = %d, want 3 (the explicitly set value)", cfg.SimultaneousDownloads)
+	}
+}
+
 // TestUpdateConfigNormalizesNilArrs verifies that an API update body that
 // omits Arrs (which JSON decodes as a nil slice) is normalized to an empty
 // non-nil slice, so GET /api/config cannot be left serving "Arrs": null.

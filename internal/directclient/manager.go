@@ -52,17 +52,22 @@ type Manager struct {
 	mu              sync.RWMutex
 	pollMu          sync.Mutex
 	pm              *premiumizeme.Premiumizeme
-	config          *config.Config
+	config          config.Config
 	stateDir        string
 	jobs            map[string]*Job
 	categories      map[string]bool
 	active          map[string]context.CancelFunc
 	removing        map[string]bool
 	failureReporter func(Job) ([]string, error)
-	rootMu          sync.Mutex // guards rootDir/rootID: submit may race the poll loop
-	rootDir         string
-	rootID          string
-	stop            chan struct{}
+	// failureReportPolls counts failed-report passes per job in memory;
+	// it bounds the reporter calls so a job no configured *arr ever
+	// acknowledges cannot pin the *arr stack with a full-history refetch
+	// every poll forever.
+	failureReportPolls map[string]int
+	rootMu             sync.Mutex // guards rootDir/rootID: submit may race the poll loop
+	rootDir            string
+	rootID             string
+	stop               chan struct{}
 }
 
 func NewManager(pm *premiumizeme.Premiumizeme, cfg *config.Config, configDir string) (*Manager, error) {
@@ -73,7 +78,7 @@ func NewManager(pm *premiumizeme.Premiumizeme, cfg *config.Config, configDir str
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return nil, err
 	}
-	m := &Manager{pm: pm, config: cfg, stateDir: stateDir, jobs: make(map[string]*Job), categories: make(map[string]bool), active: make(map[string]context.CancelFunc), removing: make(map[string]bool), stop: make(chan struct{})}
+	m := &Manager{pm: pm, config: *cfg, stateDir: stateDir, jobs: make(map[string]*Job), categories: make(map[string]bool), active: make(map[string]context.CancelFunc), removing: make(map[string]bool), failureReportPolls: make(map[string]int), stop: make(chan struct{})}
 	data, err := os.ReadFile(filepath.Join(stateDir, "jobs.json"))
 	if err == nil {
 		var stored []Job
@@ -90,6 +95,12 @@ func NewManager(pm *premiumizeme.Premiumizeme, cfg *config.Config, configDir str
 				// Never issue it a second time without a transfer ID.
 				j.Phase = "failed"
 				j.Error = "Submission outcome unknown after restart; inspect the Premiumize transfer before retrying"
+				if j.CloudFolder != "" {
+					// The reserved folder would otherwise outlive the
+					// recovery and sit on the account with nothing left
+					// to clean it: the poll deletion pass retries it.
+					j.CleanupPending = true
+				}
 			}
 			m.jobs[j.ID] = &j
 			if j.Category != "" {
@@ -98,6 +109,24 @@ func NewManager(pm *premiumizeme.Premiumizeme, cfg *config.Config, configDir str
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
+	}
+	// Categories the *arr clients created through the compat endpoints do
+	// not belong to any job, so the jobs registry alone loses them on a
+	// restart and the next *arr category save re-conflicts. Persist them
+	// separately. A corrupt or missing file degrades to the same state a
+	// fresh install has: the clients re-create the categories on their next
+	// save, so load failures are non-fatal here (unlike the job registry).
+	if data, err := os.ReadFile(m.categoriesPath()); err == nil {
+		var storedCats []string
+		if err := json.Unmarshal(data, &storedCats); err != nil {
+			log.Warnf("Could not parse direct category registry %s: %v", m.categoriesPath(), err)
+		} else {
+			for _, c := range storedCats {
+				m.categories[c] = true
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		log.Warnf("Could not read direct category registry %s: %v", m.categoriesPath(), err)
 	}
 	return m, nil
 }
@@ -212,6 +241,45 @@ func newID() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
+func (m *Manager) categoriesPath() string {
+	return filepath.Join(m.stateDir, "categories.json")
+}
+
+// saveCategoriesLocked persists the category set atomically so a restart
+// does not drop categories the clients created through the compat
+// endpoints. Call with m.mu held.
+func (m *Manager) saveCategoriesLocked() error {
+	cats := make([]string, 0, len(m.categories))
+	for c := range m.categories {
+		cats = append(cats, c)
+	}
+	data, err := json.Marshal(cats)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(m.stateDir, ".categories-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), m.categoriesPath())
+}
+
 func (m *Manager) add(kind string, data []byte, filename, category string) (Job, error) {
 	if len(data) == 0 || len(data) > 64<<20 {
 		return Job{}, errors.New("invalid or oversized download request")
@@ -219,7 +287,7 @@ func (m *Manager) add(kind string, data []byte, filename, category string) (Job,
 	if len(category) > 128 {
 		return Job{}, errors.New("category too long")
 	}
-	if m.config.TransferOnlyMode {
+	if snap := m.configSnapshot(); snap.TransferOnlyMode {
 		return Job{}, errors.New("direct download requires TransferOnlyMode to be disabled")
 	}
 	var id string
@@ -262,11 +330,26 @@ func (m *Manager) add(kind string, data []byte, filename, category string) (Job,
 	defer m.mu.Unlock()
 	if old := m.jobs[id]; old != nil {
 		if old.Kind != "nzb" && old.Category == category {
+			if old.Phase == "failed" && !old.DeleteRequested {
+				// The *arr clients re-issue a grab through this
+				// endpoint when they want a retry, and a terminally
+				// failed job has no other retry path: reset the row
+				// to queued so the queued pass re-submits it instead
+				// of returning the failed corpse as if nothing changed.
+				old.Phase = "queued"
+				old.Error = ""
+				old.Progress = 0
+				old.Downloaded = 0
+				old.TotalBytes = 0
+				if err := m.saveLocked(); err != nil {
+					return Job{}, err
+				}
+			}
 			return *old, nil
 		}
 		return Job{}, errors.New("torrent is already assigned to a different category")
 	}
-	outputRoot := filepath.Join(m.outputRoot(), "direct")
+	outputRoot := filepath.Join(m.outputRootLocked(), "direct")
 	job := &Job{ID: id, Kind: kind, Name: name, Category: category, SourceName: filename, Phase: "queued", OutputPath: filepath.Join(outputRoot, id), Created: time.Now()}
 	sourcePath, err := m.jobSourcePath(id)
 	if err != nil {
@@ -276,8 +359,11 @@ func (m *Manager) add(kind string, data []byte, filename, category string) (Job,
 		return Job{}, err
 	}
 	m.jobs[id] = job
-	if category != "" {
+	if category != "" && !m.categories[category] {
 		m.categories[category] = true
+		if err := m.saveCategoriesLocked(); err != nil {
+			log.Warnf("Could not persist direct category registry: %v", err)
+		}
 	}
 	if err := m.saveLocked(); err != nil {
 		delete(m.jobs, id)
@@ -312,11 +398,45 @@ func (m *Manager) AddNZB(_ context.Context, data []byte, filename, category stri
 	return sabView(job), nil
 }
 
-func (m *Manager) outputRoot() string {
-	if m.config.DownloadsDirectory != "" {
-		return m.config.DownloadsDirectory
+// configSnapshot returns the manager's private config value under m.mu.
+// The manager never reads the shared App config struct: UpdateConfig
+// rewrites that struct in place from an HTTP goroutine while the poll and
+// compat goroutines read these fields, and only this locked snapshot
+// separates the two.
+func (m *Manager) configSnapshot() config.Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.config
+}
+
+// ConfigUpdatedCallback installs a fresh snapshot of the updated config
+// after the App's config route rewrites the shared struct.
+func (m *Manager) ConfigUpdatedCallback(_ config.Config, newConfig config.Config) {
+	m.mu.Lock()
+	m.config = newConfig
+	m.mu.Unlock()
+}
+
+// outputRootLocked resolves the validated local base for direct job
+// output. Call with m.mu held. The base location goes through the same
+// GetDownloadsBaseLocation validation the blackhole path uses: an invalid
+// base (the filesystem root, or a directory that is not writeable) must
+// not be trusted into the import path the *arrs read, so the result
+// falls back to the default location instead.
+func (m *Manager) outputRootLocked() string {
+	fallback := filepath.Join(os.TempDir(), "premiumizearrd")
+	root, err := (&m.config).GetDownloadsBaseLocation()
+	if err != nil {
+		log.Warnf("Direct output base location %q is unusable (%v); using %s", m.config.DownloadsDirectory, err, fallback)
+		return fallback
 	}
-	return filepath.Join(os.TempDir(), "premiumizearrd")
+	return root
+}
+
+func (m *Manager) outputRoot() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.outputRootLocked()
 }
 
 func (m *Manager) QBitOutputRoot() string { return filepath.Join(m.outputRoot(), "direct") }
@@ -379,8 +499,11 @@ func (m *Manager) SetCategory(hash, category string) error {
 		return os.ErrNotExist
 	}
 	j.Category = category
-	if category != "" {
+	if category != "" && !m.categories[category] {
 		m.categories[category] = true
+		if err := m.saveCategoriesLocked(); err != nil {
+			log.Warnf("Could not persist direct category registry: %v", err)
+		}
 	}
 	return m.saveLocked()
 }
@@ -391,7 +514,12 @@ func (m *Manager) CreateCategory(category string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.categories[category] = true
+	if !m.categories[category] {
+		m.categories[category] = true
+		if err := m.saveCategoriesLocked(); err != nil {
+			log.Warnf("Could not persist direct category registry: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -587,6 +715,15 @@ func (m *Manager) SetTorrentFailureReporter(reporter func(Job) ([]string, error)
 	m.failureReporter = reporter
 }
 
+// failedReportPollCap bounds the failure-report passes per job. Each
+// pass forces a full-history refetch against every configured *arr;
+// unbounded, a job no *arr's history contains (a purged grab record, a
+// deleted entry, a Lidarr history without downloadIds, or a multi-*arr
+// setup where only one instance made the grab) pins the *arr stack with
+// that refetch every 15 s forever. After the cap the job dead-letters:
+// it stays failed and *arr-visible until it is removed.
+const failedReportPollCap = 8
+
 func (m *Manager) reportFailedTorrents() {
 	m.mu.RLock()
 	reporter := m.failureReporter
@@ -598,24 +735,44 @@ func (m *Manager) reportFailedTorrents() {
 			}
 		}
 	}
+	polls := make(map[string]int, len(m.failureReportPolls))
+	for id, n := range m.failureReportPolls {
+		polls[id] = n
+	}
 	m.mu.RUnlock()
 	for _, job := range failed {
+		if polls[job.ID] >= failedReportPollCap {
+			continue
+		}
 		acknowledged, err := reporter(job)
 		if err != nil {
 			log.Warnf("Could not report direct torrent %s failure: %v", job.ID, err)
 		}
-		if len(acknowledged) == 0 {
-			continue
+		if len(acknowledged) == 0 && err == nil {
+			// Every reachable *arr answered but none tracked this grab.
+			// Name the silent path once instead of looping quietly.
+			if polls[job.ID] == 0 {
+				log.Warnf("No configured *arr acknowledged the failure of direct torrent %s; retrying for up to %d polls", job.ID, failedReportPollCap)
+			}
 		}
 		m.mu.Lock()
 		if j := m.jobs[job.ID]; j != nil {
+			m.failureReportPolls[job.ID] = polls[job.ID] + 1
 			for _, target := range acknowledged {
 				if !containsReport(j.ReportedFailures, target) {
 					j.ReportedFailures = append(j.ReportedFailures, target)
 				}
 			}
-			if err := m.saveLocked(); err != nil {
-				log.Errorf("Could not persist direct torrent %s failure report: %v", job.ID, err)
+			if m.failureReportPolls[job.ID] >= failedReportPollCap {
+				// Terminal notice for this job: the passes above are all it
+				// gets, so the *arr stack is no longer pinned by this
+				// row refetching its full history every poll.
+				log.Warnf("Giving up reporting direct torrent %s failure after %d polls; the job stays failed until it is removed through the *arr client", job.ID, failedReportPollCap)
+			}
+			if len(acknowledged) > 0 {
+				if err := m.saveLocked(); err != nil {
+					log.Errorf("Could not persist direct torrent %s failure report: %v", job.ID, err)
+				}
 			}
 		}
 		m.mu.Unlock()
@@ -635,8 +792,15 @@ func containsReport(reported []string, target string) bool {
 // deterministic tests without waiting for the service ticker.
 func (m *Manager) PollOnce(ctx context.Context) {
 	m.pollMu.Lock()
-	defer m.pollMu.Unlock()
+	// Defer order is load-bearing: defers run LIFO, so the report runs
+	// AFTER the unlock. The report issues *arr network calls (a forced
+	// full-history fetch per target, up to the client timeout each) and
+	// must not hold the poll critical section: an unreachable *arr would
+	// otherwise inflate the effective poll period to the report time and
+	// stall every queued submission, in-flight download, and cleanup pass
+	// behind it.
 	defer m.reportFailedTorrents()
+	defer m.pollMu.Unlock()
 	m.mu.RLock()
 	deleting := make([]Job, 0)
 	for _, j := range m.jobs {
@@ -720,7 +884,7 @@ func (m *Manager) PollOnce(ctx context.Context) {
 				}
 				id = j.ID
 				if transfer.Status == "error" {
-					j.Phase, j.Error = "failed", transfer.Message
+					m.markFailedLocked(j, transfer.Message)
 				} else if j.Phase != "completed" && j.Phase != "local" {
 					j.Phase = "cloud"
 					j.Progress = clampProgress(transfer.Progress) * 0.9
@@ -755,7 +919,9 @@ func clampProgress(p float64) float64 {
 // reusing the old one forever. Resolution stays lazy — the config update
 // fan-out issues no API calls (minimal-sync policy).
 func (m *Manager) resolveRootFolder() (string, error) {
+	m.mu.RLock()
 	dir := m.config.TransferDirectory
+	m.mu.RUnlock()
 	m.rootMu.Lock()
 	defer m.rootMu.Unlock()
 	if m.rootID == "" || m.rootDir != dir {
@@ -893,11 +1059,22 @@ func (m *Manager) submit(ctx context.Context, id string) error {
 	return nil
 }
 
+// markFailedLocked transitions a job to the terminal failed state and
+// hands any reserved cloud folder to the poll deletion pass: without the
+// retry flag no path ever deletes that folder (a lifetime orphan on the
+// account). Call with m.mu held.
+func (m *Manager) markFailedLocked(j *Job, message string) {
+	j.Phase, j.Error = "failed", message
+	if j.CloudFolder != "" && !j.CleanupPending {
+		j.CleanupPending = true
+	}
+}
+
 func (m *Manager) fail(id, message string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if j := m.jobs[id]; j != nil {
-		j.Phase, j.Error = "failed", message
+		m.markFailedLocked(j, message)
 		if err := m.saveLocked(); err != nil {
 			log.Errorf("Could not persist direct job %s failure: %v", id, err)
 		}
@@ -911,8 +1088,12 @@ func (m *Manager) startDownload(id string) {
 		m.mu.Unlock()
 		return
 	}
+	// A non-positive limit means unlimited here: a config that carries
+	// 0 through this door (a value the web route permits and the load
+	// path normalizes only at file-parse time) must not silently stall
+	// every direct download, so it cannot bind the slot gate.
 	max := m.config.SimultaneousDownloads
-	if max <= 0 || len(m.active) >= max {
+	if max > 0 && len(m.active) >= max {
 		m.mu.Unlock()
 		return
 	}
@@ -927,6 +1108,7 @@ func (m *Manager) startDownload(id string) {
 		return
 	}
 	job := *j
+	snap := m.config
 	m.mu.Unlock()
 	go func() {
 		defer func() {
@@ -941,7 +1123,7 @@ func (m *Manager) startDownload(id string) {
 				_ = m.remove(id, deleteFiles)
 			}
 		}()
-		err := DownloadCloudFolder(ctx, m.pm, job.CloudFolder, job.OutputPath, m.config.EnableTlsCheck, m.config.DownloadSpeedLimit, func(done, total int64) {
+		err := DownloadCloudFolder(ctx, m.pm, job.CloudFolder, job.OutputPath, job.ID, snap.EnableTlsCheck, snap.DownloadSpeedLimit, func(done, total int64) {
 			m.mu.Lock()
 			if j := m.jobs[id]; j != nil {
 				j.TotalBytes, j.Downloaded = total, done

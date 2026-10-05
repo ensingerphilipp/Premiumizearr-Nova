@@ -77,7 +77,7 @@ func TestManagerRemovalRetriesAfterFolderDeleteFailure(t *testing.T) {
 	if err := m.RemoveTorrent(id, true); err == nil {
 		t.Fatal("first removal should surface transient folder failure")
 	}
-	restarted, err := NewManager(&pm, m.config, configDir)
+	restarted, err := NewManager(&pm, &m.config, configDir)
 	if err != nil {
 		t.Fatal(err)
 	}

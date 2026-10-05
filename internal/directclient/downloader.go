@@ -12,16 +12,26 @@ import (
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
 )
 
+// publishedManifestName is the marker file the atomic publish writes into
+// the published tree, BEFORE the staging rename, tying the published
+// directory to the downloader that owns it.
+const publishedManifestName = ".directclient-published"
+
 // DownloadCloudFolder copies a Premiumize cloud folder into outputPath. Files
 // are downloaded into a sibling staging directory and only exposed at
 // outputPath once every file has completed. Successfully downloaded files in
 // the staging directory are retained across retries; wget's own partial file
 // is retained as well so it can resume an interrupted transfer.
 //
+// publishedKey identifies the downloader that owns the published output
+// (the manager passes the job ID). The publish writes a manifest carrying
+// that key into the tree, and a re-invocation treats an existing output
+// directory as a finished publish ONLY when its manifest matches the key.
+//
 // Progress reports bytes already present in the staging directory after each
 // completed file. Premiumize's folder listing currently has no size field, so
 // total is zero (unknown).
-func DownloadCloudFolder(ctx context.Context, pm *premiumizeme.Premiumizeme, folderID, outputPath string, tlsCheck bool, speedLimit int, progress func(done, total int64)) error {
+func DownloadCloudFolder(ctx context.Context, pm *premiumizeme.Premiumizeme, folderID, outputPath, publishedKey string, tlsCheck bool, speedLimit int, progress func(done, total int64)) error {
 	if pm == nil {
 		return fmt.Errorf("premiumize client is nil")
 	}
@@ -30,6 +40,9 @@ func DownloadCloudFolder(ctx context.Context, pm *premiumizeme.Premiumizeme, fol
 	}
 	if strings.TrimSpace(outputPath) == "" {
 		return fmt.Errorf("output path is empty")
+	}
+	if strings.TrimSpace(publishedKey) == "" {
+		return fmt.Errorf("published key is empty")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -41,9 +54,20 @@ func DownloadCloudFolder(ctx context.Context, pm *premiumizeme.Premiumizeme, fol
 	}
 	if info, err := os.Lstat(finalPath); err == nil {
 		if info.IsDir() {
-			// A prior call may have finished the atomic publish and lost its
-			// response. Treat it as success to make retries idempotent.
-			return nil
+			// "The directory exists" is not verifiable as "I published
+			// it": a pre-created or re-used directory may hold foreign
+			// content, and treating it as success would let the caller
+			// delete the cloud source folder above content this call
+			// never delivered. Only the manifest written by the atomic
+			// publish below, keyed to this downloader, proves it.
+			if data, rerr := os.ReadFile(filepath.Join(finalPath, publishedManifestName)); rerr == nil &&
+				strings.TrimSpace(string(data)) == publishedKey {
+				// A prior call may have finished the atomic publish and
+				// lost its response. Treat it as success to make
+				// retries idempotent.
+				return nil
+			}
+			return fmt.Errorf("output path %s exists but was not published by this downloader (key %q) for folder %s", finalPath, publishedKey, folderID)
 		}
 		return fmt.Errorf("output path already exists and is not a directory")
 	} else if !os.IsNotExist(err) {
@@ -154,6 +178,12 @@ func DownloadCloudFolder(ctx context.Context, pm *premiumizeme.Premiumizeme, fol
 
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// Tie the published tree to its downloader BEFORE the atomic publish:
+	// on a later retry the manifest is the only proof that the existing
+	// output directory was published by this downloader.
+	if err := os.WriteFile(filepath.Join(stagePath, publishedManifestName), []byte(publishedKey), 0644); err != nil {
+		return fmt.Errorf("record published folder: %w", err)
 	}
 	if err := os.Rename(stagePath, finalPath); err != nil {
 		return fmt.Errorf("publish downloaded folder: %w", err)

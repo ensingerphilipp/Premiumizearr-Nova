@@ -101,6 +101,69 @@ func TestDownloadFileContextResumesPartialFile(t *testing.T) {
 	}
 }
 
+// TestDownloadFileContextKeepsPartialAfterServerFailure is the regression
+// test for the finding that a wget failure deleted the partial file —
+// discarding exactly the bytes the next "wget -c" attempt needs to resume.
+// The partial must survive.
+//
+// The server truncates the first attempt mid-body (a retryable failure for
+// wget) and answers every retry with a definitive 404: wget does not retry
+// a permanent 4xx, so the failure is terminal and fast instead of running
+// wget's full ~150 s retry backoff against an eternally flaky server.
+func TestDownloadFileContextKeepsPartialAfterServerFailure(t *testing.T) {
+	requireDownloadTools(t)
+	payload := patternedPayload(256 << 10)
+	var firstAttempt atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if firstAttempt.CompareAndSwap(false, true) {
+			// Declare the full body, serve exactly half, then drop the
+			// connection abruptly: wget fails on the truncated body and
+			// has written a resumable partial.
+			h, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+				return
+			}
+			conn, buf, err := h.Hijack()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			_, _ = fmt.Fprintf(buf, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", len(payload))
+			_ = buf.Flush()
+			_, _ = conn.Write(payload[:128<<10])
+			time.Sleep(100 * time.Millisecond)
+			// conn.Close() in the defer drops the connection mid-body.
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	outPath := filepath.Join(t.TempDir(), "partial.bin")
+	err := DownloadFileContext(context.Background(), false, 0, server.URL+"/file.bin", outPath, NewWriteCounter())
+	if err == nil {
+		t.Fatal("DownloadFileContext succeeded although the server dropped the connection mid-body")
+	}
+	info, err := os.Stat(outPath)
+	if err != nil {
+		t.Fatalf("partial file missing after a wget failure: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("partial file is empty after a wget failure; the resumable bytes were discarded")
+	}
+	if info.Size() > int64(len(payload)) {
+		t.Fatalf("partial file is larger than the source (%d > %d)", info.Size(), len(payload))
+	}
+	got, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("reading the retained partial: %v", err)
+	}
+	if !bytes.HasPrefix(payload, got) {
+		t.Fatalf("retained partial (len=%d) is not a prefix of the source; a resume would corrupt the file", len(got))
+	}
+}
+
 func appendRange(mu *sync.Mutex, values *[]string, v string) {
 	mu.Lock()
 	defer mu.Unlock()
