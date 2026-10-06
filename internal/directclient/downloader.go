@@ -310,6 +310,14 @@ func collectCloudFiles(ctx context.Context, pm *premiumizeme.Premiumizeme, folde
 		if err != nil {
 			return err
 		}
+		// The manifest is written into the staging root for a file entry
+		// (which would truncate this file to the manifest key before
+		// publish) and collides with the root for a folder entry (EISDIR
+		// at the manifest write), so a listed entry with that name cannot
+		// be represented. Reject both before any download starts.
+		if name == publishedManifestName {
+			return fmt.Errorf("premiumize entry %q uses the downloader's reserved manifest name %q; refusing to download a listing the publish step cannot represent", parent+"/"+name, publishedManifestName)
+		}
 		rel := filepath.Join(parent, name)
 		switch strings.ToLower(item.Type) {
 		case "folder":
