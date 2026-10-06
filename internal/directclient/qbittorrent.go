@@ -199,9 +199,23 @@ func (h *qbitHandler) add(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		// Bound the whole body before the parse: 64 MiB is a spool
+		// THRESHOLD, not a cap, so an oversized file part would be spooled
+		// to a temp file the parser never removes. The wrapper reports its
+		// own trip, because the multipart parser obscures any limit error
+		// it encounters (same guard as the SAB handler).
+		bodyLim := newLimitedBody(r.Body, (64<<20)+(1<<20))
+		r.Body = bodyLim
 		if err := r.ParseMultipartForm(64 << 20); err != nil {
+			if bodyLim.tripped() {
+				http.Error(w, "torrent file exceeds 64 MiB limit", http.StatusInternalServerError)
+				return
+			}
 			http.Error(w, "Invalid add request", 400)
 			return
+		}
+		if r.MultipartForm != nil {
+			defer r.MultipartForm.RemoveAll()
 		}
 	} else if err := r.ParseForm(); err != nil {
 		http.Error(w, "Invalid add request", 400)

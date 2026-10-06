@@ -3,6 +3,7 @@ package directclient
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -102,6 +103,20 @@ func DownloadCloudFolder(ctx context.Context, pm *premiumizeme.Premiumizeme, fol
 			total += file.size
 		}
 	}
+	// An entry whose name is another entry's in-progress staging name
+	// ("<name>.<id>.partial") would make one file's wget resume against the
+	// other file's completed bytes: fail closed on the class, before any
+	// download starts.
+	targets := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		targets[filepath.Join(stagePath, file.relativePath)] = struct{}{}
+	}
+	for _, file := range files {
+		inProgress := fmt.Sprintf("%s.%s.partial", filepath.Join(stagePath, file.relativePath), file.id)
+		if _, ok := targets[inProgress]; ok {
+			return fmt.Errorf("premiumize folder entry %q collides with another file's in-progress name; refusing to mix content", file.relativePath)
+		}
+	}
 
 	var done int64
 	for _, file := range files {
@@ -116,11 +131,20 @@ func DownloadCloudFolder(ctx context.Context, pm *premiumizeme.Premiumizeme, fol
 			if !info.Mode().IsRegular() {
 				return fmt.Errorf("staged path %q is not a regular file", file.relativePath)
 			}
-			done += info.Size()
-			if progress != nil {
-				progress(done, total)
+			// A staged target is trusted only when its completion sidecar
+			// names THIS entry's file ID. A file that merely exists at the
+			// path may be a stale leftover from an earlier listing (a
+			// replaced entry, a renamed sibling), and trusting it would
+			// publish the old bytes under the new name; instead the fresh
+			// download replaces it.
+			if owner, rerr := os.ReadFile(completeSidecar(target)); rerr == nil &&
+				strings.TrimSpace(string(owner)) == file.id {
+				done += info.Size()
+				if progress != nil {
+					progress(done, total)
+				}
+				continue
 			}
-			continue
 		} else if !os.IsNotExist(err) {
 			return fmt.Errorf("inspect staged file %q: %w", file.relativePath, err)
 		}
@@ -166,6 +190,13 @@ func DownloadCloudFolder(ctx context.Context, pm *premiumizeme.Premiumizeme, fol
 		if err := os.Rename(partialPath, target); err != nil {
 			return fmt.Errorf("finish staged file %q: %w", file.relativePath, err)
 		}
+		// Bind the staged target to the listing entry that produced it:
+		// the sidecar is consulted by the skip above, so a retry re-uses
+		// a completed download of the SAME entry instead of re-downloading
+		// it, and re-downloads any target a previous listing left behind.
+		if err := os.WriteFile(completeSidecar(target), []byte(file.id), 0644); err != nil {
+			return fmt.Errorf("record completion of staged file %q: %w", file.relativePath, err)
+		}
 		info, err := os.Stat(target)
 		if err != nil {
 			return fmt.Errorf("stat staged file %q: %w", file.relativePath, err)
@@ -179,6 +210,15 @@ func DownloadCloudFolder(ctx context.Context, pm *premiumizeme.Premiumizeme, fol
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// The publish renames the WHOLE staging directory into the output
+	// tree, so first delete every staged entry no entry of the
+	// just-collected listing claims: an earlier listing may have left
+	// behind in-progress names and stale targets that belong to no file
+	// in this folder, and shipping them would make *arr import foreign
+	// bytes as part of the release.
+	if err := pruneUnclaimedStaging(stagePath, files); err != nil {
+		return err
+	}
 	// Tie the published tree to its downloader BEFORE the atomic publish:
 	// on a later retry the manifest is the only proof that the existing
 	// output directory was published by this downloader.
@@ -189,6 +229,59 @@ func DownloadCloudFolder(ctx context.Context, pm *premiumizeme.Premiumizeme, fol
 		return fmt.Errorf("publish downloaded folder: %w", err)
 	}
 	return nil
+}
+
+// completeSidecar is the per-file completion marker inside the staging
+// tree; its content records the listing entry ID that produced the staged
+// target, binding the target to the entry that owns it.
+func completeSidecar(target string) string { return target + ".complete" }
+
+// pruneUnclaimedStaging deletes every staged entry that no entry of the
+// current cloud listing claims: a directory is claimed only when a
+// claimed entry lies inside it. It runs before the manifest write and the
+// staging rename, because the publish moves the WHOLE staging tree into
+// the output path — only claimed entries may survive.
+func pruneUnclaimedStaging(stagePath string, files []cloudFile) error {
+	// Claimed entries as paths relative to the staging root.
+	claimedFiles := make(map[string]struct{}, 3*len(files)+1)
+	for _, file := range files {
+		claimedFiles[file.relativePath] = struct{}{}
+		claimedFiles[file.relativePath+"."+file.id+".partial"] = struct{}{}
+		claimedFiles[completeSidecar(file.relativePath)] = struct{}{}
+	}
+	claimedFiles[publishedManifestName] = struct{}{}
+	claimedDirs := make(map[string]struct{})
+	for rel := range claimedFiles {
+		dir := filepath.Dir(rel)
+		for dir != "." {
+			claimedDirs[dir] = struct{}{}
+			dir = filepath.Dir(dir)
+		}
+	}
+	return filepath.WalkDir(stagePath, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(stagePath, p)
+		if rerr != nil || rel == "." {
+			return nil
+		}
+		if d.IsDir() {
+			if _, ok := claimedDirs[rel]; !ok {
+				if err := os.RemoveAll(p); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if _, ok := claimedFiles[rel]; !ok {
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 type cloudFile struct {

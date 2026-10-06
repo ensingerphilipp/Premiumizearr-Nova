@@ -767,6 +767,19 @@ func (manager *TransferManagerService) downloadFolderRecursively(item premiumize
 			err = progress_downloader.DownloadFile(checkcertificate, ratelimit, link, fileSavePath, manager.downloadList[item.Name].ProgressDownloader)
 			if err != nil {
 				manager.removeDownload(item.Name)
+				// This caller writes straight to the FINAL name inside the
+				// *arr-watched folder, so a failed download leaves a
+				// truncated file there: the blackhole would import the
+				// partial content, and a later resume (wget -c) would
+				// accept the stale bytes against different content. The
+				// directclient caller is exempt — it stages under an
+				// invisible ID-suffixed name and renames on success — so
+				// the keep-on-failure there is safe. Remove the file here
+				// to restore "a file in the watched folder is a completed
+				// download".
+				if rerr := os.Remove(fileSavePath); rerr != nil && !os.IsNotExist(rerr) {
+					log.Warnf("could not remove failed partial file %s: %s", fileSavePath, rerr)
+				}
 				manager.markDownloadFailed(item.Name)
 				log.Errorf("Error downloading file %s: %s, continuing with other files", item.Name, err)
 				folderHasErrors = true

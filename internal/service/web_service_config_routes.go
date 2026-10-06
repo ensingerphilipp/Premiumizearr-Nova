@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
@@ -160,11 +161,18 @@ func (s *WebServerService) ConfigHandler(w http.ResponseWriter, r *http.Request)
 			})
 			return
 		}
-		s.config.UpdateConfig(newConfig)
+		// The response is written BEFORE the update: the update's
+		// in-handler web-server restart (BindIP/BindPort/WebRoot or a
+		// rotated DirectClientAPIKey) closes the very connection serving
+		// this request, so anything written after it never reaches the
+		// client — the browser would report a save failure for a change
+		// that did persist. Every validation that decides the outcome has
+		// already run above, so the reply is final here.
 		EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
 			Succeeded: true,
 			Status:    "Config updated",
 		})
+		s.config.UpdateConfig(newConfig)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -177,6 +185,20 @@ func EncodeAndWriteConfigChangeResponse(w http.ResponseWriter, resp *ConfigChang
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	w.Write(data)
+	// Pin Content-Length so the reply is self-contained: without it the
+	// body rides chunked framing whose terminator is emitted only when the
+	// handler returns — after an in-handler restart has closed the
+	// connection, leaving the client with a truncated response.
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	if _, err := w.Write(data); err != nil {
+		return
+	}
+	// net/http buffers the write in the connection's writer and only pushes
+	// it to the socket when the handler returns. The in-handler restart
+	// that a successful update triggers closes the connection before that
+	// point and would discard the buffered bytes, so flush the final
+	// response to the client before the update runs.
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }

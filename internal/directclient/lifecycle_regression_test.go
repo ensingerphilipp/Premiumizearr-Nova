@@ -3,7 +3,6 @@ package directclient
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -96,23 +95,46 @@ type lifecycleTransport func(*http.Request) (*http.Response, error)
 
 func (f lifecycleTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+// TestManagerSubmitRemovalRetainsFailedRemoteCleanup is the round-2 rewrite
+// of the round-1 lifecycle test. The round-1 version fabricated a 200
+// response the transport never produced, which exercised the post-200
+// cancellation race instead of the post-commit failure the finding is
+// about. This version models the real outcome: the request reaches the
+// server, which commits the transfer to the account, and the client's
+// transport then reports a cancellation because a concurrent removal
+// cancelled the in-flight request. The client never saw a response, so the
+// row stores no transfer ID — only the reconcile scan over the account's
+// transfer list can still reach the orphan.
 func TestManagerSubmitRemovalRetainsFailedRemoteCleanup(t *testing.T) {
-	var unavailable atomic.Bool
-	unavailable.Store(true)
+	var committed atomic.Bool
+	var orphanDeletes, folderDeletes atomic.Int32
 	pm := managerTestPremiumize(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/folder/list":
 			fmt.Fprint(w, `{"status":"success","content":[]}`)
 		case "/api/folder/create":
 			fmt.Fprint(w, `{"status":"success","id":"folder-1"}`)
-		case "/api/transfer/delete", "/api/folder/delete":
-			if unavailable.Load() {
-				http.Error(w, "transient outage", 503)
-				return
+		case "/api/transfer/delete":
+			// DeleteTransfer posts the id as a form field; the scan
+			// deletes by the transfer's own ID, so count only the
+			// deletion of the committed orphan.
+			_ = r.ParseForm()
+			if r.FormValue("id") == "T-orph-1" {
+				orphanDeletes.Add(1)
 			}
 			fmt.Fprint(w, `{"status":"success"}`)
+		case "/api/folder/delete":
+			folderDeletes.Add(1)
+			fmt.Fprint(w, `{"status":"success"}`)
 		case "/api/transfer/list":
-			fmt.Fprint(w, `{"status":"success","transfers":[]}`)
+			// The account's truth the reconcile scan reads: the
+			// transfer exists only if the create was committed
+			// server-side.
+			if committed.Load() {
+				fmt.Fprint(w, `{"status":"success","transfers":[{"id":"T-orph-1","name":"Example.Release","status":"downloading","progress":0.5,"folder_id":"folder-1"}]}`)
+			} else {
+				fmt.Fprint(w, `{"status":"success","transfers":[]}`)
+			}
 		default:
 			http.NotFound(w, r)
 		}
@@ -127,22 +149,27 @@ func TestManagerSubmitRemovalRetainsFailedRemoteCleanup(t *testing.T) {
 		if r.URL.Path != "/api/transfer/create" {
 			return original.RoundTrip(r)
 		}
-		// Model a successful response already received as a concurrent removal arrives.
+		// The request reaches the server, which commits the transfer to
+		// the account; then a concurrent removal arrives and cancels the
+		// in-flight request before the client sees the response.
+		committed.Store(true)
 		if err := m.RemoveTorrent(id, true); err != nil {
 			t.Fatal(err)
 		}
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"status":"success","id":"transfer-1"}`)), Header: make(http.Header), Request: r}, nil
+		// The transport's post-cancellation outcome: no response at all.
+		return nil, context.Canceled
 	})
 	if err := m.submit(context.Background(), id); err == nil {
-		t.Fatal("submission/removal should report the remote cleanup failure")
+		t.Fatal("a submission the client never saw a response for must not report success")
 	}
-	if len(m.ListTorrents("tv")) == 0 {
-		t.Fatal("row discarded despite remote deletion failing; transfer and folder now unowned")
+	if orphanDeletes.Load() < 1 {
+		t.Fatalf("orphan transfer deletes = %d, want >= 1: the committed transfer no row references is unowned until the reconcile scan finds it through the just-cleared folder", orphanDeletes.Load())
 	}
-	unavailable.Store(false)
-	m.PollOnce(context.Background())
+	if folderDeletes.Load() < 1 {
+		t.Fatalf("folder delete calls = %d, want >= 1: the reserved folder must not outlive the removal", folderDeletes.Load())
+	}
 	if len(m.ListTorrents("tv")) != 0 {
-		t.Fatal("pending removal was not retried after the outage")
+		t.Fatalf("row remains after the reconciled removal: %#v", m.ListTorrents("tv"))
 	}
 }
 

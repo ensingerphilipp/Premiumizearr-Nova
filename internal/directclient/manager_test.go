@@ -742,6 +742,7 @@ func TestManagerSubmittingJobRemovalLeavesNoOrphan(t *testing.T) {
 	t.Run("removal while the request is in flight", func(t *testing.T) {
 		releaseTransfer := make(chan struct{}, 1)
 		var transferDeletes, folderDeletes atomic.Int32
+		var committedTransfer atomic.Bool
 		pm := managerTestPremiumize(t, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			switch r.URL.Path {
@@ -763,7 +764,18 @@ func TestManagerSubmittingJobRemovalLeavesNoOrphan(t *testing.T) {
 				if r.Context().Err() != nil {
 					return
 				}
+				// Only a completed create commits the transfer to the
+				// account: an aborted request left nothing behind.
+				committedTransfer.Store(true)
 				fmt.Fprint(w, `{"status":"success","id":"transfer-1"}`)
+			case "/api/transfer/list":
+				// The account's truth the reconcile scan reads: the
+				// transfer exists only if the create request completed.
+				if committedTransfer.Load() {
+					fmt.Fprint(w, `{"status":"success","transfers":[{"id":"transfer-1","name":"Example.Release","status":"downloading","progress":0.5,"folder_id":"job-folder"}]}`)
+				} else {
+					fmt.Fprint(w, `{"status":"success","transfers":[]}`)
+				}
 			case "/api/transfer/delete":
 				transferDeletes.Add(1)
 				fmt.Fprint(w, `{"status":"success"}`)

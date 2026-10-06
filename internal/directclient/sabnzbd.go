@@ -155,6 +155,12 @@ func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.bad(w, err)
 			return
 		}
+		if r.MultipartForm != nil {
+			// A file part strictly larger than maxMemory was spooled to
+			// a temp file the parser will not remove; the size rejection
+			// below (and the normal completion) must not leave it behind.
+			defer r.MultipartForm.RemoveAll()
+		}
 		f, hdr, err := r.FormFile("name")
 		if err != nil {
 			f, hdr, err = r.FormFile("nzbfile")
