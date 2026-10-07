@@ -1,16 +1,67 @@
 #!/usr/bin/with-contenv bash
 
-# Default UID/GID to 1000 if not set
-PUID=${PUID:-1000}
-PGID=${PGID:-1000}
+# Read the kernel's mount table without stat-ing the potentially stalled mount.
+# Skip the whole target if a network mount contains it OR is nested beneath it.
+has_network_mount() {
+    [[ -r "${2:-/proc/self/mountinfo}" ]] || return 2
+    awk -v target="$1" '
+        {
+            mount = $5
+            gsub(/\\040/, " ", mount)
+            gsub(/\\011/, "\t", mount)
+            gsub(/\\012/, "\n", mount)
+            gsub(/\\134/, "\\", mount)
+            for (i = 7; i <= NF; i++) {
+                if ($i == "-") {
+                    type = $(i + 1)
+                    break
+                }
+            }
+            if (type ~ /^(cifs|smb3|nfs|nfs4|9p|ceph|glusterfs|fuse.*)$/ &&
+                (mount == "/" || mount == target ||
+                 index(target, mount "/") == 1 || index(mount, target "/") == 1)) {
+                found = 1
+            }
+        }
+        END { exit !found }
+    ' "${2:-/proc/self/mountinfo}"
+}
 
-# Optional: log what's happening
-echo "[cont-init.d] Setting permissions to $PUID:$PGID"
+configure_permissions() {
+    local directory
+    local mount_status
+    local mountinfo="${1:-/proc/self/mountinfo}"
+    local owner="${PUID:-1000}:${PGID:-1000}"
 
-# Change ownership recursively
-chown -R "$PUID:$PGID" \
-    /data \
-    /downloads \
-    /transfers \
-    /blackhole \
-    /opt
+    if [[ "${PREMIUMIZEARR_SKIP_CHOWN:-false}" == "true" ]]; then
+        echo "[cont-init.d] Skipping ownership changes (PREMIUMIZEARR_SKIP_CHOWN=true)"
+        return 0
+    fi
+
+    for directory in /data /downloads /transfers /blackhole /opt; do
+        if has_network_mount "$directory" "$mountinfo"; then
+            mount_status=0
+        else
+            mount_status=$?
+        fi
+        if [[ "$mount_status" -eq 0 ]]; then
+            echo "[cont-init.d] Skipping ownership changes for network mount at or under $directory; configure UID/GID on the host"
+            continue
+        elif [[ "$mount_status" -ne 1 ]]; then
+            echo "[cont-init.d] Cannot read mount information; skipping ownership changes for $directory"
+            continue
+        fi
+
+        echo "[cont-init.d] Setting ownership of $directory to $owner"
+        # coreutils timeout is installed in the image. The kill deadline also
+        # terminates the supervisor if chown is stuck in uninterruptible I/O.
+        if ! timeout --kill-after=2s 10s chown -R "$owner" "$directory"; then
+            echo "[cont-init.d] Ownership change failed or timed out for $directory; continuing startup (check host permissions)"
+        fi
+    done
+    return 0
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    configure_permissions
+fi

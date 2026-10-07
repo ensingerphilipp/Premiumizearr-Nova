@@ -77,7 +77,6 @@ func (t *TransferManagerService) Init(pme *premiumizeme.Premiumizeme, arrsManage
 	t.premiumizemeClient = pme
 	t.arrsManager = arrsManager
 	t.config = config
-	t.CleanUpDownloadDirPeriod()
 }
 
 func (t *TransferManagerService) CleanUpDownloadDirPeriod() {
@@ -153,6 +152,10 @@ func (manager *TransferManagerService) ConfigUpdatedCallback(currentConfig confi
 }
 
 func (manager *TransferManagerService) Run(interval time.Duration) {
+	// Run starts after the HTTP listener. Keep cleanup in this worker, ahead
+	// of downloads: filesystem calls on an unavailable network mount cannot
+	// be cancelled, but they must not prevent the web UI from starting.
+	manager.CleanUpDownloadDirPeriod()
 	manager.downloadsFolderID = utils.GetDownloadsFolderIDFromPremiumizeme(manager.premiumizemeClient, manager.config.TransferDirectory)
 	for {
 		manager.runningTask = true
