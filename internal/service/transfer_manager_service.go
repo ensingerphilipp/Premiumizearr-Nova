@@ -581,7 +581,10 @@ func (manager *TransferManagerService) TaskCheckPremiumizeDownloadsFolder() {
 			continue
 		}
 
-		if manager.countDownloads() < manager.config.SimultaneousDownloads {
+		// A non-positive limit means unlimited here, the same contract
+		// the direct slot gate uses: a config that carries 0 through
+		// this door must not silently stall every completed transfer.
+		if manager.config.SimultaneousDownloads <= 0 || manager.countDownloads() < manager.config.SimultaneousDownloads {
 			log.Debugf("Processing completed item: %s", item.Name)
 			manager.HandleFinishedItem(item, manager.config.DownloadsDirectory)
 			//Sleep for one Second to let Asynchronous Downloads Start and Update

@@ -22,6 +22,14 @@ type ArrsManagerService struct {
 	arrs           []arr.IArr
 	config         *config.Config
 	failureTargets []directFailureTarget
+	// failureTargetStrikes counts CONSECUTIVE erroring report passes per
+	// (job, target) pair: once a target reaches two, it is skipped for
+	// that job's remaining passes so its error can no longer pin the
+	// pass's error set (see ReportDirectTorrentFailure). Entries are
+	// bounded in practice: the manager stops calling the reporter for a
+	// dead-lettered job, and a target that queries cleanly again has its
+	// strike removed.
+	failureTargetStrikes map[string]int
 }
 
 type directFailureTarget struct {
@@ -33,6 +41,7 @@ func (am ArrsManagerService) New() ArrsManagerService {
 	am.mu = &sync.RWMutex{}
 	am.arrs = []arr.IArr{}
 	am.failureTargets = nil
+	am.failureTargetStrikes = make(map[string]int)
 	return am
 }
 
@@ -119,6 +128,17 @@ func (am *ArrsManagerService) GetArrs() []arr.IArr {
 
 // qBittorrent's error state is a warning in *arr, so terminal direct torrent
 // failures must explicitly mark the corresponding grabbed history record.
+//
+// The per-target strike isolation is what keeps the manager's report cap
+// reachable: the manager only advances its no-error-pass counter on a
+// pass that returns no error, so a permanently erroring *arr (a revoked
+// API key, a black-holed instance) would otherwise make EVERY pass fail
+// and the failedReportPollCap dead-letter would never fire — while each
+// pass still forces a full-history refetch against every healthy *arr.
+// A target that errors on two consecutive passes is therefore skipped
+// for this job's remaining passes, which restores the no-error pass; a
+// target that queries cleanly again has its strike reset and is
+// re-reported.
 func (am *ArrsManagerService) ReportDirectTorrentFailure(job directclient.Job) ([]string, error) {
 	am.mu.RLock()
 	targets := append([]directFailureTarget(nil), am.failureTargets...)
@@ -136,6 +156,13 @@ func (am *ArrsManagerService) ReportDirectTorrentFailure(job directclient.Job) (
 		if alreadyReported {
 			continue
 		}
+		strikeKey := job.ID + "\x00" + target.key
+		am.mu.RLock()
+		strikes := am.failureTargetStrikes[strikeKey]
+		am.mu.RUnlock()
+		if strikes >= 2 {
+			continue
+		}
 		id, found, err := target.client.HistoryContainsDownloadIDFresh(job.ID)
 		if err == nil && found {
 			err = target.client.MarkHistoryItemAsFailed(id)
@@ -143,6 +170,13 @@ func (am *ArrsManagerService) ReportDirectTorrentFailure(job directclient.Job) (
 				acknowledged = append(acknowledged, target.key)
 			}
 		}
+		am.mu.Lock()
+		if err != nil {
+			am.failureTargetStrikes[strikeKey] = strikes + 1
+		} else {
+			delete(am.failureTargetStrikes, strikeKey)
+		}
+		am.mu.Unlock()
 		if err != nil {
 			failures = append(failures, fmt.Errorf("%s: %w", target.client.GetArrName(), err))
 		}

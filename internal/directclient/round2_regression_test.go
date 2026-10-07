@@ -704,6 +704,12 @@ func TestCompletionPersistsCleanupPendingWriteAhead(t *testing.T) {
 	if snap.phase != "completed" || snap.cloudFolder != folder || !snap.cleanupPending {
 		t.Fatalf("row at the cloud-folder delete = {phase %q folder %q cleanupPending %v}, want {completed %s true}: the cleanup flag must be persisted in the same save as the completion, BEFORE the deletion is issued", snap.phase, snap.cloudFolder, snap.cleanupPending, folder)
 	}
+	// The completion handler runs in the downloader's goroutine, so the
+	// post-deletion clear (reference and flag, same save) can still be
+	// in flight when the row first reads completed: wait for the manager
+	// to quiesce BEFORE reading the final state, or the read races the
+	// clear and can observe the pre-clear row.
+	waitQuiescent(t, manager)
 	// After the deletion succeeds, the reference and the flag clear in
 	// the same save as well.
 	manager.mu.RLock()
@@ -726,5 +732,4 @@ func TestCompletionPersistsCleanupPendingWriteAhead(t *testing.T) {
 	if createCount.Load() != 1 {
 		t.Fatalf("transfer/create calls = %d, want exactly 1", createCount.Load())
 	}
-	waitQuiescent(t, manager)
 }

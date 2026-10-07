@@ -103,18 +103,25 @@ func DownloadCloudFolder(ctx context.Context, pm *premiumizeme.Premiumizeme, fol
 			total += file.size
 		}
 	}
-	// An entry whose name is another entry's in-progress staging name
-	// ("<name>.<id>.partial") would make one file's wget resume against the
-	// other file's completed bytes: fail closed on the class, before any
-	// download starts.
+	// An entry whose name is another entry's downloader-internal staging
+	// name — the in-progress name ("<name>.<id>.partial", which would make
+	// one file's wget resume against the other file's completed bytes) or
+	// the completion sidecar ("<name>.complete", which the per-file marker
+	// write would overwrite with the sibling's file ID after the sibling
+	// downloads) — would mix two entries' bytes in the published tree:
+	// fail closed on the class, before any download starts.
 	targets := make(map[string]struct{}, len(files))
 	for _, file := range files {
 		targets[filepath.Join(stagePath, file.relativePath)] = struct{}{}
 	}
 	for _, file := range files {
-		inProgress := fmt.Sprintf("%s.%s.partial", filepath.Join(stagePath, file.relativePath), file.id)
+		target := filepath.Join(stagePath, file.relativePath)
+		inProgress := fmt.Sprintf("%s.%s.partial", target, file.id)
 		if _, ok := targets[inProgress]; ok {
 			return fmt.Errorf("premiumize folder entry %q collides with another file's in-progress name; refusing to mix content", file.relativePath)
+		}
+		if _, ok := targets[completeSidecar(target)]; ok {
+			return fmt.Errorf("premiumize folder entry %q collides with another file's completion sidecar; refusing to mix content", file.relativePath)
 		}
 	}
 
@@ -242,12 +249,18 @@ func completeSidecar(target string) string { return target + ".complete" }
 // staging rename, because the publish moves the WHOLE staging tree into
 // the output path — only claimed entries may survive.
 func pruneUnclaimedStaging(stagePath string, files []cloudFile) error {
-	// Claimed entries as paths relative to the staging root.
-	claimedFiles := make(map[string]struct{}, 3*len(files)+1)
+	// Claimed entries as paths relative to the staging root. The
+	// per-file completion sidecars ("<name>.complete") are deliberately
+	// NOT claimed: they bind a staged target to the listing entry that
+	// produced it so a RETRY can reuse or replace the bytes — but they
+	// are downloader-internal bookkeeping, not listing content, and the
+	// publish moves the whole staging tree into the *arr output path, so
+	// claiming them would ship one marker file per downloaded file into
+	// the import tree where nothing ever removes them.
+	claimedFiles := make(map[string]struct{}, 2*len(files)+1)
 	for _, file := range files {
 		claimedFiles[file.relativePath] = struct{}{}
 		claimedFiles[file.relativePath+"."+file.id+".partial"] = struct{}{}
-		claimedFiles[completeSidecar(file.relativePath)] = struct{}{}
 	}
 	claimedFiles[publishedManifestName] = struct{}{}
 	claimedDirs := make(map[string]struct{})

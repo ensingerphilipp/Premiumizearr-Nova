@@ -171,16 +171,13 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 		config.SimultaneousDownloads = 5
 		updated = true
 	}
-	if config.SimultaneousDownloads <= 0 {
-		// Only a missing key is backfilled above; a hand-edited 0 (or a
-		// negative value) sails through the parse and would then pass
-		// load while binding every direct download to a zero slot limit,
-		// stalling them silently forever. Normalize it like the missing
-		// value instead.
-		log.Info("SimultaneousDownloads is zero or negative, resetting to 5")
-		config.SimultaneousDownloads = 5
-		updated = true
-	}
+	// A hand-edited 0 (or a negative value) is kept as-is, not rewritten
+	// to the default: every consumer reads a non-positive limit as
+	// "no limit" (the transfer gate and the direct slot gate both treat
+	// <= 0 as unlimited), so the literal keeps ONE meaning across load,
+	// web save, and runtime. Rewriting it on load only would produce a
+	// value the web save path never produces, so the same file would
+	// mean "unlimited" after a save and "cap of 5" after a restart.
 
 	if configInterface["DownloadSpeedLimit"] == nil {
 		log.Info("DownloadSpeedLimit not set, setting to 100 Megabytes per second")

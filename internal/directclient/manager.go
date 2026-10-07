@@ -50,7 +50,11 @@ type Job struct {
 	// carries no transfer ID, so no deletion path can target the orphan
 	// directly; the flag lets the cleanup pass reconcile it by listing the
 	// account's transfers and deleting the one committed into the job's
-	// just-cleared folder.
+	// just-cleared folder. Reconciling against an EMPTY listing is
+	// inconclusive — it cannot distinguish "the transfer never committed"
+	// from "the commit has not landed yet" — so a row is only cleared of
+	// the flag once a matching transfer is positively deleted; an empty
+	// listing leaves the row pending for a later retry.
 	TransferUnknown bool      `json:"transfer_unknown,omitempty"`
 	Created         time.Time `json:"created"`
 }
@@ -663,11 +667,27 @@ func (m *Manager) remove(id string, deleteFiles bool) error {
 		// handle on it. A failed reconcile keeps the row pending so the
 		// next poll's deletion pass retries the whole remote cleanup.
 		if job.Phase == "failed" && job.TransferID == "" && job.TransferUnknown {
-			if err := m.reconcileOrphanTransfer(job.CloudFolder); err != nil {
+			deleted, err := m.reconcileOrphanTransfer(job.CloudFolder)
+			if err != nil {
 				log.Warnf("Orphan transfer reconcile for direct job %s failed: %v", id, err)
 				m.markCleanupPending(id, deleteFiles, "Remote cleanup pending: the orphan transfer was not deleted; the removal will be retried")
 				return err
 			}
+			if deleted == 0 {
+				// An empty listing is not proof the submission never
+				// committed: the commit may land after this scan, and a
+				// transfer no remaining row names would stay on the account
+				// permanently. Keep the row pending, still holding its folder
+				// reference and unknown flag, so the next poll's deletion
+				// pass retries the reconcile; deleting the row now would
+				// orphan the very transfer this removal exists to clean up.
+				// A positive deletion (or a later poll's) resolves it.
+				m.markCleanupPending(id, deleteFiles, "Remote cleanup pending: no orphan transfer found yet; the removal will be retried")
+				return nil
+			}
+			// The orphan was found and deleted: the outcome is resolved, so
+			// the unknown-outcome handle can clear and removal proceeds to
+			// the local cleanup and row deletion.
 			job.TransferUnknown = false
 		}
 		job.CloudFolder = ""
@@ -722,27 +742,34 @@ func (m *Manager) remove(id string, deleteFiles bool) error {
 	return nil
 }
 
-// reconcileOrphanTransfer deletes the server-side transfer that an
+// reconcileOrphanTransfer deletes the server-side transfer(s) that an
 // unknown-outcome submission left behind: the just-cleared cloud folder is
 // the only remaining reference, so the account's transfer list is scanned
-// for the one committed into that folder. Call without m.mu held.
-func (m *Manager) reconcileOrphanTransfer(folderID string) error {
+// for the one committed into that folder. It reports how many matching
+// transfers it deleted so the caller can distinguish "an orphan was found
+// and resolved" from "the listing was empty": an empty list cannot prove
+// the submission never committed (the commit may still be in flight), so
+// only a positive deletion may clear the row's unknown-outcome handle.
+// Call without m.mu held.
+func (m *Manager) reconcileOrphanTransfer(folderID string) (int, error) {
 	if strings.TrimSpace(folderID) == "" {
-		return nil
+		return 0, nil
 	}
 	transfers, err := m.pm.GetTransfers()
 	if err != nil {
-		return err
+		return 0, err
 	}
+	deleted := 0
 	for _, t := range transfers {
 		if t.FolderID != folderID {
 			continue
 		}
 		if err := m.pm.DeleteTransfer(t.ID); err != nil && !transferDeleteGone(err) {
-			return err
+			return deleted, err
 		}
+		deleted++
 	}
-	return nil
+	return deleted, nil
 }
 
 // Persist each remote deletion separately so an outage or restart resumes
@@ -767,7 +794,11 @@ func (m *Manager) markCleanupPending(id string, deleteFiles bool, message string
 	if cur := m.jobs[id]; cur != nil {
 		cur.Phase, cur.Error = "failed", message
 		cur.DeleteRequested = true
-		cur.DeleteFiles = deleteFiles
+		// OR with the row's current value: a concurrent caller may have
+		// merged its own deleteFiles=true into the row through the
+		// removing-guard; assigning the caller's local would write it back
+		// to false and orphan the other caller's output files.
+		cur.DeleteFiles = deleteFiles || cur.DeleteFiles
 		if err := m.saveLocked(); err != nil {
 			log.Errorf("Could not persist direct job %s cleanup: %v", id, err)
 		}
@@ -842,13 +873,23 @@ func (m *Manager) reportFailedTorrents() {
 			}
 		}
 		m.mu.Lock()
-		if j := m.jobs[job.ID]; j != nil {
+		// The write-back is episode-gated: the pass started against ONE
+		// failure episode, but add()'s re-queue resets the row mid-flight
+		// (phase back to queued, ReportedFailures nil, the report counter
+		// zeroed) — landing this pass's stale increment and the old
+		// episode's acks on the fresh episode would dead-letter it on its
+		// very first pass. Only a row still in the same failure episode
+		// receives the write-back.
+		if j := m.jobs[job.ID]; j != nil && j.Phase == "failed" {
 			// Only no-error passes count against the cap: a transient *arr
 			// outage must not permanently dead-letter the report — the
 			// cap exists to bound the no-ack refetch storm, and error
 			// passes keep retrying until the stack is reachable again.
+			// Re-read the CURRENT counter rather than the pass-start
+			// snapshot: a mid-pass re-queue reset it, and the stale
+			// snapshot's increment must not land on the zeroed counter.
 			if err == nil {
-				m.failureReportPolls[job.ID] = polls[job.ID] + 1
+				m.failureReportPolls[job.ID] = m.failureReportPolls[job.ID] + 1
 			}
 			for _, target := range acknowledged {
 				if !containsReport(j.ReportedFailures, target) {
@@ -941,11 +982,31 @@ func (m *Manager) PollOnce(ctx context.Context) {
 			m.mu.RLock()
 			if cur := m.jobs[j.ID]; cur != nil {
 				needsReconcile = cur.Phase == "failed" && cur.TransferID == "" && cur.TransferUnknown
+				// The guard must not be one-sided: a re-queue across the
+				// DeleteFolder round-trip above resets the row to a fresh
+				// episode (phase queued, a fresh unknown flag) while the
+				// pass's snapshot still carries the PREVIOUS episode's
+				// unknown flag. The failed-phase test alone then reads the
+				// reset row and skips the reconcile, so the previous
+				// episode's orphan transfer is named by no remaining code
+				// path and stays on the account permanently.
+				needsReconcile = needsReconcile ||
+					(cur.Phase == "queued" && cur.TransferID == "" && j.TransferUnknown)
 			}
 			m.mu.RUnlock()
 			if needsReconcile {
-				if err := m.reconcileOrphanTransfer(j.CloudFolder); err != nil {
+				deleted, err := m.reconcileOrphanTransfer(j.CloudFolder)
+				if err != nil {
 					log.Warnf("Direct job %s orphan transfer reconcile failed: %v", j.ID, err)
+					continue
+				}
+				if deleted == 0 {
+					// An empty listing is not proof the submission never
+					// committed: the commit may still be in flight. Keep the
+					// folder reference and the unknown-outcome flag so the
+					// next poll's cleanup pass retries the reconcile; clearing
+					// them now would leave a later-committed transfer named by
+					// no row.
 					continue
 				}
 			}
@@ -1168,7 +1229,10 @@ func (m *Manager) submit(ctx context.Context, id string) error {
 		if deleteRequested {
 			// A concurrent removal outlived the failed submission; run its
 			// cleanup (including the orphan reconcile) now instead of
-			// leaving the row for the poll deletion pass.
+			// leaving the row for the poll deletion pass. If the orphan
+			// reconcile finds no transfer yet — the commit may still be in
+			// flight — remove() parks the row pending instead of deleting
+			// it, and a later pass retries.
 			m.remove(id, deleteFiles)
 		}
 		return err
@@ -1176,6 +1240,7 @@ func (m *Manager) submit(ctx context.Context, id string) error {
 	m.mu.Lock()
 	deleteRequested := false
 	deleteFiles := false
+	orphaned := false
 	if j := m.jobs[id]; j != nil {
 		j.TransferID = res.ID
 		j.Phase = "cloud"
@@ -1186,9 +1251,28 @@ func (m *Manager) submit(ctx context.Context, id string) error {
 			m.mu.Unlock()
 			return err
 		}
+	} else {
+		// The durable row was removed by a concurrent remove() AFTER the
+		// transfer was committed: no row will ever reference the transfer
+		// (or its reserved folder), and the poll transfer loop only names
+		// row-referenced IDs, so nothing else can delete them. Delete both
+		// here — the account's transfer limit would otherwise leak one
+		// object per such race and eventually bounce every new direct job.
+		orphaned = true
 	}
 	delete(m.active, id)
 	m.mu.Unlock()
+	if orphaned {
+		if err := m.pm.DeleteTransfer(res.ID); err != nil && !transferDeleteGone(err) {
+			log.Warnf("Could not delete orphan transfer of removed direct job %s: %v", id, err)
+		}
+		if job.CloudFolder != "" {
+			if err := m.pm.DeleteFolder(job.CloudFolder); err != nil && !folderDeleteGone(err) {
+				log.Warnf("Could not delete cloud folder of removed direct job %s: %v", id, err)
+			}
+		}
+		return nil
+	}
 	if deleteRequested {
 		return m.remove(id, deleteFiles)
 	}

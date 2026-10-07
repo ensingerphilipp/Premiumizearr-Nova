@@ -82,7 +82,6 @@ func TestConfigSaveResponseSurvivesInHandlerRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the client lost the save request: %v", err)
 	}
-	defer resp.Body.Close()
 	got, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("the save response was truncated by the in-handler restart: %v", err)
@@ -97,10 +96,8 @@ func TestConfigSaveResponseSurvivesInHandlerRestart(t *testing.T) {
 	// temp-dir cleanup.
 	cfgPath := filepath.Join(dir, "config.yaml")
 	deadline := time.Now().Add(5 * time.Second)
-	var data []byte
 	for {
-		var err error
-		data, err = os.ReadFile(cfgPath)
+		data, err := os.ReadFile(cfgPath)
 		if err == nil && strings.Contains(string(data), "rotated-direct-key-2") {
 			break
 		}
@@ -108,6 +105,41 @@ func TestConfigSaveResponseSurvivesInHandlerRestart(t *testing.T) {
 			t.Fatalf("rotated key not persisted to config.yaml; last content:\n%s", data)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	// The in-handler restart (srv.Close() then Start()) is still running
+	// here: Start() parses the UI template from ./static BEFORE it binds
+	// the listener, so once the old listener has gone and a new one
+	// answers on the port, the parse has provably completed. Wait it out
+	// before returning: without this, the temp-dir cleanup at test end
+	// can delete ./static while the in-flight parse is reading it, the
+	// parse's log.Fatal os.Exits the WHOLE test process, and the rest of
+	// the package's tests silently never run. Closing the response body
+	// first returns the connection to the idle pool, which lets the
+	// in-handler Close() finish and the new listener come up at all.
+	resp.Body.Close()
+	addr := "127.0.0.1:" + strconv.Itoa(port)
+	seenDown := false
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		c, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
+		if err == nil {
+			c.Close()
+			if seenDown {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the old web listener never went down: the in-handler restart never started")
+			}
+			// The old listener is still up: probe as fast as the
+			// round-trip allows, or the brief down window between the
+			// close and the new bind can slip past a sleeping probe.
+			continue
+		}
+		seenDown = true
+		if time.Now().After(deadline) {
+			t.Fatalf("the in-handler web-server restart never came back on the port")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

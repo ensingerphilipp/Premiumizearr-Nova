@@ -739,119 +739,158 @@ func TestManagerSubmittingJobRemovalLeavesNoOrphan(t *testing.T) {
 		}
 		waitQuiescent(t, manager)
 	})
-	t.Run("removal while the request is in flight", func(t *testing.T) {
-		releaseTransfer := make(chan struct{}, 1)
-		var transferDeletes, folderDeletes atomic.Int32
-		var committedTransfer atomic.Bool
-		pm := managerTestPremiumize(t, func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			switch r.URL.Path {
-			case "/api/account/info":
-				fmt.Fprint(w, `{"status":"success","limit_used":0,"booster_points":0}`)
-			case "/api/folder/list":
-				fmt.Fprint(w, `{"status":"success","content":[]}`)
-			case "/api/folder/create":
-				fmt.Fprint(w, `{"status":"success","id":"job-folder"}`)
-			case "/api/transfer/create":
-				// Hold the submission; abort without a response when the
-				// client cancels. The post-release context check closes the
-				// race in which the release and the cancel both arrive.
-				select {
-				case <-releaseTransfer:
-				case <-r.Context().Done():
-					return
+	// The in-flight interleaving is decided by whether the server commits
+	// the transfer before the client's cancellation settles. That commit is
+	// driven below by a test-controlled flag, not by the server's in-flight
+	// disconnect detection: a body-bearing request's server context is not
+	// cancelled promptly on Go 1.24, so keying the commit on
+	// r.Context().Err() made which world this subtest exercised depend on
+	// the host. Two worlds are covered: a commit that lands after the
+	// client cancels (the premature-convergence regression the
+	// park-on-empty fix addresses) and an abort that leaves nothing to
+	// reconcile.
+	for _, tc := range []struct {
+		name   string
+		commit bool
+	}{
+		{"in flight; the server commits after the client cancels", true},
+		{"in flight; the server aborts before commit", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			releaseTransfer := make(chan struct{}, 1)
+			var transferDeletes, folderDeletes atomic.Int32
+			var committedTransfer, shouldCommit atomic.Bool
+			shouldCommit.Store(tc.commit)
+			pm := managerTestPremiumize(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/api/account/info":
+					fmt.Fprint(w, `{"status":"success","limit_used":0,"booster_points":0}`)
+				case "/api/folder/list":
+					fmt.Fprint(w, `{"status":"success","content":[]}`)
+				case "/api/folder/create":
+					fmt.Fprint(w, `{"status":"success","id":"job-folder"}`)
+				case "/api/transfer/create":
+					// Hold the submission until the test releases it (or the
+					// request context is cancelled). Which select case fires
+					// only gates WHEN the fake resolves; the commit decision is
+					// the test-controlled shouldCommit below, so the world is
+					// deterministic regardless of the host's disconnect
+					// detection.
+					select {
+					case <-releaseTransfer:
+					case <-r.Context().Done():
+					}
+					if !shouldCommit.Load() {
+						// The server aborted before commit: nothing was
+						// written to the account.
+						return
+					}
+					// Only a completed create commits the transfer to the
+					// account: an aborted request left nothing behind.
+					committedTransfer.Store(true)
+					fmt.Fprint(w, `{"status":"success","id":"transfer-1"}`)
+				case "/api/transfer/list":
+					// The account's truth the reconcile scan reads: the
+					// transfer exists only if the create request completed.
+					if committedTransfer.Load() {
+						fmt.Fprint(w, `{"status":"success","transfers":[{"id":"transfer-1","name":"Example.Release","status":"downloading","progress":0.5,"folder_id":"job-folder"}]}`)
+					} else {
+						fmt.Fprint(w, `{"status":"success","transfers":[]}`)
+					}
+				case "/api/transfer/delete":
+					transferDeletes.Add(1)
+					fmt.Fprint(w, `{"status":"success"}`)
+				case "/api/folder/delete":
+					folderDeletes.Add(1)
+					fmt.Fprint(w, `{"status":"success"}`)
+				default:
+					http.NotFound(w, r)
 				}
-				if r.Context().Err() != nil {
-					return
-				}
-				// Only a completed create commits the transfer to the
-				// account: an aborted request left nothing behind.
-				committedTransfer.Store(true)
-				fmt.Fprint(w, `{"status":"success","id":"transfer-1"}`)
-			case "/api/transfer/list":
-				// The account's truth the reconcile scan reads: the
-				// transfer exists only if the create request completed.
-				if committedTransfer.Load() {
-					fmt.Fprint(w, `{"status":"success","transfers":[{"id":"transfer-1","name":"Example.Release","status":"downloading","progress":0.5,"folder_id":"job-folder"}]}`)
-				} else {
-					fmt.Fprint(w, `{"status":"success","transfers":[]}`)
-				}
-			case "/api/transfer/delete":
-				transferDeletes.Add(1)
-				fmt.Fprint(w, `{"status":"success"}`)
-			case "/api/folder/delete":
-				folderDeletes.Add(1)
-				fmt.Fprint(w, `{"status":"success"}`)
-			default:
-				http.NotFound(w, r)
+			})
+			manager := newTestManager(t, &pm, t.TempDir())
+			if err := manager.AddMagnet(context.Background(), testMagnet, "tv"); err != nil {
+				t.Fatal(err)
 			}
-		})
-		manager := newTestManager(t, &pm, t.TempDir())
-		if err := manager.AddMagnet(context.Background(), testMagnet, "tv"); err != nil {
-			t.Fatal(err)
-		}
-		const jobID = "0123456789abcdef0123456789abcdef01234567"
-		polled := make(chan struct{})
-		go func() {
+			const jobID = "0123456789abcdef0123456789abcdef01234567"
+			polled := make(chan struct{})
+			go func() {
+				manager.PollOnce(context.Background())
+				close(polled)
+			}()
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				manager.mu.RLock()
+				phase := ""
+				if j := manager.jobs[jobID]; j != nil {
+					phase = j.Phase
+				}
+				manager.mu.RUnlock()
+				if phase == "submitting" {
+					break
+				}
+				select {
+				case <-polled:
+					t.Fatal("poll finished before the submission reached the in-flight phase")
+				case <-time.After(5 * time.Millisecond):
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("job never reached the submitting phase")
+				}
+			}
+			// remove() takes the active-cancel branch for a submitting job,
+			// cancelling the in-flight request. The client then reports a
+			// cancellation (deterministic: its own context), and the
+			// submission's error path runs the removal's cleanup now — whose
+			// first orphan reconcile reads the not-yet-committed listing and
+			// must PARK the row pending (not delete it) while the commit may
+			// still land. The sleep lets that first reconcile settle before
+			// the fake is released to commit.
+			if err := manager.RemoveTorrent(jobID, true); err != nil {
+				t.Fatalf("remove submitting job: %v", err)
+			}
+			time.Sleep(50 * time.Millisecond)
+			releaseTransfer <- struct{}{}
+			<-polled
 			manager.PollOnce(context.Background())
-			close(polled)
-		}()
-		deadline := time.Now().Add(10 * time.Second)
-		for {
 			manager.mu.RLock()
-			phase := ""
-			if j := manager.jobs[jobID]; j != nil {
-				phase = j.Phase
+			cur := manager.jobs[jobID]
+			var phase, folder string
+			var unknown bool
+			if cur != nil {
+				phase, folder, unknown = cur.Phase, cur.CloudFolder, cur.TransferUnknown
 			}
 			manager.mu.RUnlock()
-			if phase == "submitting" {
-				break
+			if tc.commit {
+				// The committed world: the transfer is on the account, so a
+				// later pass's reconcile must delete it and converge the row.
+				if got := transferDeletes.Load(); got != 1 {
+					t.Fatalf("transfer delete calls = %d, want 1 (the committed transfer must be deleted)", got)
+				}
+				if got := manager.ListTorrents("tv"); len(got) != 0 {
+					t.Fatalf("job row remains after the committed transfer was reconciled: %#v", got)
+				}
+			} else {
+				// The aborted world: nothing was ever committed, so no delete
+				// may fire and the row must survive, still pending, naming the
+				// folder a later reconcile can retry against.
+				if got := transferDeletes.Load(); got != 0 {
+					t.Fatalf("transfer delete calls = %d, want 0 (nothing was committed on the account)", got)
+				}
+				if got := manager.ListTorrents("tv"); len(got) != 1 {
+					t.Fatalf("job row count = %d, want 1 (an unknown-outcome removal parks the row on an empty listing; it must not be deleted)", len(got))
+				}
+				if phase != "failed" || !unknown || folder == "" {
+					t.Fatalf("parked row lost its unknown-outcome handle: phase=%q unknown=%v folder=%q", phase, unknown, folder)
+				}
 			}
-			select {
-			case <-polled:
-				t.Fatal("poll finished before the submission reached the in-flight phase")
-			case <-time.After(5 * time.Millisecond):
+			// The removal always deletes the reserved folder at least once.
+			if got := folderDeletes.Load(); got < 1 {
+				t.Fatalf("folder delete calls = %d, want at least 1 (the job folder must not outlive the removal)", got)
 			}
-			if time.Now().After(deadline) {
-				t.Fatal("job never reached the submitting phase")
-			}
-		}
-		// remove() takes the active-cancel branch for a submitting job,
-		// cancelling the in-flight request; then let the fake complete
-		// whichever side of the release/cancel race it lands on.
-		if err := manager.RemoveTorrent(jobID, true); err != nil {
-			t.Fatalf("remove submitting job: %v", err)
-		}
-		releaseTransfer <- struct{}{}
-		<-polled
-		// Two deterministic interleavings: if the client stored the
-		// transfer ID (its response won the cancel race), the first
-		// poll's success path already deleted transfer and folder and
-		// dropped the row; otherwise the row survived marked failed and
-		// DeleteRequested for the second poll's deletion pass (a transfer
-		// the client never saw a response for is undecidable from here —
-		// the fail message documents it and is out of scope for this test).
-		manager.mu.RLock()
-		rowAfterFirstPoll := manager.jobs[jobID] != nil
-		manager.mu.RUnlock()
-		manager.PollOnce(context.Background())
-		if got := manager.ListTorrents("tv"); len(got) != 0 {
-			t.Fatalf("job row remains after the deletion pass: %#v", got)
-		}
-		if rowAfterFirstPoll {
-			if got := transferDeletes.Load(); got != 0 {
-				t.Fatalf("transfer delete calls = %d, want 0 (the client never stored an ID)", got)
-			}
-		} else {
-			if got := transferDeletes.Load(); got != 1 {
-				t.Fatalf("transfer delete calls = %d, want 1 (the stored transfer must be deleted)", got)
-			}
-		}
-		if got := folderDeletes.Load(); got != 1 {
-			t.Fatalf("folder delete calls = %d, want 1 (the job folder must not outlive the removal)", got)
-		}
-		waitQuiescent(t, manager)
-	})
+			waitQuiescent(t, manager)
+		})
+	}
 }
 
 func TestManagerRegistrationSaveFailureReleasesActiveSlot(t *testing.T) {

@@ -203,27 +203,35 @@ func TestLoadConfigFromDiskKeepsSetArrs(t *testing.T) {
 	}
 }
 
-// TestLoadConfigFromDiskNormalizesZeroSimultaneousDownloads verifies that a
-// hand-edited 0 (or negative) SimultaneousDownloads is normalized to the
-// 5 default on load and written back: a 0 would otherwise pass the
-// load gate and then bind every direct download to a zero slot limit,
-// stalling them silently forever.
-func TestLoadConfigFromDiskNormalizesZeroSimultaneousDownloads(t *testing.T) {
-	for _, input := range []string{"SimultaneousDownloads: 0", "SimultaneousDownloads: -2"} {
-		t.Run(input, func(t *testing.T) {
+// TestLoadConfigFromDiskKeepsNonPositiveSimultaneousDownloads verifies that
+// a hand-edited 0 (or a negative) SimultaneousDownloads is KEPT as-is on
+// load — in memory and in the file — and never rewritten to the 5
+// default: every consumer reads a non-positive limit as "no limit", so the
+// literal keeps ONE meaning across load, web save, and runtime. A load-only
+// rewrite would make the same file mean "unlimited" after a web save and
+// "cap of 5" after a restart.
+func TestLoadConfigFromDiskKeepsNonPositiveSimultaneousDownloads(t *testing.T) {
+	for _, tc := range []struct {
+		line string
+		want int
+	}{
+		{"SimultaneousDownloads: 0", 0},
+		{"SimultaneousDownloads: -2", -2},
+	} {
+		t.Run(tc.line, func(t *testing.T) {
 			dir := t.TempDir()
-			writeConfigFile(t, dir, "PremiumizemeAPIKey: xxxxxxxxx\n"+input+"\n")
+			writeConfigFile(t, dir, "PremiumizemeAPIKey: xxxxxxxxx\n"+tc.line+"\n")
 
 			cfg, err := loadConfigFromDisk(dir)
 			if err != nil {
 				t.Fatalf("loadConfigFromDisk() error = %v, want nil", err)
 			}
-			if cfg.SimultaneousDownloads != 5 {
-				t.Fatalf("SimultaneousDownloads = %d, want 5 (normalized on load)", cfg.SimultaneousDownloads)
+			if cfg.SimultaneousDownloads != tc.want {
+				t.Fatalf("SimultaneousDownloads = %d, want %d (kept as-is, not rewritten to the default)", cfg.SimultaneousDownloads, tc.want)
 			}
 			file := readConfigFile(t, dir)
-			if !strings.Contains(file, "SimultaneousDownloads: 5") {
-				t.Fatalf("config file does not contain the normalized limit:\n%s", file)
+			if !strings.Contains(file, tc.line) {
+				t.Fatalf("config file does not contain the hand-edited limit (rewritten on load):\n%s", file)
 			}
 		})
 	}
