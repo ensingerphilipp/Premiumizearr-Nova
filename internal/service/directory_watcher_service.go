@@ -20,12 +20,20 @@ type DirectoryWatcherService struct {
 	mu                 sync.RWMutex
 	premiumizemeClient *premiumizeme.Premiumizeme
 	config             *config.Config
-	Queue              *stringqueue.StringQueue
-	status             string
-	quotaBlocked       bool
-	quotaCheckFailed   bool
-	downloadsFolderID  string
-	watchDirectory     *directory_watcher.WatchDirectory
+	// configSnapshot is this service's synchronized view of the shared
+	// config: the web route rewrites the App's config struct IN PLACE
+	// (PersistUpdate's *c = _newConfig), so long-lived loops read the
+	// snapshot under the mutex instead of the struct — the same
+	// value-snapshot fix the directclient manager got for the identical
+	// race.
+	configSnapshot    config.Config
+	Queue             *stringqueue.StringQueue
+	status            string
+	quotaBlocked      bool
+	quotaCheckFailed  bool
+	downloadsFolderID string
+	watchDirectory    *directory_watcher.WatchDirectory
+	polling           bool
 }
 
 const (
@@ -44,16 +52,79 @@ func NewDirectoryWatcherService() DirectoryWatcherService {
 }
 
 func (dw *DirectoryWatcherService) Init(premiumizemeClient *premiumizeme.Premiumizeme, config *config.Config) {
+	dw.mu.Lock()
 	dw.premiumizemeClient = premiumizemeClient
 	dw.config = config
+	dw.configSnapshot = *config
+	dw.mu.Unlock()
 }
 
 func (dw *DirectoryWatcherService) ConfigUpdatedCallback(currentConfig config.Config, newConfig config.Config) {
+	// The shared config struct is rewritten in place by the web route;
+	// refresh the synchronized snapshot first so every consumer (the
+	// poll loop, the watch start below) reads the new values under the
+	// mutex.
+	dw.mu.Lock()
+	dw.config = &newConfig
+	dw.configSnapshot = newConfig
+	dw.mu.Unlock()
+
 	if currentConfig.BlackholeDirectory != newConfig.BlackholeDirectory {
-		log.Info("Blackhole directory changed, restarting directory watcher...")
-		log.Info("Running initial directory scan...")
-		go dw.directoryScan(dw.config.BlackholeDirectory)
-		dw.watchDirectory.UpdatePath(newConfig.BlackholeDirectory)
+		newDir := newConfig.BlackholeDirectory
+		if _, err := os.Stat(newDir); err != nil {
+			// A configured directory that does not exist yet must not
+			// leave the PREVIOUS directory being processed: a watcher on
+			// it still consumes its create events (and keeps uploading
+			// into the queue) while the new path is never watched —
+			// stopping it here mirrors the pre-PR unconditioned
+			// UpdatePath, which removed the old directory even on a
+			// change to a not-yet-existing one. The directory starts
+			// through this same path once a later update points at an
+			// existing one.
+			dw.mu.Lock()
+			if dw.watchDirectory != nil {
+				log.Info("Stopping directory watcher for the removed blackhole directory...")
+				if err := dw.watchDirectory.Stop(); err != nil {
+					log.Errorf("Error stopping directory watcher: %s", err)
+				}
+				dw.watchDirectory = nil
+			}
+			dw.mu.Unlock()
+			log.Info("Blackhole directory is unavailable; the directory watcher will start once it exists")
+		} else {
+			log.Info("Blackhole directory changed, restarting directory watcher...")
+			dw.mu.RLock()
+			watcher := dw.watchDirectory
+			dw.mu.RUnlock()
+			if watcher == nil {
+				// The directory was missing at Start, so no watcher ever
+				// ran; now that it exists, run the usual initial scan
+				// plus watcher (or poller) start.
+				dw.startBlackholeWatch(newDir)
+			} else {
+				log.Info("Running initial directory scan...")
+				go dw.directoryScan(newDir)
+				if err := watcher.UpdatePath(newDir); err != nil {
+					log.Warnf("Could not update blackhole watcher: %v", err)
+				}
+			}
+		}
+	}
+	// A directory that comes into existence at the ALREADY-CONFIGURED
+	// path (missing at Start, so the watcher is nil and no watcher ever
+	// ran) must start watching even when this callback was triggered by
+	// an unrelated config field: the path-change arm above is the only
+	// other re-arm point, and a config save that leaves the path
+	// untouched can otherwise leave the directory unwatched forever.
+	dw.mu.RLock()
+	watcherNil := dw.watchDirectory == nil
+	polling := dw.polling
+	dw.mu.RUnlock()
+	if watcherNil && !polling {
+		if _, err := os.Stat(newConfig.BlackholeDirectory); err == nil {
+			log.Info("Configured blackhole directory appeared, starting directory watcher...")
+			dw.startBlackholeWatch(newConfig.BlackholeDirectory)
+		}
 	}
 
 	if currentConfig.TransferDirectory != newConfig.TransferDirectory {
@@ -83,9 +154,24 @@ func (dw *DirectoryWatcherService) Start() {
 
 	log.Info("Starting uploads processor...")
 	go dw.processUploads()
+	if _, err := os.Stat(dw.config.BlackholeDirectory); err != nil {
+		log.Info("Blackhole directory is unavailable; direct *arr clients can operate without it")
+		return
+	}
+
+	dw.startBlackholeWatch(dw.config.BlackholeDirectory)
+}
+
+// startBlackholeWatch runs the initial scan of dir and then starts either
+// the inotify watcher or the poll-mode scan loop for it. Start uses it at
+// boot and ConfigUpdatedCallback uses it for a blackhole directory that
+// only appears later, so the two stay in lockstep.
+func (dw *DirectoryWatcherService) startBlackholeWatch(dir string) {
+	dw.mu.Lock()
+	defer dw.mu.Unlock()
 
 	log.Info("Running initial directory scan...")
-	go dw.directoryScan(dw.config.BlackholeDirectory)
+	go dw.directoryScan(dir)
 
 	if dw.watchDirectory != nil {
 		log.Info("Stopping directory watcher...")
@@ -95,23 +181,41 @@ func (dw *DirectoryWatcherService) Start() {
 		}
 	}
 
-	if dw.config.PollBlackholeDirectory {
-		log.Info("Starting directory poller...")
-		go func() {
-			for {
-				if !dw.config.PollBlackholeDirectory {
-					log.Info("Directory poller stopped")
-					break
+	if dw.configSnapshot.PollBlackholeDirectory {
+		if !dw.polling {
+			dw.polling = true
+			log.Info("Starting directory poller...")
+			go func() {
+				defer func() {
+					dw.mu.Lock()
+					dw.polling = false
+					dw.mu.Unlock()
+				}()
+				for {
+					// The shared config struct is rewritten in place by
+					// the web route; the snapshot is refreshed under the
+					// mutex by Init and ConfigUpdatedCallback, so read it
+					// under the same lock instead of the unsynchronized
+					// struct.
+					dw.mu.RLock()
+					poll := dw.configSnapshot.PollBlackholeDirectory
+					interval := dw.configSnapshot.PollBlackholeIntervalMinutes
+					pollDir := dw.configSnapshot.BlackholeDirectory
+					dw.mu.RUnlock()
+					if !poll {
+						log.Info("Directory poller stopped")
+						break
+					}
+					time.Sleep(time.Duration(interval) * time.Minute)
+					log.Infof("Running directory scan of %s", pollDir)
+					dw.directoryScan(pollDir)
+					log.Infof("Scan complete, next scan in %d minutes", interval)
 				}
-				time.Sleep(time.Duration(dw.config.PollBlackholeIntervalMinutes) * time.Minute)
-				log.Infof("Running directory scan of %s", dw.config.BlackholeDirectory)
-				dw.directoryScan(dw.config.BlackholeDirectory)
-				log.Infof("Scan complete, next scan in %d minutes", dw.config.PollBlackholeIntervalMinutes)
-			}
-		}()
+			}()
+		}
 	} else {
 		log.Info("Starting directory watcher...")
-		dw.watchDirectory = directory_watcher.NewDirectoryWatcher(dw.config.BlackholeDirectory,
+		dw.watchDirectory = directory_watcher.NewDirectoryWatcher(dir,
 			true,
 			dw.checkFile,
 			dw.addFileToQueue,

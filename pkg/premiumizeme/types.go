@@ -64,6 +64,7 @@ type Item struct {
 	ID         string `json:"id"`
 	Name       string `json:"name"`
 	Type       string `json:"type"`
+	Size       int64  `json:"size"`
 	CreatedAt  int    `json:"created_at"`
 	MimeType   string `json:"mime_type"`
 	Link       string `json:"link"`

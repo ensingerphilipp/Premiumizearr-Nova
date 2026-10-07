@@ -2,6 +2,7 @@ package progress_downloader
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -43,6 +44,12 @@ func (wc *WriteCounter) GetProgress() string {
 
 // DownloadFile uses wget for downloading and updates WriteCounter for progress tracking.
 func DownloadFile(checkcertificate bool, ratelimit int, url string, filepath string, counter *WriteCounter) error {
+	return DownloadFileContext(context.Background(), checkcertificate, ratelimit, url, filepath, counter)
+}
+
+// DownloadFileContext retains the wget implementation while allowing a
+// direct *arr cancellation to stop an active file transfer.
+func DownloadFileContext(ctx context.Context, checkcertificate bool, ratelimit int, url string, filepath string, counter *WriteCounter) error {
 	// Prepare the wget command without passing empty args
 	args := []string{"-oL", "wget", "-c"}
 	if ratelimit != 0 {
@@ -53,7 +60,7 @@ func DownloadFile(checkcertificate bool, ratelimit int, url string, filepath str
 		args = append(args, "--no-check-certificate")
 	}
 	args = append(args, "--no-use-server-timestamps", "-O", filepath, url)
-	cmd := exec.Command("stdbuf", args...)
+	cmd := exec.CommandContext(ctx, "stdbuf", args...)
 
 	// Get a pipe for the command's output
 	stdout, err := cmd.StderrPipe()
@@ -119,15 +126,17 @@ func DownloadFile(checkcertificate bool, ratelimit int, url string, filepath str
 
 	// Wait for wget to finish
 	if err := cmd.Wait(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err() // Keep the partial file for a resumable retry.
+		}
 		log.Errorf("wget command failed: %v", err)
-		// Attempt to clean up the potentially malformed file
-		if fileInfo, err := os.Stat(filepath); err == nil {
-			fileSize := fileInfo.Size()
-			if removeErr := os.Remove(filepath); removeErr == nil {
-				log.Warnf("cleaned up incomplete download file: %s (size: %d bytes)", filepath, fileSize)
-			} else {
-				log.Warnf("failed to clean up incomplete download file %s: %v", filepath, removeErr)
-			}
+		// wget failed for its own reason (server error, dropped
+		// connection, ...) — the bytes it wrote are a resumable partial:
+		// the next attempt runs "wget -c" against the same path, so
+		// deleting the file here would discard exactly the progress a
+		// retry needs. Keep it.
+		if fileInfo, statErr := os.Stat(filepath); statErr == nil {
+			log.Warnf("keeping partial download for resumable retry: %s (size: %d bytes)", filepath, fileInfo.Size())
 		}
 		return fmt.Errorf("wget command failed: %v", err)
 	}

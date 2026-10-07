@@ -2,6 +2,7 @@ package premiumizeme
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,19 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+)
+
+// TransferSourceKind identifies the payload format accepted by Premiumize's
+// /transfer/create endpoint.
+type TransferSourceKind string
+
+const (
+	TransferSourceMagnet      TransferSourceKind = "magnet"
+	TransferSourceTorrent     TransferSourceKind = "torrent"
+	TransferSourceNZB         TransferSourceKind = "nzb"
+	maxTransferSourceSize                        = 100 << 20
+	transferSubmissionTimeout                    = 2 * time.Minute
+	folderListTimeout                            = 2 * time.Minute
 )
 
 type Premiumizeme struct {
@@ -156,9 +170,22 @@ func (pm *Premiumizeme) GetTransfers() ([]Transfer, error) {
 	return res.Transfers, nil
 }
 
+// ListFolder lists the items of one Premiumize folder. It keeps the
+// historical signature for existing callers; call sites that own a context
+// should use ListFolderContext so a hung listing can be interrupted.
 func (pm *Premiumizeme) ListFolder(folderID string) ([]Item, error) {
+	return pm.ListFolderContext(context.Background(), folderID)
+}
+
+// ListFolderContext is the context-aware variant of ListFolder: cancelling
+// the context interrupts a hanging listing, and the request additionally
+// carries a bounded timeout because a hang is not a slow response.
+func (pm *Premiumizeme) ListFolderContext(ctx context.Context, folderID string) ([]Item, error) {
 	if pm.APIKey == "" {
 		return nil, ErrAPIKeyNotSet
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	var ret []Item
@@ -171,13 +198,14 @@ func (pm *Premiumizeme) ListFolder(folderID string) ([]Item, error) {
 	q.Set("id", folderID)
 	url.RawQuery = q.Encode()
 
-	client := &http.Client{}
-	request, err := http.NewRequest("GET", url.String(), nil)
+	requestContext, cancel := context.WithTimeout(ctx, folderListTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestContext, "GET", url.String(), nil)
 	if err != nil {
 		return ret, err
 	}
 
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return ret, pm.redactRequestError(err)
 	}
@@ -216,7 +244,7 @@ func (pm *Premiumizeme) GetFolders() ([]Item, error) {
 	var ret []Item
 	req, _ := http.NewRequest("GET", url.String(), nil)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := pm.httpClient().Do(req)
 	if err != nil {
 		return ret, pm.redactRequestError(err)
 	}
@@ -302,6 +330,88 @@ func (pm *Premiumizeme) CreateTransfer(filePath string, parentID string) error {
 	return nil
 }
 
+// CreateTransferFromBytes submits a transfer payload without requiring a
+// temporary file. name is used as the uploaded filename for torrent and NZB
+// sources; magnet sources are sent as a multipart text field. The returned
+// response includes Premiumize's transfer ID for subsequent tracking.
+func (pm *Premiumizeme) CreateTransferFromBytes(ctx context.Context, kind TransferSourceKind, data []byte, name, parentID string) (CreateTransferResponse, error) {
+	var result CreateTransferResponse
+	if pm.APIKey == "" {
+		return result, ErrAPIKeyNotSet
+	}
+	if ctx == nil {
+		return result, fmt.Errorf("transfer context is nil")
+	}
+	if len(data) == 0 || len(data) > maxTransferSourceSize {
+		return result, fmt.Errorf("transfer source size must be between 1 and %d bytes", maxTransferSourceSize)
+	}
+	if kind != TransferSourceMagnet && kind != TransferSourceTorrent && kind != TransferSourceNZB {
+		return result, fmt.Errorf("unsupported transfer source kind %q", kind)
+	}
+	if kind == TransferSourceMagnet && len(data) > 16*1024 {
+		return result, fmt.Errorf("magnet source exceeds 16384 bytes")
+	}
+	if kind != TransferSourceMagnet {
+		name = filepath.Base(name)
+		if name == "." || name == string(filepath.Separator) || name == "" {
+			return result, fmt.Errorf("transfer filename is required")
+		}
+	}
+
+	endpoint, err := pm.createPremiumizemeURL("/transfer/create")
+	if err != nil {
+		return result, err
+	}
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	var part io.Writer
+	if kind == TransferSourceMagnet {
+		part, err = writer.CreateFormField("src")
+	} else {
+		part, err = writer.CreateFormFile("src", name)
+	}
+	if err == nil {
+		_, err = part.Write(data)
+	}
+	if err == nil {
+		part, err = writer.CreateFormField("folder_id")
+	}
+	if err == nil {
+		_, err = io.WriteString(part, parentID)
+	}
+	if err == nil {
+		err = writer.Close()
+	}
+	if err != nil {
+		return result, err
+	}
+	requestContext, cancel := context.WithTimeout(ctx, transferSubmissionTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestContext, http.MethodPost, endpoint.String(), body)
+	if err != nil {
+		return result, pm.redactRequestError(err)
+	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := pm.httpClient().Do(request)
+	if err != nil {
+		return result, pm.redactRequestError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return result, fmt.Errorf("error creating transfer: %s (%d)", resp.Status, resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return CreateTransferResponse{}, err
+	}
+	if result.Status != "success" {
+		return CreateTransferResponse{}, pm.redactRequestError(fmt.Errorf("transfer creation failed: %s", result.Message))
+	}
+	if result.ID == "" {
+		return CreateTransferResponse{}, fmt.Errorf("transfer creation response did not include an ID")
+	}
+	return result, nil
+}
+
 func (pm *Premiumizeme) DeleteFolder(folderID string) error {
 	if pm.APIKey == "" {
 		return ErrAPIKeyNotSet
@@ -316,13 +426,12 @@ func (pm *Premiumizeme) DeleteFolder(folderID string) error {
 	q.Set("id", folderID)
 	url.RawQuery = q.Encode()
 
-	client := &http.Client{}
 	request, err := http.NewRequest("DELETE", url.String(), nil)
 	if err != nil {
 		return err
 	}
 
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return pm.redactRequestError(err)
 	}
@@ -364,13 +473,12 @@ func (pm *Premiumizeme) MoveItem(itemID string, folderID string) error {
 	q.Set("id", folderID)
 	url.RawQuery = q.Encode()
 
-	client := &http.Client{}
 	request, err := http.NewRequest("POST", url.String(), nil)
 	if err != nil {
 		return err
 	}
 
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return pm.redactRequestError(err)
 	}
@@ -414,13 +522,12 @@ func (pm *Premiumizeme) CreateFolder(folderName string, parentID *string) (strin
 	}
 	url.RawQuery = q.Encode()
 
-	client := &http.Client{}
 	request, err := http.NewRequest("POST", url.String(), nil)
 	if err != nil {
 		return "", err
 	}
 
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return "", pm.redactRequestError(err)
 	}
@@ -680,9 +787,8 @@ func (pm *Premiumizeme) generateZip(ID string, srcType SRCType) (string, error) 
 	request.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Add("Content-Length", strconv.Itoa(len(data.Encode())))
 
-	//Fire request
-	client := &http.Client{}
-	resp, err := client.Do(request)
+	// Fire request
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return "", pm.redactRequestError(err)
 	}
@@ -728,13 +834,12 @@ func (pm *Premiumizeme) GenerateFileLink(ID string) (string, error) {
 	q.Set("id", ID)
 	url.RawQuery = q.Encode()
 
-	client := &http.Client{}
 	request, err := http.NewRequest("GET", url.String(), nil)
 	if err != nil {
 		return "", err
 	}
 
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return "", pm.redactRequestError(err)
 	}
@@ -755,6 +860,7 @@ func (pm *Premiumizeme) GenerateFileLink(ID string) (string, error) {
 		return "Unknown Error: ", err
 	}
 
-	log.Debugf("File link created: %+v", res.Link)
+	// Generated CDN URLs may contain bearer tokens. Never log them.
+	log.Debug("File link created")
 	return res.Link, nil
 }

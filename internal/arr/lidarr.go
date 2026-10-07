@@ -2,6 +2,7 @@ package arr
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
@@ -97,6 +98,23 @@ func (arr *LidarrArr) HistoryContainsFresh(name string) (int64, bool, error) {
 	arr.LastUpdate = time.Time{}
 	arr.LastUpdateMutex.Unlock()
 	return arr.HistoryContains(name)
+}
+
+func (arr *LidarrArr) HistoryContainsDownloadIDFresh(downloadID string) (int64, bool, error) {
+	arr.LastUpdateMutex.Lock()
+	arr.LastUpdate = time.Time{}
+	arr.LastUpdateMutex.Unlock()
+	his, err := arr.GetHistory()
+	if err != nil {
+		return -1, false, err
+	}
+	var id int64 = -1
+	for _, item := range his.Records {
+		if downloadID != "" && item.EventType == grabbedEventType && item.ID > id && strings.EqualFold(item.DownloadID, downloadID) {
+			id = item.ID
+		}
+	}
+	return id, id != -1, nil
 }
 
 func (arr *LidarrArr) HandleErrorTransfer(transfer *premiumizeme.Transfer, arrID int64, pm *premiumizeme.Premiumizeme) error {

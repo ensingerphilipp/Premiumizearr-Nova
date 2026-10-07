@@ -23,6 +23,7 @@
   import { CalculateAPIPath } from "../Utilities/web_root";
 
   let config = {
+    DirectClientAPIKey: "",
     BlackholeDirectory: "",
     PollBlackholeDirectory: false,
     PollBlackholeIntervalMinutes: 10,
@@ -65,6 +66,11 @@
   let arrTestKind = [];
 
   let inputDisabled = true;
+  // True once a getConfig() fetch has succeeded at least once. A failed
+  // re-fetch must re-enable the form only when it already holds
+  // server-confirmed values; re-enabling after a failed INITIAL load would
+  // let the user save the placeholder defaults over the real config.
+  let configLoaded = false;
 
   let errorModal = false;
   let errorTitle = ERR_SAVE;
@@ -92,10 +98,26 @@
         if (!Array.isArray(config.Arrs)) {
           config.Arrs = [];
         }
+        configLoaded = true;
         inputDisabled = false;
       })
       .catch((error) => {
         console.error("Error: ", error);
+        // A refused re-fetch must not leave the form and Save button
+        // silently disabled until a manual reload. The daemon restarts its
+        // web server in-handler when a save changes a restart-triggering
+        // field (DirectClientAPIKey, BindIP, BindPort or WebRoot), and the
+        // port is briefly unbound during the same-port rebind, so the
+        // immediate post-save re-fetch (R3-18) is often refused. Once the
+        // form already holds server-confirmed values (configLoaded), the
+        // just-saved edits are the values the server now has, so re-enable
+        // the form rather than stranding the user. The configLoaded guard
+        // keeps a failed INITIAL load failing safe (form stays disabled with
+        // only placeholder defaults, so they cannot be saved over the real
+        // config).
+        if (configLoaded) {
+          inputDisabled = false;
+        }
       });
   }
 
@@ -333,6 +355,13 @@
       <FormGroup>
         <TextInput
           disabled={inputDisabled}
+          labelText="Direct *arr client key (SABnzbd API key / qBittorrent password)"
+          bind:value={config.DirectClientAPIKey}
+        />
+      </FormGroup>
+      <FormGroup>
+        <TextInput
+          disabled={inputDisabled}
           labelText="Blackhole Directory"
           bind:value={config.BlackholeDirectory}
         />
@@ -372,6 +401,7 @@
         <TextInput
           disabled={inputDisabled}
           labelText="Web Root"
+          helperText="Serves the UI under this path. /qbit and /sab are reserved for the built-in *arr compat APIs and cannot be used."
           bind:value={config.WebRoot}
         />
       </FormGroup>

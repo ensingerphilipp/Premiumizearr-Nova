@@ -1,6 +1,7 @@
 package premiumizeme
 
 import (
+	"context"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -12,6 +13,112 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestCreateTransferFromBytes(t *testing.T) {
+	tests := []struct {
+		kind TransferSourceKind
+		name string
+		data string
+	}{
+		{TransferSourceMagnet, "", "magnet:?xt=urn:btih:123"},
+		{TransferSourceTorrent, "release.torrent", "torrent-bytes"},
+		{TransferSourceNZB, "release.nzb", "<nzb></nzb>"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.kind), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/api/transfer/create" {
+					t.Errorf("request = %s %s", r.Method, r.URL.Path)
+				}
+				if r.URL.Query().Get("apikey") != "test-key" {
+					t.Errorf("missing API key")
+				}
+				mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+				if err != nil || mediaType != "multipart/form-data" {
+					t.Errorf("content type = %q, err = %v", mediaType, err)
+					return
+				}
+				reader := multipart.NewReader(r.Body, params["boundary"])
+				parts := map[string]string{}
+				filenames := map[string]string{}
+				for {
+					part, err := reader.NextPart()
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						t.Errorf("read multipart: %v", err)
+						return
+					}
+					value, err := io.ReadAll(part)
+					if err != nil {
+						t.Errorf("read part: %v", err)
+						return
+					}
+					parts[part.FormName()] = string(value)
+					filenames[part.FormName()] = part.FileName()
+				}
+				if parts["src"] != tt.data || parts["folder_id"] != "folder-1" {
+					t.Errorf("multipart fields = %#v", parts)
+				}
+				if got := filenames["src"]; got != tt.name {
+					t.Errorf("src filename = %q, want %q", got, tt.name)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, `{"status":"success","id":"transfer-123","name":"release","type":"torrent"}`)
+			}))
+			defer server.Close()
+			client := NewPremiumizemeClient("test-key")
+			client.APIBaseURL = server.URL + "/api/"
+			got, err := client.CreateTransferFromBytes(context.Background(), tt.kind, []byte(tt.data), tt.name, "folder-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.ID != "transfer-123" || got.Status != "success" {
+				t.Fatalf("response = %#v", got)
+			}
+		})
+	}
+}
+
+func TestCreateTransferFromBytesValidationAndResponseErrors(t *testing.T) {
+	client := NewPremiumizemeClient("key")
+	for _, tc := range []struct {
+		kind TransferSourceKind
+		data []byte
+		name string
+	}{
+		{TransferSourceKind("unknown"), []byte("data"), "x"},
+		{TransferSourceTorrent, nil, "x.torrent"},
+		{TransferSourceMagnet, make([]byte, 16*1024+1), ""},
+		{TransferSourceTorrent, []byte("data"), ""},
+	} {
+		if _, err := client.CreateTransferFromBytes(context.Background(), tc.kind, tc.data, tc.name, ""); err == nil {
+			t.Errorf("expected validation error for kind %q", tc.kind)
+		}
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"status":"error","message":"bad request"}`)
+	}))
+	defer server.Close()
+	client.APIBaseURL = server.URL + "/api/"
+	if _, err := client.CreateTransferFromBytes(context.Background(), TransferSourceMagnet, []byte("magnet:?x"), "", ""); err == nil || !strings.Contains(err.Error(), "bad request") {
+		t.Fatalf("response error = %v", err)
+	}
+}
+
+func TestCreateTransferFromBytesRedactsAPIKeyOnRequestError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	baseURL := server.URL + "/api/"
+	server.Close()
+	client := NewPremiumizemeClient("secret key+value")
+	client.APIBaseURL = baseURL
+	_, err := client.CreateTransferFromBytes(context.Background(), TransferSourceMagnet, []byte("magnet:?x"), "", "")
+	if err == nil || strings.Contains(err.Error(), client.APIKey) || !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("request error = %v", err)
+	}
+}
 
 func TestCreateTransferRequestsIncludeFolderID(t *testing.T) {
 	tests := []struct {

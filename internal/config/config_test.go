@@ -25,6 +25,104 @@ func readConfigFile(t *testing.T, dir string) string {
 	return string(data)
 }
 
+func TestDirectClientKeyGeneratedOnceAndSavedPrivate(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := LoadOrCreateConfig(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.DirectClientAPIKey) != 48 {
+		t.Fatalf("generated direct client key length = %d, want 48", len(cfg.DirectClientAPIKey))
+	}
+	info, err := os.Stat(path.Join(dir, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("config permissions = %04o, want 0600", got)
+	}
+	reloaded, err := LoadOrCreateConfig(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.DirectClientAPIKey != cfg.DirectClientAPIKey {
+		t.Fatal("direct client key changed after restart")
+	}
+}
+
+// TestLoadOrCreateConfigTightensLegacyReadableConfig verifies that a legacy
+// 0644 config (predating the private-file tightening) ends up as a 0600
+// file after the fresh DirectClientAPIKey is generated, with the key stable
+// across reloads: the new content must never sit in a world-readable file,
+// so it is written to a 0600 temp file and renamed into place.
+func TestLoadOrCreateConfigTightensLegacyReadableConfig(t *testing.T) {
+	dir := t.TempDir()
+	writeConfigFile(t, dir, "PremiumizemeAPIKey: xxxxxxxxx\n") // 0644, empty direct client key
+
+	cfg, err := LoadOrCreateConfig(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.DirectClientAPIKey) != 48 {
+		t.Fatalf("generated direct client key length = %d, want 48", len(cfg.DirectClientAPIKey))
+	}
+	info, err := os.Stat(path.Join(dir, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("config permissions = %04o, want 0600 after tightening a legacy 0644 file", got)
+	}
+	reloaded, err := LoadOrCreateConfig(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.DirectClientAPIKey != cfg.DirectClientAPIKey {
+		t.Fatal("direct client key changed after reload")
+	}
+	if info, err := os.Stat(path.Join(dir, "config.yaml")); err != nil {
+		t.Fatal(err)
+	} else if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("config permissions after reload = %04o, want 0600", got)
+	}
+}
+
+// TestSaveFailureKeepsPreviousConfigAndLeavesNoDebris verifies the failure
+// side of the atomic save: when the final rename cannot happen, Save must
+// report the error, leave the previous config byte-for-byte intact, and
+// not leave a temp file behind.
+func TestSaveFailureKeepsPreviousConfigAndLeavesNoDebris(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{PremiumizemeAPIKey: "xxxxxxxxx"}
+	cfg.altConfigLocation = dir
+
+	// A directory named config.yaml makes the final rename fail (rename to
+	// an existing directory is an error), whatever the user running the
+	// test is.
+	if err := os.Mkdir(path.Join(dir, "config.yaml"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cfg.Save(); err == nil {
+		t.Fatal("Save() succeeded, want an error for the blocked rename")
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() == "config.yaml" {
+			continue
+		}
+		t.Fatalf("leftover file %q after a failed save", e.Name())
+	}
+	info, err := os.Stat(path.Join(dir, "config.yaml"))
+	if err != nil || !info.IsDir() {
+		t.Fatalf("previous config target changed by the failed save: %v", err)
+	}
+}
+
 // TestLoadConfigFromDiskBackfillsGracePeriod verifies that a legacy config
 // file without ErroredTransferDeleteGracePeriodSeconds is backfilled with
 // the 300 second default on load, and that the backfilled value is written
@@ -102,6 +200,56 @@ func TestLoadConfigFromDiskKeepsSetArrs(t *testing.T) {
 	}
 	if cfg.Arrs[0].Name != "Sonarr" || cfg.Arrs[0].URL != "http://127.0.0.1:8989" || cfg.Arrs[0].Type != Sonarr {
 		t.Fatalf("Arrs[0] = %+v, want the entry from the file", cfg.Arrs[0])
+	}
+}
+
+// TestLoadConfigFromDiskKeepsNonPositiveSimultaneousDownloads verifies that
+// a hand-edited 0 (or a negative) SimultaneousDownloads is KEPT as-is on
+// load — in memory and in the file — and never rewritten to the 5
+// default: every consumer reads a non-positive limit as "no limit", so the
+// literal keeps ONE meaning across load, web save, and runtime. A load-only
+// rewrite would make the same file mean "unlimited" after a web save and
+// "cap of 5" after a restart.
+func TestLoadConfigFromDiskKeepsNonPositiveSimultaneousDownloads(t *testing.T) {
+	for _, tc := range []struct {
+		line string
+		want int
+	}{
+		{"SimultaneousDownloads: 0", 0},
+		{"SimultaneousDownloads: -2", -2},
+	} {
+		t.Run(tc.line, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfigFile(t, dir, "PremiumizemeAPIKey: xxxxxxxxx\n"+tc.line+"\n")
+
+			cfg, err := loadConfigFromDisk(dir)
+			if err != nil {
+				t.Fatalf("loadConfigFromDisk() error = %v, want nil", err)
+			}
+			if cfg.SimultaneousDownloads != tc.want {
+				t.Fatalf("SimultaneousDownloads = %d, want %d (kept as-is, not rewritten to the default)", cfg.SimultaneousDownloads, tc.want)
+			}
+			file := readConfigFile(t, dir)
+			if !strings.Contains(file, tc.line) {
+				t.Fatalf("config file does not contain the hand-edited limit (rewritten on load):\n%s", file)
+			}
+		})
+	}
+}
+
+// TestLoadConfigFromDiskKeepsSetSimultaneousDownloads verifies that an
+// explicitly set positive SimultaneousDownloads is preserved on load
+// instead of being overwritten by the default.
+func TestLoadConfigFromDiskKeepsSetSimultaneousDownloads(t *testing.T) {
+	dir := t.TempDir()
+	writeConfigFile(t, dir, "PremiumizemeAPIKey: xxxxxxxxx\nSimultaneousDownloads: 3\n")
+
+	cfg, err := loadConfigFromDisk(dir)
+	if err != nil {
+		t.Fatalf("loadConfigFromDisk() error = %v, want nil", err)
+	}
+	if cfg.SimultaneousDownloads != 3 {
+		t.Fatalf("SimultaneousDownloads = %d, want 3 (the explicitly set value)", cfg.SimultaneousDownloads)
 	}
 }
 

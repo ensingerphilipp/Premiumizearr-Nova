@@ -36,6 +36,8 @@ Next Steps:
 - Monitor blackhole directory to push `.magnet`, `.torrent`  and `.nzb` to Premiumize.me
 - Monitor and download Premiumize.me transfers (web ui on default port 8182)
 - Mark transfers as failed in Radarr & Sonarr
+- Optional direct download-client integration for Sonarr, Radarr and Lidarr,
+  including progress, import paths and removal, without a blackhole mount.
 
 New blackhole submissions pause automatically when the Premiumize fair-use quota is exhausted and no booster points are available. Existing cloud transfers are not affected. Source files remain in the blackhole directory and are processed automatically after quota replenishment or booster activation.
 
@@ -84,6 +86,42 @@ If you already use this binding for something else you can edit them in the `con
 
 ### Sonarr/Radarr
 
+#### Direct download clients (no blackhole)
+
+1. Mount a writable downloads directory into Premiumizearr and make it visible
+   at the **same path** to each *arr container (for example `/downloads`). The
+   completed media is placed in `/downloads/direct/<job-id>/`. No blackhole
+   mount is required. Keep Transfer-Only-Mode disabled.
+2. Start Premiumizearr once and copy **Direct *arr client key** from its Config
+   tab (or `DirectClientAPIKey` in `config.yaml`). A random key is generated at
+   first startup. The compatibility APIs share the web server port.
+3. For torrents and magnets, add a **qBittorrent** download client in each
+   *arr: Host = the Premiumizearr host; Port = `8182` (or the configured port);
+   URL Base = `/qbit`; Username = `premiumizearr`; Password = the direct client
+   key. Set a distinct category for each *arr (for example `sonarr`, `radarr`,
+   `lidarr`).
+4. For NZBs, add a **SABnzbd** download client: the same host/port, URL Base
+   = `/sab`, API Key = the direct client key, and a distinct category for each
+   *arr. The preconfigured category names include `sonarr`, `radarr`, `lidarr`,
+   `tv`, `movies`, `music`, and the names of configured *arr instances.
+5. Use *arr's **Test** button and submit a release. Premiumizearr keeps direct
+   jobs in `<config directory>/direct-jobs` across restarts. A job appears
+   completed only once its files have been fully downloaded locally. *arr can
+   then import from the reported path and remove the job through the client.
+
+The web UI still exposes account keys without authentication. Keep the service
+on a trusted network or behind an authenticated reverse proxy. Its qBittorrent
+and SABnzbd endpoints require the direct client key.
+
+For automatic failure handling of torrents, configure each *arr instance in
+Premiumizearr's Config tab with its URL, type and API key. The qBittorrent
+`error` state is treated as a warning by *arr, so Premiumizearr explicitly
+marks the grabbed history record matching the torrent's download ID as failed.
+Failed reports are retried and successful reports are retained across restarts.
+NZB failures are handled through SABnzbd history without this extra setup.
+
+#### Existing blackhole clients
+
 - Go to your Arr's `Download Client` settings page
 - Add a new Torrent Blackhole client, set the `Torrent Folder` to the previously set `BlackholeDirectory` location, set the `Watch Folder` to the previously set `DownloadsDirectory` location
 - Add a new Usenet Blackhole client, set the `Nzb Folder` to the previously set `BlackholeDirectory` location, set the `Watch Folder` to the previously set `DownloadsDirectory` location
@@ -107,7 +145,34 @@ location /premiumizearr/ {
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection $http_connection;
 }
+
+# The built-in *arr compat APIs are mounted at fixed root paths outside the
+# WebRoot (/qbit and /sab). To reach them through this proxy, map the proxied
+# paths to those root paths and use the mapped URL Base in each *arr:
+# /premiumizearr/qbit (qBittorrent) and /premiumizearr/sab (SABnzbd).
+location /premiumizearr/qbit/ {
+    proxy_pass http://127.0.0.1:8182/qbit/;
+    proxy_set_header Host $proxy_host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+}
+
+location /premiumizearr/sab/ {
+    proxy_pass http://127.0.0.1:8182/sab/;
+    proxy_set_header Host $proxy_host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+}
 ```
+
+> The direct *arr endpoints always live outside the WebRoot at the fixed root
+> paths `/qbit` and `/sab` (WebRoots under those prefixes are rejected), so
+> *arr clients on the same host can also point straight at port `8182` with
+> URL Base `/qbit` or `/sab` and bypass the reverse proxy entirely.
 
 ## License
 

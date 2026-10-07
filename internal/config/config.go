@@ -1,7 +1,10 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io/ioutil"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/utils"
@@ -9,6 +12,7 @@ import (
 
 	"os"
 	"path"
+	"path/filepath"
 
 	"gopkg.in/yaml.v2"
 )
@@ -25,6 +29,13 @@ func LoadOrCreateConfig(altConfigLocation string, _appCallback AppCallback) (Con
 		if err == ErrInvalidConfigFile || err == ErrFailedToSaveConfig {
 			return config, err
 		}
+	}
+	if config.DirectClientAPIKey == "" {
+		var token [24]byte
+		if _, err := rand.Read(token[:]); err != nil {
+			return config, fmt.Errorf("generate direct client key: %w", err)
+		}
+		config.DirectClientAPIKey = hex.EncodeToString(token[:])
 	}
 
 	// Override directory if running in docker
@@ -45,12 +56,19 @@ func LoadOrCreateConfig(altConfigLocation string, _appCallback AppCallback) (Con
 	config.appCallback = _appCallback
 	config.altConfigLocation = altConfigLocation
 
-	config.Save()
+	if err := config.Save(); err != nil {
+		return config, err
+	}
 
 	return config, nil
 }
 
-// Save - Saves the config to disk
+// Save - Saves the config to disk. The new content goes to a 0600 temp
+// file in the destination directory and is renamed over the previous
+// config: a legacy config may still be world-readable (the tightening used
+// to happen only after the write, so a freshly generated API key sat in a
+// 0644 file in between), and a crash or error mid-save must not leave a
+// truncated file where the last good config was.
 func (c *Config) Save() error {
 	log.Trace("Marshaling & saving config")
 	data, err := yaml.Marshal(*c)
@@ -65,8 +83,37 @@ func (c *Config) Save() error {
 	}
 
 	log.Tracef("Writing config to %s", savePath)
-	err = ioutil.WriteFile(savePath, data, 0644)
+	tmp, err := os.CreateTemp(filepath.Dir(savePath), ".config-*.tmp")
 	if err != nil {
+		log.Errorf("Failed to save config file: %+v", err)
+		return err
+	}
+	tmpPath := tmp.Name()
+	// Any failure before the rename leaves no debris behind.
+	defer func() {
+		if _, statErr := os.Stat(tmpPath); statErr == nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0600); err != nil {
+		log.Errorf("Failed to save config file: %+v", err)
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		log.Errorf("Failed to save config file: %+v", err)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		log.Errorf("Failed to save config file: %+v", err)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		log.Errorf("Failed to save config file: %+v", err)
+		return err
+	}
+	if err := os.Rename(tmpPath, savePath); err != nil {
 		log.Errorf("Failed to save config file: %+v", err)
 		return err
 	}
@@ -124,6 +171,13 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 		config.SimultaneousDownloads = 5
 		updated = true
 	}
+	// A hand-edited 0 (or a negative value) is kept as-is, not rewritten
+	// to the default: every consumer reads a non-positive limit as
+	// "no limit" (the transfer gate and the direct slot gate both treat
+	// <= 0 as unlimited), so the literal keeps ONE meaning across load,
+	// web save, and runtime. Rewriting it on load only would produce a
+	// value the web save path never produces, so the same file would
+	// mean "unlimited" after a save and "cap of 5" after a restart.
 
 	if configInterface["DownloadSpeedLimit"] == nil {
 		log.Info("DownloadSpeedLimit not set, setting to 100 Megabytes per second")

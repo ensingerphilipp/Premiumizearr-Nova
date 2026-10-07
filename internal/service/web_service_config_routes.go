@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
@@ -146,11 +147,46 @@ func (s *WebServerService) ConfigHandler(w http.ResponseWriter, r *http.Request)
 			})
 			return
 		}
-		s.config.UpdateConfig(newConfig)
+		if strings.TrimSpace(newConfig.DirectClientAPIKey) == "" {
+			EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{Succeeded: false, Status: "DirectClientAPIKey must not be empty"})
+			return
+		}
+		// The compat API prefixes are fixed root routes; reserve them here,
+		// before the whole-struct replace, so a rejected WebRoot cannot be
+		// saved and then trip the validation on the restart path.
+		if _, err := validateWebRoot(newConfig.WebRoot); err != nil {
+			EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
+				Succeeded: false,
+				Status:    fmt.Sprintf("Config failed to update: %s", err.Error()),
+			})
+			return
+		}
+		// Persist first, respond, then fan out. A save failure must come
+		// back as an error, not succeeded:true — PersistUpdate rolls the
+		// in-memory config back on failure, so the running server and the
+		// on-disk file never diverge (the rotated DirectClientAPIKey would
+		// otherwise be live in memory while the file kept the old key).
+		// The success response is written and flushed BEFORE the fan-out:
+		// the fan-out's in-handler web-server restart (BindIP/BindPort/
+		// WebRoot or a rotated DirectClientAPIKey) closes the very
+		// connection serving this request, and net/http would discard a
+		// small write still buffered in the connection writer — the
+		// browser would report a save failure for a change that did
+		// persist. Every validation that decides the outcome has already
+		// run above, so the reply is final here.
+		oldConfig := *s.config
+		if err := s.config.PersistUpdate(newConfig); err != nil {
+			EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
+				Succeeded: false,
+				Status:    fmt.Sprintf("Config failed to update: %s", err),
+			})
+			return
+		}
 		EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
 			Succeeded: true,
 			Status:    "Config updated",
 		})
+		s.config.NotifyApp(oldConfig, *s.config)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -163,6 +199,20 @@ func EncodeAndWriteConfigChangeResponse(w http.ResponseWriter, resp *ConfigChang
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	w.Write(data)
+	// Pin Content-Length so the reply is self-contained: without it the
+	// body rides chunked framing whose terminator is emitted only when the
+	// handler returns — after an in-handler restart has closed the
+	// connection, leaving the client with a truncated response.
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	if _, err := w.Write(data); err != nil {
+		return
+	}
+	// net/http buffers the write in the connection's writer and only pushes
+	// it to the socket when the handler returns. The in-handler restart
+	// that a successful update triggers closes the connection before that
+	// point and would discard the buffered bytes, so flush the final
+	// response to the client before the update runs.
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
