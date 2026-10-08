@@ -112,4 +112,25 @@ configure_permissions "$tmp/mountinfo" "$tmp/local" > "$tmp/output" || fail "sel
 grep -q 'failed or timed out' "$tmp/output" || fail "selective failure was not logged"
 grep -Fq "$tmp/local/config.yaml" "$OWNERSHIP_CALLS" || fail "one ownership failure skipped other local files"
 
+# A target spelled as a symlink alias, with a trailing slash, or through a
+# relative symlink must normalise to the canonical spelling before
+# detection, so every spelling follows the same selective pass the canonical
+# target gets.
+unset CHOWN_RESULT
+mount_entry "$tmp/local" ext4 > "$tmp/mountinfo"
+mount_entry "$tmp/local/network" cifs >> "$tmp/mountinfo"
+mount_entry "$tmp/local/branch/nested" nfs4 >> "$tmp/mountinfo"
+ln -s local "$tmp/alias"
+ln -s ./local "$tmp/twin"
+: > "$OWNERSHIP_CALLS"
+: > "$tmp/deadlines"
+configure_permissions "$tmp/mountinfo" "$tmp/alias" "$tmp/twin" "$tmp/local/" > "$tmp/output"
+grep -Fxq -- "-h -- 1000:1000 $tmp/local" "$OWNERSHIP_CALLS" || fail "symlinked target was not normalised to its canonical spelling"
+grep -Fxq -- "-h -R -- 1000:1000 $tmp/local/.hidden $tmp/local/config.yaml $tmp/local/link $tmp/local/with spaces" "$OWNERSHIP_CALLS" || fail "normalised target siblings were not batched"
+[[ "$(wc -l < "$OWNERSHIP_CALLS")" -eq 12 ]] || fail "normalised targets must follow the same selective pass"
+if grep -Fq "$tmp/local/network" "$OWNERSHIP_CALLS" || grep -Fq "$tmp/local/branch/nested" "$OWNERSHIP_CALLS"; then
+    fail "normalised target pass touched a network subtree"
+fi
+[[ "$(wc -l < "$tmp/deadlines")" -eq 3 ]] || fail "each normalised target must get its own bounded selective pass"
+
 echo "Container permission regressions passed"

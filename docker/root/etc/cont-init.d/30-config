@@ -37,6 +37,98 @@ has_network_mount() {
     ' "${2:-/proc/self/mountinfo}"
 }
 
+# Resolve a symlinked prefix of a path to its real spelling. Every prefix
+# is safe to readlink (an lstat of its parent directory, never of the
+# component itself, which may sit on a stale or network mount and is
+# never followed here). Relative links join to the parent directory.
+# The 40-pass cap terminates symlink cycles without stat'ing anything.
+resolve_symlink_prefix() {
+    local path="$1" prefix link parent pass absolute=0
+    for pass in {1..40}; do
+        absolute=0
+        [[ "$path" == /* ]] && absolute=1
+        IFS='/' read -ra parts <<< "$path"
+        prefix=""
+        local i
+        for ((i = 0; i < ${#parts[@]}; i++)); do
+            [[ -z "${parts[i]}" ]] && continue
+            if [[ -z "$prefix" ]]; then
+                if [[ "$absolute" -eq 1 ]]; then prefix="/${parts[i]}"; else prefix="${parts[i]}"; fi
+            else
+                prefix+="/${parts[i]}"
+            fi
+            if [[ -L "$prefix" ]]; then
+                link="$(readlink "$prefix" 2>/dev/null)"
+                if [[ -z "$link" ]]; then
+                    # Stale link: keep the spelling, let chown report it.
+                    break
+                fi
+                if [[ "$link" == /* ]]; then
+                    prefix="$link"
+                else
+                    parent="${prefix%/*}"
+                    [[ -z "$parent" || "$parent" == "$prefix" ]] && parent="/"
+                    prefix="$parent/$link"
+                fi
+                break
+            fi
+        done
+        if [[ "$prefix" != "$path" ]]; then
+            path="$prefix"
+            [[ -z "$path" || "$path" == "." ]] && path="/"
+            continue
+        fi
+        break
+    done
+    printf '%s' "$path"
+}
+
+# String-only path spelling normalisation: drop trailing slashes (keep the
+# root itself), collapse "x/.." and drop "." so a relative readlink target
+# lands in canonical form without touching the filesystem.
+collapse_path_dots() {
+    local path="$1" comp out="" absolute=0
+    [[ "$path" == /* ]] && absolute=1
+    IFS='/' read -ra parts <<< "$path"
+    for comp in "${parts[@]}"; do
+        case "$comp" in
+            '' | .) ;;
+            ..) if [[ "$out" == */* ]]; then out="${out%/*}"; fi ;;
+            *) if [[ -z "$out" ]]; then
+                    if [[ "$absolute" -eq 1 ]]; then out="/$comp"; else out="$comp"; fi
+                else
+                    out+="/$comp"
+                fi
+                ;;
+        esac
+    done
+    if [[ -z "$out" ]]; then
+        if [[ "$absolute" -eq 1 ]]; then out="/"; else out="."; fi
+    fi
+    printf '%s' "$out"
+}
+
+# Normalise a target's spelling before mount-table matching: strip trailing
+# slashes and resolve any symlink component, so "alias -> real" or "real/"
+# matches the same mount-table entries as "real" and takes the same branch.
+# readlink never follows the link, so a target whose final component sits
+# on the probed mount is safe to test; the cap stops symlink cycles.
+canonical_target() {
+    local target="$1" pass canon
+    while [[ "$target" == */ && "$target" != "/" ]]; do
+        target="${target%/}"
+    done
+    for pass in {1..40}; do
+        canon="$(resolve_symlink_prefix "$target")"
+        canon="$(collapse_path_dots "$canon")"
+        if [[ "$canon" == "$target" ]]; then
+            break
+        fi
+        target="$canon"
+    done
+    printf '%s' "$target"
+}
+
 # Print every decoded network mountpoint strictly under directory, from one
 # awk pass over the mount table. The ownership pass skips and batches
 # against this precomputed set instead of re-reading the table per entry.
@@ -132,6 +224,11 @@ configure_permissions() {
     fi
 
     for directory in "$@"; do
+        # Normalise the spelling before any mount-table matching so a
+        # symlinked target or trailing slash takes the same branch as its
+        # canonical form; both the detection below and the chown/subprocess
+        # arguments then use the canonical value.
+        directory="$(canonical_target "$directory")"
         nested=false
         if has_network_mount "$directory" "$mountinfo"; then
             mount_status=0
