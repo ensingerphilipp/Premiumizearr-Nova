@@ -70,9 +70,11 @@ If you wish to increase logging (which you'll be asked to do if you submit an is
 
 For CIFS/SMB, NFS, or FUSE mounts, set permissions or UID/GID mapping on the host
 so the container's `PUID`/`PGID` can read and write the mounted folders. Container
-startup skips recursive ownership changes for detected network mounts, including
-network mounts nested inside a target directory. Other ownership changes have a
-10-second timeout per directory, followed by a 2-second forced-stop deadline; a
+startup skips ownership changes on detected network mounts. When a network mount
+is nested inside a local directory, startup still sets ownership of the local
+directory and its local contents while excluding the network subtree. Ownership
+work has a 10-second timeout for each target directory (including any selective
+traversal), followed by a 2-second forced-stop deadline; a
 failure is logged and startup continues. To manage all ownership on the host,
 add `-e PREMIUMIZEARR_SKIP_CHOWN=true` to skip these changes entirely.
 

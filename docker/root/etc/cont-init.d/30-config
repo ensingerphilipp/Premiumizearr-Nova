@@ -1,10 +1,11 @@
 #!/usr/bin/with-contenv bash
 
 # Read the kernel's mount table without stat-ing the potentially stalled mount.
-# Skip the whole target if a network mount contains it OR is nested beneath it.
+# By default include nested mounts; "covering" only checks the target itself
+# and its ancestors so local files around a nested mount can still be owned.
 has_network_mount() {
     [[ -r "${2:-/proc/self/mountinfo}" ]] || return 2
-    awk -v target="$1" '
+    awk -v target="$1" -v scope="${3:-any}" '
         {
             mount = $5
             gsub(/\\040/, " ", mount)
@@ -19,7 +20,8 @@ has_network_mount() {
             }
             if (type ~ /^(cifs|smb3|nfs|nfs4|9p|ceph|glusterfs|fuse.*)$/ &&
                 (mount == "/" || mount == target ||
-                 index(target, mount "/") == 1 || index(mount, target "/") == 1)) {
+                 index(target, mount "/") == 1 ||
+                 (scope == "any" && index(mount, target "/") == 1))) {
                 found = 1
             }
         }
@@ -27,26 +29,71 @@ has_network_mount() {
     ' "${2:-/proc/self/mountinfo}"
 }
 
+# Only invoked in a subprocess under the per-target timeout. Check the mount
+# table before inspecting each child, so even the network mountpoint is skipped.
+# Recurse selectively along ancestors of mounts, and use chown -R elsewhere.
+own_local_tree() {
+    local directory="$1" owner="$2" mountinfo="$3"
+    local mount_status child failed=0
+    if has_network_mount "$directory" "$mountinfo" covering; then
+        echo "[cont-init.d] Skipping ownership changes for network mount $directory; configure UID/GID on the host"
+        return 0
+    else
+        mount_status=$?
+    fi
+    [[ "$mount_status" -eq 1 ]] || return 1
+
+    if has_network_mount "$directory" "$mountinfo"; then
+        chown -h -- "$owner" "$directory" || failed=1
+        if [[ ! -L "$directory" && -d "$directory" ]]; then
+            for child in "$directory"/*; do
+                own_local_tree "$child" "$owner" "$mountinfo" || failed=1
+            done
+        fi
+        return "$failed"
+    else
+        mount_status=$?
+    fi
+    [[ "$mount_status" -eq 1 ]] || return 1
+    # Do not follow symlinks that might point into an excluded network mount.
+    chown -h -R -- "$owner" "$directory"
+}
+
 configure_permissions() {
     local directory
     local mount_status
     local mountinfo="${1:-/proc/self/mountinfo}"
     local owner="${PUID:-1000}:${PGID:-1000}"
+    local script="${BASH_SOURCE[0]}"
+    local nested
+
+    if [[ "$#" -gt 0 ]]; then shift; fi
+    if [[ "$#" -eq 0 ]]; then set -- /data /downloads /transfers /blackhole /opt; fi
 
     if [[ "${PREMIUMIZEARR_SKIP_CHOWN:-false}" == "true" ]]; then
         echo "[cont-init.d] Skipping ownership changes (PREMIUMIZEARR_SKIP_CHOWN=true)"
         return 0
     fi
 
-    for directory in /data /downloads /transfers /blackhole /opt; do
+    for directory in "$@"; do
+        nested=false
         if has_network_mount "$directory" "$mountinfo"; then
             mount_status=0
         else
             mount_status=$?
         fi
         if [[ "$mount_status" -eq 0 ]]; then
-            echo "[cont-init.d] Skipping ownership changes for network mount at or under $directory; configure UID/GID on the host"
-            continue
+            if has_network_mount "$directory" "$mountinfo" covering; then
+                echo "[cont-init.d] Skipping ownership changes for network mount $directory; configure UID/GID on the host"
+                continue
+            else
+                mount_status=$?
+            fi
+            if [[ "$mount_status" -ne 1 ]]; then
+                echo "[cont-init.d] Cannot read mount information; skipping ownership changes for $directory"
+                continue
+            fi
+            nested=true
         elif [[ "$mount_status" -ne 1 ]]; then
             echo "[cont-init.d] Cannot read mount information; skipping ownership changes for $directory"
             continue
@@ -55,7 +102,13 @@ configure_permissions() {
         echo "[cont-init.d] Setting ownership of $directory to $owner"
         # coreutils timeout is installed in the image. The kill deadline also
         # terminates the supervisor if chown is stuck in uninterruptible I/O.
-        if ! timeout --kill-after=2s 10s chown -R "$owner" "$directory"; then
+        if [[ "$nested" == true ]]; then
+            # Bound enumeration and all ownership work with one deadline, even
+            # when there are many local siblings or deeply nested mounts.
+            if ! timeout --kill-after=2s 10s bash "$script" --local-ownership "$directory" "$owner" "$mountinfo"; then
+                echo "[cont-init.d] Ownership change failed or timed out for $directory; continuing startup (check host permissions)"
+            fi
+        elif ! timeout --kill-after=2s 10s chown -R "$owner" "$directory"; then
             echo "[cont-init.d] Ownership change failed or timed out for $directory; continuing startup (check host permissions)"
         fi
     done
@@ -63,5 +116,10 @@ configure_permissions() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    configure_permissions
+    if [[ "${1:-}" == --local-ownership ]]; then
+        shopt -s dotglob nullglob
+        own_local_tree "$2" "$3" "$4"
+    else
+        configure_permissions
+    fi
 fi

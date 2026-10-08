@@ -35,7 +35,7 @@ if has_network_mount /downloads "$tmp/mountinfo"; then fail "local storage treat
 timeout() { printf '%s\n' "$*" >> "$tmp/calls"; return "${timeout_result:-0}"; }
 unset PREMIUMIZEARR_SKIP_CHOWN PUID PGID
 mount_entry /downloads cifs > "$tmp/mountinfo"
-mount_entry /blackhole/nested nfs4 >> "$tmp/mountinfo"
+mount_entry /blackhole nfs4 >> "$tmp/mountinfo"
 : > "$tmp/calls"
 configure_permissions "$tmp/mountinfo" > "$tmp/output"
 printf '%s\n' \
@@ -63,5 +63,54 @@ unset PREMIUMIZEARR_SKIP_CHOWN
 configure_permissions "$tmp/missing-mountinfo" > "$tmp/output" 2>&1
 [[ ! -s "$tmp/calls" ]] || fail "unknown mounts must not be traversed"
 grep -q 'Cannot read mount information' "$tmp/output" || fail "mount table error was not logged"
+
+# Exercise the real bounded worker against a scratch tree. Stub only chown so
+# the test can run without root and never change ownership outside the fixture.
+mkdir -p "$tmp/bin" "$tmp/local/branch/nested" "$tmp/local/network"
+touch "$tmp/local/config.yaml" "$tmp/local/branch/local.txt" "$tmp/local/.hidden" "$tmp/local/with spaces"
+ln -s "$tmp/local/network" "$tmp/local/link"
+cat > "$tmp/bin/chown" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$OWNERSHIP_CALLS"
+exit "${CHOWN_RESULT:-0}"
+STUB
+chmod +x "$tmp/bin/chown"
+export PATH="$tmp/bin:$PATH"
+export OWNERSHIP_CALLS="$tmp/ownership-calls"
+PUID=1000
+PGID=1000
+timeout() { printf '%s\n' "$*" >> "$tmp/deadlines"; command timeout "$@"; }
+mount_entry "$tmp/local" ext4 > "$tmp/mountinfo"
+mount_entry "$tmp/local/network" cifs >> "$tmp/mountinfo"
+mount_entry "$tmp/local/branch/nested" nfs4 >> "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+: > "$tmp/deadlines"
+configure_permissions "$tmp/mountinfo" "$tmp/local" > "$tmp/output"
+grep -Fxq -- "-h -- 1000:1000 $tmp/local" "$OWNERSHIP_CALLS" || fail "local target ownership was skipped"
+grep -Fxq -- "-h -- 1000:1000 $tmp/local/branch" "$OWNERSHIP_CALLS" || fail "local ancestor of deeper mount was skipped"
+for local_file in config.yaml branch/local.txt .hidden 'with spaces' link; do
+    grep -Fxq -- "-h -R -- 1000:1000 $tmp/local/$local_file" "$OWNERSHIP_CALLS" || fail "local file skipped: $local_file"
+done
+[[ "$(wc -l < "$OWNERSHIP_CALLS")" -eq 7 ]] || fail "selective pass issued unexpected ownership commands"
+if grep -Fq "$tmp/local/network" "$OWNERSHIP_CALLS" || grep -Fq "$tmp/local/branch/nested" "$OWNERSHIP_CALLS"; then
+    fail "ownership worker touched a network subtree"
+fi
+[[ "$(wc -l < "$tmp/deadlines")" -eq 1 ]] || fail "selective pass must use one deadline for the whole target"
+grep -q '^--kill-after=2s 10s bash ' "$tmp/deadlines" || fail "selective pass was not bounded"
+
+# A mount covering the target must still be skipped completely.
+mount_entry "$tmp/local" cifs > "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+: > "$tmp/deadlines"
+configure_permissions "$tmp/mountinfo" "$tmp/local" > "$tmp/output"
+[[ ! -s "$OWNERSHIP_CALLS" && ! -s "$tmp/deadlines" ]] || fail "covered target must stay untouched"
+
+# Ownership errors in a selective pass are logged without failing container init.
+mount_entry "$tmp/local/network" cifs > "$tmp/mountinfo"
+export CHOWN_RESULT=1
+: > "$OWNERSHIP_CALLS"
+configure_permissions "$tmp/mountinfo" "$tmp/local" > "$tmp/output" || fail "selective failure aborted startup"
+grep -q 'failed or timed out' "$tmp/output" || fail "selective failure was not logged"
+grep -Fq "$tmp/local/config.yaml" "$OWNERSHIP_CALLS" || fail "one ownership failure skipped other local files"
 
 echo "Container permission regressions passed"
