@@ -37,34 +37,82 @@ has_network_mount() {
     ' "${2:-/proc/self/mountinfo}"
 }
 
-# Only invoked in a subprocess under the per-target timeout. Check the mount
-# table before inspecting each child, so even the network mountpoint is skipped.
-# Recurse selectively along ancestors of mounts, and use chown -R elsewhere.
-own_local_tree() {
-    local directory="$1" owner="$2" mountinfo="$3"
-    local mount_status child failed=0
-    if has_network_mount "$directory" "$mountinfo" covering; then
-        echo "[cont-init.d] Skipping ownership changes for network mount $directory; configure UID/GID on the host"
-        return 0
-    else
-        mount_status=$?
-    fi
-    [[ "$mount_status" -eq 1 ]] || return 1
+# Print every decoded network mountpoint strictly under directory, from one
+# awk pass over the mount table. The ownership pass skips and batches
+# against this precomputed set instead of re-reading the table per entry.
+network_mounts_under() {
+    TARGET="$1" awk '
+        BEGIN { target = ENVIRON["TARGET"] }
+        {
+            mount = $5
+            gsub(/\\040/, " ", mount)
+            gsub(/\\011/, "\t", mount)
+            gsub(/\\012/, "\n", mount)
+            gsub(/\\134/, "\\", mount)
+            for (i = 7; i <= NF; i++) {
+                if ($i == "-") {
+                    type = $(i + 1)
+                    break
+                }
+            }
+            if (type ~ /^(cifs|smb3|nfs|nfs4|9p|ceph|glusterfs|fuse.*)$/ &&
+                index(mount, target "/") == 1) {
+                print mount
+            }
+        }
+    ' "${2:-/proc/self/mountinfo}"
+}
 
-    if has_network_mount "$directory" "$mountinfo"; then
-        chown -h -- "$owner" "$directory" || failed=1
-        if [[ ! -L "$directory" && -d "$directory" ]]; then
-            for child in "$directory"/*; do
-                own_local_tree "$child" "$owner" "$mountinfo" || failed=1
-            done
+# Only invoked in a subprocess under the per-target timeout. Cost is one
+# chown per directory entry on the nested-mount chain plus one batched
+# chown per level covering every mount-free sibling subtree, so a large
+# tree no longer spends one spawn per entry against the shared deadline:
+# only directories that hold a nested network mount are recursed into, a
+# mount-free subtree is chowned whole, and the mountpoint set comes from
+# the precomputed NETWORK_MOUNTS array, not a per-entry table probe.
+own_local_tree() {
+    local directory="$1" owner="$2"
+    local mount entry nested skip below=0 failed=0
+    local batch=()
+    for mount in "${NETWORK_MOUNTS[@]}"; do
+        if [[ "$mount" == "$directory"/* ]]; then
+            below=1
+            break
         fi
-        return "$failed"
-    else
-        mount_status=$?
+    done
+    if [[ "$below" -eq 0 ]]; then
+        # Do not follow symlinks that might point into an excluded network mount.
+        chown -h -R -- "$owner" "$directory"
+        return $?
     fi
-    [[ "$mount_status" -eq 1 ]] || return 1
-    # Do not follow symlinks that might point into an excluded network mount.
-    chown -h -R -- "$owner" "$directory"
+    chown -h -- "$owner" "$directory" || failed=1
+    [[ -L "$directory" || ! -d "$directory" ]] && return "$failed"
+    for entry in "$directory"/*; do
+        skip=0
+        nested=0
+        for mount in "${NETWORK_MOUNTS[@]}"; do
+            if [[ "$entry" == "$mount" ]]; then
+                echo "[cont-init.d] Skipping ownership changes for network mount $entry; configure UID/GID on the host"
+                skip=1
+                break
+            fi
+            if [[ "$mount" == "$entry"/* ]]; then
+                nested=1
+            fi
+        done
+        [[ "$skip" -eq 1 ]] && continue
+        if [[ "$nested" -eq 1 && -d "$entry" && ! -L "$entry" ]]; then
+            own_local_tree "$entry" "$owner" || failed=1
+        else
+            batch+=("$entry")
+        fi
+    done
+    if [[ "${#batch[@]}" -gt 0 ]]; then
+        # One chown for the whole mount-free remainder of this level;
+        # xargs chunks the operand list so it stays within exec limits.
+        printf '%s\0' "${batch[@]}" | xargs -0 -r chown -h -R -- "$owner" || failed=1
+    fi
+    return "$failed"
 }
 
 configure_permissions() {
@@ -126,7 +174,20 @@ configure_permissions() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     if [[ "${1:-}" == --local-ownership ]]; then
         shopt -s dotglob nullglob
-        own_local_tree "$2" "$3" "$4"
+        # Byte-wise glob order keeps the batched chown operand order stable.
+        export LC_ALL=C
+        # One awk pass over the mount table precomputes the network
+        # mountpoints below the target, so the ownership pass skips and
+        # batches against a string set instead of probing per entry.
+        if has_network_mount "$2" "${4:-/proc/self/mountinfo}" covering; then
+            echo "[cont-init.d] Skipping ownership changes for network mount $2; configure UID/GID on the host"
+        else
+            mount_status=$?
+            if [[ "$mount_status" -eq 1 ]]; then
+                mapfile -t NETWORK_MOUNTS < <(network_mounts_under "$2" "${4:-/proc/self/mountinfo}")
+                own_local_tree "$2" "$3"
+            fi
+        fi
     else
         configure_permissions
     fi
