@@ -79,8 +79,13 @@ func (t *TransferManagerService) Init(pme *premiumizeme.Premiumizeme, arrsManage
 	t.config = config
 }
 
+// StartupCleanupEntryMarker rides the startup cleanup entry line as a logrus
+// field so test tooling can stall the walk at that point without coupling to
+// the human-facing message prose.
+const StartupCleanupEntryMarker = "startup-cleanup-entry"
+
 func (t *TransferManagerService) CleanUpDownloadDirPeriod() {
-	log.Info("Cleaning download directory - deleting files older than 4 days")
+	log.WithField("marker", StartupCleanupEntryMarker).Info("Cleaning download directory - deleting files older than 4 days")
 
 	downloadBase, err := t.config.GetDownloadsBaseLocation()
 	if err != nil {

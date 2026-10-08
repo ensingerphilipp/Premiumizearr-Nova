@@ -16,17 +16,22 @@ import (
 	"time"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
+	"github.com/ensingerphilipp/premiumizearr-nova/internal/service"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 )
 
 // Stall cleanup at its entry point to simulate an uninterruptible filesystem
 // call. Use a subprocess because App.Start and the stalled worker never return.
+// The hook matches the marker field the service attaches to that line, not
+// the message prose: rewording the human-facing log must not break this test,
+// and a full-value field match cannot fire on the near-identical full-wipe
+// line, which carries no marker.
 type stalledCleanupHook struct{}
 
 func (stalledCleanupHook) Levels() []log.Level { return []log.Level{log.InfoLevel} }
 func (stalledCleanupHook) Fire(entry *log.Entry) error {
-	if entry.Message == "Cleaning download directory - deleting files older than 4 days" {
+	if entry.Data["marker"] == service.StartupCleanupEntryMarker {
 		fmt.Println("startup-cleanup-blocked")
 		select {}
 	}
