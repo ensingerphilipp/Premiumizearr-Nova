@@ -5,7 +5,15 @@
 # and its ancestors so local files around a nested mount can still be owned.
 has_network_mount() {
     [[ -r "${2:-/proc/self/mountinfo}" ]] || return 2
-    awk -v target="$1" -v scope="${3:-any}" '
+    # Pass target/scope through the environment, not awk -v: -v re-processes
+    # escape sequences in the value, so a target containing a literal
+    # backslash escape would decode differently from the mountinfo field it
+    # is compared against and never match.
+    TARGET="$1" SCOPE="${3:-any}" awk '
+        BEGIN {
+            target = ENVIRON["TARGET"]
+            scope = ENVIRON["SCOPE"]
+        }
         {
             mount = $5
             gsub(/\\040/, " ", mount)
