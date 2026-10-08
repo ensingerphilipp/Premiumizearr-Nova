@@ -117,7 +117,11 @@ func (t *TransferManagerService) CleanUpDownloadDirPeriod() {
 
 	if err != nil {
 		log.Errorf("Error cleaning download directory: %s", err.Error())
+		return
 	}
+	// A walk stalled on an unresponsive mount never reaches this entry, so
+	// oncall can tell a stuck worker from a finished no-op cleanup.
+	log.Info("Startup download directory cleanup finished")
 }
 
 func (t *TransferManagerService) CleanUpDownloadDir() {
