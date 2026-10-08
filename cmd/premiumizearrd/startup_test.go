@@ -119,6 +119,16 @@ func TestHTTPAvailableDuringStartupCleanup(t *testing.T) {
 		for scanner.Scan() {
 			output.WriteString(scanner.Text() + "\n")
 			if scanner.Text() == "startup-cleanup-blocked" {
+				// Pin the documented ordering (ARCHITECTURE.md): cleanup
+				// runs before the first transfer poll. A poll that ran
+				// first fails with the keyless test config and logs
+				// "Error getting transfers" before this marker. The
+				// pre-Run folder errors ("Error getting folders") are
+				// expected on correct code and are not asserted here.
+				if n := strings.Count(output.String(), "Error getting transfers"); n > 0 {
+					blocked <- fmt.Errorf("a transfer poll ran before startup cleanup finished (%d lines before the marker):\n%s", n, output.String())
+					return
+				}
 				blocked <- nil
 				return
 			}
