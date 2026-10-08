@@ -116,7 +116,7 @@ configure_permissions() {
             if ! timeout --kill-after=2s 10s bash "$script" --local-ownership "$directory" "$owner" "$mountinfo"; then
                 echo "[cont-init.d] Ownership change failed or timed out for $directory; continuing startup (check host permissions)"
             fi
-        elif ! timeout --kill-after=2s 10s chown -R "$owner" "$directory"; then
+        elif ! timeout --kill-after=2s 10s chown -R -- "$owner" "$directory"; then
             echo "[cont-init.d] Ownership change failed or timed out for $directory; continuing startup (check host permissions)"
         fi
     done
