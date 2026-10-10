@@ -68,6 +68,22 @@ docker run -d --name premiumizearr \
 
 If you wish to increase logging (which you'll be asked to do if you submit an issue) you can add `-e PREMIUMIZEARR_LOG_LEVEL=trace` to the command
 
+For CIFS/SMB, NFS, or FUSE mounts, set permissions or UID/GID mapping on the host
+so the container's `PUID`/`PGID` can read and write the mounted folders. Container
+startup skips ownership changes on detected network mounts. When a network mount
+is nested inside a local directory, startup still sets ownership of the local
+directory and its local contents while excluding the network subtree. Ownership
+work has a 10-second timeout for each target directory (including any selective
+traversal), followed by a 2-second forced-stop deadline; a
+failure is logged and startup continues. To manage all ownership on the host,
+add `-e PREMIUMIZEARR_SKIP_CHOWN=true` to skip these changes entirely.
+
+The four-day download cleanup runs after the HTTP listener starts and before
+the transfer loop begins downloading. A stalled downloads mount can still pause
+that worker until the filesystem recovers, while the web UI remains available.
+Keep `/data` (configuration and logs) and the application files on responsive
+storage, since they are needed to start the daemon.
+
 > Note: The /data mount is where the `config.yaml` and log files are kept
 > You might need to run the docker command with UID GID 1000 on the host as well
 > If you absolutely can not use docker, scroll to the bottom of the README for unsupported Installation-Methods, they are automatically built and untested.

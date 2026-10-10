@@ -77,11 +77,15 @@ func (t *TransferManagerService) Init(pme *premiumizeme.Premiumizeme, arrsManage
 	t.premiumizemeClient = pme
 	t.arrsManager = arrsManager
 	t.config = config
-	t.CleanUpDownloadDirPeriod()
 }
 
+// StartupCleanupEntryMarker rides the startup cleanup entry line as a logrus
+// field so test tooling can stall the walk at that point without coupling to
+// the human-facing message prose.
+const StartupCleanupEntryMarker = "startup-cleanup-entry"
+
 func (t *TransferManagerService) CleanUpDownloadDirPeriod() {
-	log.Info("Cleaning download directory - deleting files older than 4 days")
+	log.WithField("marker", StartupCleanupEntryMarker).Info("Cleaning download directory - deleting files older than 4 days")
 
 	downloadBase, err := t.config.GetDownloadsBaseLocation()
 	if err != nil {
@@ -118,7 +122,11 @@ func (t *TransferManagerService) CleanUpDownloadDirPeriod() {
 
 	if err != nil {
 		log.Errorf("Error cleaning download directory: %s", err.Error())
+		return
 	}
+	// A walk stalled on an unresponsive mount never reaches this entry, so
+	// oncall can tell a stuck worker from a finished no-op cleanup.
+	log.Info("Startup download directory cleanup finished")
 }
 
 func (t *TransferManagerService) CleanUpDownloadDir() {
@@ -153,6 +161,10 @@ func (manager *TransferManagerService) ConfigUpdatedCallback(currentConfig confi
 }
 
 func (manager *TransferManagerService) Run(interval time.Duration) {
+	// Run starts after the HTTP listener. Keep cleanup in this worker, ahead
+	// of downloads: filesystem calls on an unavailable network mount cannot
+	// be cancelled, but they must not prevent the web UI from starting.
+	manager.CleanUpDownloadDirPeriod()
 	manager.downloadsFolderID = utils.GetDownloadsFolderIDFromPremiumizeme(manager.premiumizemeClient, manager.config.TransferDirectory)
 	for {
 		manager.runningTask = true
