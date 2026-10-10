@@ -5,9 +5,15 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# Never let this regression script change real ownership, even against the
-# original entrypoint which runs chown immediately when sourced.
+# Deliberate tripwire: any direct chown in this process must fail. The
+# fixture phases reach the PATH stub binary instead, because the ownership
+# work runs in a subprocess; xargs can only ever invoke that binary, never
+# this function.
+# shellcheck disable=SC2032
 chown() { echo "Unbounded chown must not run" >&2; exit 1; }
+# The sourced entrypoint is linted on its own; run shellcheck with -x to
+# follow this source (with -x, nothing below this line reports).
+# shellcheck disable=SC1091
 source "$root/docker/root/etc/cont-init.d/30-config"
 
 mount_entry() {
@@ -32,16 +38,47 @@ if has_network_mount /downloads "$tmp/mountinfo"; then fail "local storage treat
 
 # Stub the supervisor: assert every ownership command is bounded and that
 # failures do not abort initialization or prevent later directories being tried.
+# Invoked from the sourced 30-config as the command name `timeout`; shellcheck
+# sees the call only with -x.
+# shellcheck disable=SC2329
 timeout() { printf '%s\n' "$*" >> "$tmp/calls"; return "${timeout_result:-0}"; }
+# The default-target call strings are byte-exact only while all five defaults
+# are literal (non-symlink) host paths: canonical_target probes the real
+# filesystem, so a symlinked default records its canonical spelling and a
+# hardcoded as-given expectation goes red on the common big-disk pattern
+# (/downloads -> /media/hdd/downloads) for a diff between two spellings of
+# the same directory. Where any default is a symlink, compute the expected
+# spelling from the resolver under test instead of failing the gate; the
+# fixture phases below still run, so only these two phases lose
+# byte-exactness, never the whole script.
+DEFAULT_TARGETS=(/data /downloads /transfers /blackhole /opt)
+SYMLINKED_DEFAULTS=()
+for d in "${DEFAULT_TARGETS[@]}"; do
+    if [[ -L "$d" ]]; then SYMLINKED_DEFAULTS+=("$d"); fi
+done
+if [[ "${#SYMLINKED_DEFAULTS[@]}" -gt 0 ]]; then
+    echo "note: default target(s) ${SYMLINKED_DEFAULTS[*]} are symlinks on this host; the default-target pins below are computed via canonical_target"
+fi
 unset PREMIUMIZEARR_SKIP_CHOWN PUID PGID
 mount_entry /downloads cifs > "$tmp/mountinfo"
 mount_entry /blackhole nfs4 >> "$tmp/mountinfo"
+local_targets=()
+if [[ "${#SYMLINKED_DEFAULTS[@]}" -eq 0 ]]; then
+    local_targets=(/data /transfers /opt)
+else
+    for d in "${DEFAULT_TARGETS[@]}"; do
+        canon="$(canonical_target "$d")"
+        if ! has_network_mount "$canon" "$tmp/mountinfo"; then
+            local_targets+=("$canon")
+        fi
+    done
+fi
 : > "$tmp/calls"
 configure_permissions "$tmp/mountinfo" > "$tmp/output"
-printf '%s\n' \
-    '--kill-after=2s 10s chown -R -- 1000:1000 /data' \
-    '--kill-after=2s 10s chown -R -- 1000:1000 /transfers' \
-    '--kill-after=2s 10s chown -R -- 1000:1000 /opt' > "$tmp/expected"
+: > "$tmp/expected"
+for t in "${local_targets[@]}"; do
+    printf '%s\n' "--kill-after=2s 10s chown -R -- 1000:1000 $t" >> "$tmp/expected"
+done
 diff -u "$tmp/expected" "$tmp/calls"
 
 PUID=123
@@ -49,10 +86,16 @@ PGID=456
 timeout_result=124
 : > "$tmp/calls"
 configure_permissions "$tmp/mountinfo" > "$tmp/output"
-[[ "$(wc -l < "$tmp/calls")" -eq 3 ]] || fail "a timeout prevented later targets"
-grep -q -- 'chown -R -- 123:456 /data' "$tmp/calls" || fail "UID/GID not respected"
-grep -q 'failed or timed out' "$tmp/output" || fail "timeout was not logged"
+[[ "$(wc -l < "$tmp/calls")" -eq "${#local_targets[@]}" ]] || fail "a timeout prevented later targets"
+if [[ "${#local_targets[@]}" -gt 0 ]]; then
+    data_canon="$(canonical_target /data)"
+    grep -q -- "chown -R -- 123:456 $data_canon" "$tmp/calls" || fail "UID/GID not respected"
+    grep -q 'failed or timed out' "$tmp/output" || fail "timeout was not logged"
+fi
 
+# Read by the sourced 30-config, not by this script; shellcheck only sees
+# the cross-file use with -x.
+# shellcheck disable=SC2034
 PREMIUMIZEARR_SKIP_CHOWN=true
 : > "$tmp/calls"
 configure_permissions "$tmp/mountinfo" > "$tmp/output"
@@ -63,6 +106,56 @@ unset PREMIUMIZEARR_SKIP_CHOWN
 configure_permissions "$tmp/missing-mountinfo" > "$tmp/output" 2>&1
 [[ ! -s "$tmp/calls" ]] || fail "unknown mounts must not be traversed"
 grep -q 'Cannot read mount information' "$tmp/output" || fail "mount table error was not logged"
+
+# The canonical resolver: a symlink prefix keeps the components that follow
+# it, a parent symlink resolves against the link's location, a plain path
+# keeps its spelling, and a symlink cycle keeps the original spelling with a
+# distinct diagnostic instead of a cap-terminated in-cycle spelling.
+mkdir -p "$tmp/resolve/real" "$tmp/resolve/plain" "$tmp/resolve/pt/a" "$tmp/resolve/one" "$tmp/resolve/two"
+touch "$tmp/resolve/b" "$tmp/resolve/pt/b"
+ln -s real "$tmp/resolve/alias"
+ln -s a "$tmp/resolve/pt/lnk"
+ln -s one "$tmp/resolve/one/one"
+ln -s y "$tmp/resolve/two/x"
+ln -s x "$tmp/resolve/two/y"
+[[ "$(canonical_target "$tmp/resolve/alias/b/c")" == "$tmp/resolve/real/b/c" ]] \
+    || fail "symlink prefix resolution dropped the path suffix"
+[[ "$(canonical_target "$tmp/resolve/pt/lnk/../b")" == "$tmp/resolve/pt/b" ]] \
+    || fail "parent symlink did not resolve to the parent of the link location"
+[[ "$(canonical_target "$tmp/resolve/pt/a/../b")" == "$tmp/resolve/pt/b" ]] \
+    || fail "plain 'a/../b' spelling did not collapse"
+[[ "$(canonical_target "$tmp/resolve/plain/")" == "$tmp/resolve/plain" ]] \
+    || fail "trailing slash was not stripped"
+canonical_target "$tmp/resolve/one/one" > "$tmp/oneout" 2> "$tmp/oneerr"
+[[ "$(cat "$tmp/oneout")" == "$tmp/resolve/one/one" ]] \
+    || fail "1-cycle target must stay a fixed point and keep its spelling"
+if grep -q 'cycle' "$tmp/oneerr"; then
+    fail "1-cycle raised the cycle diagnostic"
+fi
+canonical_target "$tmp/resolve/two/x/z" > "$tmp/twout" 2> "$tmp/twoerr"
+[[ "$(cat "$tmp/twout")" == "$tmp/resolve/two/x/z" ]] \
+    || fail "2-cycle must keep the original spelling, got: $(cat "$tmp/twout")"
+grep -q 'Symlink cycle detected' "$tmp/twoerr" || fail "2-cycle did not raise the cycle diagnostic"
+
+# The flat chown must then target the original spelling, never an in-cycle
+# one: the diagnostic lands on stderr (not in the command-substituted
+# value) and the recorded ownership command stays inside the fixture tree.
+# Read by the sourced 30-config, not by this script; shellcheck only sees
+# the cross-file use with -x.
+# shellcheck disable=SC2034
+PUID=1000
+# shellcheck disable=SC2034
+PGID=1000
+timeout_result=0
+mount_entry "$tmp/resolve" ext4 > "$tmp/mountinfo"
+: > "$tmp/calls"
+configure_permissions "$tmp/mountinfo" "$tmp/resolve/two/x/z" > "$tmp/output" 2> "$tmp/cycerr"
+grep -q 'Symlink cycle detected' "$tmp/cycerr" || fail "configure_permissions lost the cycle diagnostic"
+grep -Fq -- "chown -R -- 1000:1000 $tmp/resolve/two/x/z" "$tmp/calls" \
+    || fail "cycle target must chown the original spelling"
+if grep -Fq "$tmp/resolve/two/y" "$tmp/calls"; then
+    fail "ownership command targeted an in-cycle spelling other than the original"
+fi
 
 # Exercise the real bounded worker against a scratch tree. Stub only chown so
 # the test can run without root and never change ownership outside the fixture.
@@ -77,7 +170,11 @@ STUB
 chmod +x "$tmp/bin/chown"
 export PATH="$tmp/bin:$PATH"
 export OWNERSHIP_CALLS="$tmp/ownership-calls"
+# Read by the sourced 30-config, not by this script; shellcheck only sees
+# the cross-file use with -x.
+# shellcheck disable=SC2034
 PUID=1000
+# shellcheck disable=SC2034
 PGID=1000
 timeout() { printf '%s\n' "$*" >> "$tmp/deadlines"; command timeout "$@"; }
 mount_entry "$tmp/local" ext4 > "$tmp/mountinfo"

@@ -1,19 +1,15 @@
 #!/usr/bin/with-contenv bash
+# shellcheck shell=bash
 
-# Read the kernel's mount table without stat-ing the potentially stalled mount.
-# By default include nested mounts; "covering" only checks the target itself
-# and its ancestors so local files around a nested mount can still be owned.
-has_network_mount() {
-    [[ -r "${2:-/proc/self/mountinfo}" ]] || return 2
-    # Pass target/scope through the environment, not awk -v: -v re-processes
-    # escape sequences in the value, so a target containing a literal
-    # backslash escape would decode differently from the mountinfo field it
-    # is compared against and never match.
-    TARGET="$1" SCOPE="${3:-any}" awk '
-        BEGIN {
-            target = ENVIRON["TARGET"]
-            scope = ENVIRON["SCOPE"]
-        }
+# Decode the mount table's mountpoint field (field 5) once and print every
+# decoded network mountpoint it contains. The decode plus fstype
+# classification lives here a single time: has_network_mount and
+# network_mounts_under both filter this stream with their own tail, so the
+# two consumers classify "network" identically by construction — a one-sided
+# fstype or decode edit can no longer make detection and the exclusion set
+# disagree about the same mount.
+network_mount_lines() {
+    awk '
         {
             mount = $5
             gsub(/\\040/, " ", mount)
@@ -26,61 +22,97 @@ has_network_mount() {
                     break
                 }
             }
-            if (type ~ /^(cifs|smb3|nfs|nfs4|9p|ceph|glusterfs|fuse.*)$/ &&
-                (mount == "/" || mount == target ||
-                 index(target, mount "/") == 1 ||
-                 (scope == "any" && index(mount, target "/") == 1))) {
-                found = 1
+            if (type ~ /^(cifs|smb3|nfs|nfs4|9p|ceph|glusterfs|fuse.*)$/) {
+                print mount
             }
         }
-        END { exit !found }
-    ' "${2:-/proc/self/mountinfo}"
+    ' "${1:-/proc/self/mountinfo}"
 }
 
-# Resolve a symlinked prefix of a path to its real spelling. Every prefix
-# is safe to readlink (an lstat of its parent directory, never of the
-# component itself, which may sit on a stale or network mount and is
-# never followed here). Relative links join to the parent directory.
-# The 40-pass cap terminates symlink cycles without stat'ing anything.
+# Read the kernel's mount table without stat-ing the potentially stalled mount.
+# By default include nested mounts; "covering" only checks the target itself
+# and its ancestors so local files around a nested mount can still be owned.
+has_network_mount() {
+    local mountinfo="${2:-/proc/self/mountinfo}"
+    [[ -r "$mountinfo" ]] || return 2
+    # Pass target/scope through the environment, not awk -v: -v re-processes
+    # escape sequences in the value, so a target containing a literal
+    # backslash escape would decode differently from the mountinfo field it
+    # is compared against and never match.
+    network_mount_lines "$mountinfo" |
+        TARGET="$1" SCOPE="${3:-any}" awk '
+            BEGIN {
+                target = ENVIRON["TARGET"]
+                scope = ENVIRON["SCOPE"]
+            }
+            {
+                if ($0 == "/" || $0 == target ||
+                    index(target, $0 "/") == 1 ||
+                    (scope == "any" && index($0, target "/") == 1)) {
+                    found = 1
+                }
+            }
+            END { exit !found }
+        '
+}
+
+# Resolve the first symlink prefix of a path, one link per pass: an
+# absolute link replaces the prefix, a relative link joins to its parent
+# directory, and the components after the link are preserved, so
+# "…/mid/a/b/c" with a -> real resolves to "…/mid/real/b/c" — dropping
+# the suffix would silently shorten the target. Every probe is an lstat
+# of the prefix (newfstatat, AT_SYMLINK_NOFOLLOW semantics): the component
+# is never followed or stat'ed through, so a prefix that sits on a stale
+# or network mount is never traversed; only its parent directory is read.
+# canonical_target repeats the pass until the spelling stops moving.
 resolve_symlink_prefix() {
-    local path="$1" prefix link parent pass absolute=0
-    for pass in {1..40}; do
-        absolute=0
-        [[ "$path" == /* ]] && absolute=1
-        IFS='/' read -ra parts <<< "$path"
-        prefix=""
-        local i
-        for ((i = 0; i < ${#parts[@]}; i++)); do
-            [[ -z "${parts[i]}" ]] && continue
-            if [[ -z "$prefix" ]]; then
-                if [[ "$absolute" -eq 1 ]]; then prefix="/${parts[i]}"; else prefix="${parts[i]}"; fi
-            else
-                prefix+="/${parts[i]}"
-            fi
-            if [[ -L "$prefix" ]]; then
-                link="$(readlink "$prefix" 2>/dev/null)"
-                if [[ -z "$link" ]]; then
-                    # Stale link: keep the spelling, let chown report it.
-                    break
-                fi
-                if [[ "$link" == /* ]]; then
-                    prefix="$link"
-                else
-                    parent="${prefix%/*}"
-                    [[ -z "$parent" || "$parent" == "$prefix" ]] && parent="/"
-                    prefix="$parent/$link"
-                fi
+    local path="$1" prefix link parent absolute=0
+    [[ "$path" == /* ]] && absolute=1
+    local -a parts=()
+    IFS='/' read -ra parts <<< "$path"
+    prefix=""
+    local i
+    for ((i = 0; i < ${#parts[@]}; i++)); do
+        [[ -z "${parts[i]}" ]] && continue
+        if [[ -z "$prefix" ]]; then
+            if [[ "$absolute" -eq 1 ]]; then prefix="/${parts[i]}"; else prefix="${parts[i]}"; fi
+        else
+            prefix+="/${parts[i]}"
+        fi
+        if [[ -L "$prefix" ]]; then
+            link="$(readlink "$prefix" 2>/dev/null)"
+            if [[ -z "$link" ]]; then
+                # Stale link: keep the spelling, let chown report it.
                 break
             fi
-        done
-        if [[ "$prefix" != "$path" ]]; then
-            path="$prefix"
-            [[ -z "$path" || "$path" == "." ]] && path="/"
-            continue
+            if [[ "$link" == /* ]]; then
+                prefix="$link"
+            else
+                parent="${prefix%/*}"
+                [[ -z "$parent" || "$parent" == "$prefix" ]] && parent="/"
+                prefix="$parent/$link"
+            fi
+            local j suffix=""
+            for ((j = i + 1; j < ${#parts[@]}; j++)); do
+                [[ -z "${parts[j]}" ]] && continue
+                if [[ -z "$suffix" ]]; then
+                    suffix="${parts[j]}"
+                else
+                    suffix+="/${parts[j]}"
+                fi
+            done
+            # Preserve everything after the link (see above).
+            [[ -n "$suffix" ]] && prefix+="/$suffix"
+            break
         fi
-        break
     done
-    printf '%s' "$path"
+    if [[ -z "$prefix" ]]; then
+        # No link in the prefix chain: the spelling is already canonical.
+        printf '%s' "$path"
+        return
+    fi
+    [[ "$prefix" == "." ]] && prefix="/"
+    printf '%s' "$prefix"
 }
 
 # String-only path spelling normalisation: drop trailing slashes (keep the
@@ -111,48 +143,58 @@ collapse_path_dots() {
 # Normalise a target's spelling before mount-table matching: strip trailing
 # slashes and resolve any symlink component, so "alias -> real" or "real/"
 # matches the same mount-table entries as "real" and takes the same branch.
-# readlink never follows the link, so a target whose final component sits
-# on the probed mount is safe to test; the cap stops symlink cycles.
+# Each pass resolves at most one link and re-normalises dots, which keeps
+# relative readlink targets (and the "x/.." spellings they produce) in
+# canonical form; the lstat-only probes never follow a component. When the
+# spelling still moves after the 40-pass cap — the kernel's own
+# symlink-resolution bound — the prefix chain cycles (x -> y -> x, ...) and
+# the original spelling is kept with a distinct diagnostic instead of
+# acting on a cap-terminated in-cycle spelling, which may not exist.
 canonical_target() {
-    local target="$1" pass canon
+    local target="$1" pass canon prev original
     while [[ "$target" == */ && "$target" != "/" ]]; do
         target="${target%/}"
     done
+    original="$target"
+    prev=""
+    # Bounded iteration idiom: the counter only caps the passes.
+    # shellcheck disable=SC2034
     for pass in {1..40}; do
         canon="$(resolve_symlink_prefix "$target")"
         canon="$(collapse_path_dots "$canon")"
         if [[ "$canon" == "$target" ]]; then
             break
         fi
+        if [[ -n "$prev" && "$canon" == "$prev" ]]; then
+            # Two spellings keep alternating: a two-link cycle.
+            break
+        fi
+        prev="$target"
         target="$canon"
     done
+    if [[ "$canon" != "$target" ]]; then
+        # The loop left a moving spelling: a two-link cycle caught above, or
+        # a longer cycle / link chain that ran out of passes. Keep the
+        # original spelling; the diagnostic goes to stderr so it never
+        # lands in the command-substituted value.
+        echo "[cont-init.d] Symlink cycle detected for $original; using the original spelling" >&2
+        target="$original"
+    fi
     printf '%s' "$target"
 }
 
 # Print every decoded network mountpoint strictly under directory, from one
-# awk pass over the mount table. The ownership pass skips and batches
+# pass over the mount table. The ownership pass skips and batches
 # against this precomputed set instead of re-reading the table per entry.
+# The decode+classify work is shared with has_network_mount via
+# network_mount_lines; only the strictly-below filter is local.
 network_mounts_under() {
-    TARGET="$1" awk '
-        BEGIN { target = ENVIRON["TARGET"] }
-        {
-            mount = $5
-            gsub(/\\040/, " ", mount)
-            gsub(/\\011/, "\t", mount)
-            gsub(/\\012/, "\n", mount)
-            gsub(/\\134/, "\\", mount)
-            for (i = 7; i <= NF; i++) {
-                if ($i == "-") {
-                    type = $(i + 1)
-                    break
-                }
-            }
-            if (type ~ /^(cifs|smb3|nfs|nfs4|9p|ceph|glusterfs|fuse.*)$/ &&
-                index(mount, target "/") == 1) {
-                print mount
-            }
-        }
-    ' "${2:-/proc/self/mountinfo}"
+    local target="$1"
+    network_mount_lines "${2:-/proc/self/mountinfo}" |
+        TARGET="$target" awk '
+            BEGIN { target = ENVIRON["TARGET"] }
+            { if (index($0, target "/") == 1) print }
+        '
 }
 
 # Only invoked in a subprocess under the per-target timeout. Cost is one
@@ -286,6 +328,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             fi
         fi
     else
-        configure_permissions
+        # Forward caller arguments (mountinfo, then targets) instead of
+        # silently dropping them in favour of the built-in defaults.
+        configure_permissions "$@"
     fi
 fi

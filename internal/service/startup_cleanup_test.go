@@ -54,6 +54,14 @@ func TestCleanUpDownloadDirPeriodLogsCompletion(t *testing.T) {
 	})
 
 	dir := t.TempDir()
+	old := filepath.Join(dir, "old.mkv")
+	if err := os.WriteFile(old, []byte("media"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	modified := time.Now().AddDate(0, 0, -5)
+	if err := os.Chtimes(old, modified, modified); err != nil {
+		t.Fatal(err)
+	}
 	manager := TransferManagerService{}.New()
 	manager.Init(nil, nil, &config.Config{DownloadsDirectory: dir})
 	manager.CleanUpDownloadDirPeriod()
@@ -67,7 +75,16 @@ func TestCleanUpDownloadDirPeriodLogsCompletion(t *testing.T) {
 	if !strings.Contains(out, entry) {
 		t.Fatalf("entry log missing:\n%s", out)
 	}
-	if !strings.Contains(out, done) {
+	doneIdx := strings.Index(out, done)
+	if doneIdx < 0 {
 		t.Fatalf("fast cleanup emitted no completion entry; a stalled walk is indistinguishable from it:\n%s", out)
+	}
+	// Pin the position, not just the presence: the completion line must come
+	// after every walk line, so a mutation that moves it in front of a
+	// stalled "Deleting …" entry is caught. LastIndex is -1 when no file
+	// was deleted, in which case any position is after the walk output.
+	lastDeleting := strings.LastIndex(out, "Deleting ")
+	if doneIdx <= lastDeleting {
+		t.Fatalf("completion line at offset %d does not come AFTER the walk output (last Deleting at %d):\n%s", doneIdx, lastDeleting, out)
 	}
 }
