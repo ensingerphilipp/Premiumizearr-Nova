@@ -61,9 +61,9 @@ has_network_mount() {
 # directory, and the components after the link are preserved, so
 # "…/mid/a/b/c" with a -> real resolves to "…/mid/real/b/c" — dropping
 # the suffix would silently shorten the target. Every probe is an lstat
-# of the prefix (newfstatat, AT_SYMLINK_NOFOLLOW semantics): the component
-# is never followed or stat'ed through, so a prefix that sits on a stale
-# or network mount is never traversed; only its parent directory is read.
+# of the prefix (newfstatat, AT_SYMLINK_NOFOLLOW semantics). Even without
+# following a symlink, lstat or readlink can block on a stalled filesystem,
+# so the entire resolver runs inside the per-target ownership timeout.
 # canonical_target repeats the pass until the spelling stops moving.
 resolve_symlink_prefix() {
     local path="$1" prefix link parent absolute=0
@@ -249,13 +249,68 @@ own_local_tree() {
     return "$failed"
 }
 
+configure_target_ownership() {
+    local directory="$1" owner="$2"
+    local mountinfo="${3:-/proc/self/mountinfo}"
+    local mount_status
+    local nested=false
+
+    # Check the literal spelling first, without touching the target. A known
+    # network mount needs no symlink probes, which can themselves stall.
+    if has_network_mount "$directory" "$mountinfo" covering; then
+        echo "[cont-init.d] Skipping ownership changes for network mount $directory; configure UID/GID on the host"
+        return 0
+    else
+        mount_status=$?
+    fi
+    if [[ "$mount_status" -ne 1 ]]; then
+        echo "[cont-init.d] Cannot read mount information; skipping ownership changes for $directory"
+        return 0
+    fi
+
+    # Aliases and trailing slashes must still use the canonical spelling for
+    # detection and traversal. All metadata lookups here share the deadline
+    # with enumeration and chown, including targets not found in mountinfo.
+    directory="$(canonical_target "$directory")"
+    if has_network_mount "$directory" "$mountinfo"; then
+        mount_status=0
+    else
+        mount_status=$?
+    fi
+    if [[ "$mount_status" -eq 0 ]]; then
+        if has_network_mount "$directory" "$mountinfo" covering; then
+            echo "[cont-init.d] Skipping ownership changes for network mount $directory; configure UID/GID on the host"
+            return 0
+        else
+            mount_status=$?
+        fi
+        if [[ "$mount_status" -ne 1 ]]; then
+            echo "[cont-init.d] Cannot read mount information; skipping ownership changes for $directory"
+            return 0
+        fi
+        nested=true
+    elif [[ "$mount_status" -ne 1 ]]; then
+        echo "[cont-init.d] Cannot read mount information; skipping ownership changes for $directory"
+        return 0
+    fi
+
+    echo "[cont-init.d] Setting ownership of $directory to $owner"
+    if [[ "$nested" == true ]]; then
+        shopt -s dotglob nullglob
+        # Byte-wise glob order keeps the batched chown operand order stable.
+        export LC_ALL=C
+        mapfile -t NETWORK_MOUNTS < <(network_mounts_under "$directory" "$mountinfo")
+        own_local_tree "$directory" "$owner"
+    else
+        chown -R -- "$owner" "$directory"
+    fi
+}
+
 configure_permissions() {
     local directory
-    local mount_status
     local mountinfo="${1:-/proc/self/mountinfo}"
     local owner="${PUID:-1000}:${PGID:-1000}"
     local script="${BASH_SOURCE[0]}"
-    local nested
 
     if [[ "$#" -gt 0 ]]; then shift; fi
     if [[ "$#" -eq 0 ]]; then set -- /data /downloads /transfers /blackhole /opt; fi
@@ -266,44 +321,11 @@ configure_permissions() {
     fi
 
     for directory in "$@"; do
-        # Normalise the spelling before any mount-table matching so a
-        # symlinked target or trailing slash takes the same branch as its
-        # canonical form; both the detection below and the chown/subprocess
-        # arguments then use the canonical value.
-        directory="$(canonical_target "$directory")"
-        nested=false
-        if has_network_mount "$directory" "$mountinfo"; then
-            mount_status=0
-        else
-            mount_status=$?
-        fi
-        if [[ "$mount_status" -eq 0 ]]; then
-            if has_network_mount "$directory" "$mountinfo" covering; then
-                echo "[cont-init.d] Skipping ownership changes for network mount $directory; configure UID/GID on the host"
-                continue
-            else
-                mount_status=$?
-            fi
-            if [[ "$mount_status" -ne 1 ]]; then
-                echo "[cont-init.d] Cannot read mount information; skipping ownership changes for $directory"
-                continue
-            fi
-            nested=true
-        elif [[ "$mount_status" -ne 1 ]]; then
-            echo "[cont-init.d] Cannot read mount information; skipping ownership changes for $directory"
-            continue
-        fi
-
-        echo "[cont-init.d] Setting ownership of $directory to $owner"
         # coreutils timeout is installed in the image. The kill deadline also
-        # terminates the supervisor if chown is stuck in uninterruptible I/O.
-        if [[ "$nested" == true ]]; then
-            # Bound enumeration and all ownership work with one deadline, even
-            # when there are many local siblings or deeply nested mounts.
-            if ! timeout --kill-after=2s 10s bash "$script" --local-ownership "$directory" "$owner" "$mountinfo"; then
-                echo "[cont-init.d] Ownership change failed or timed out for $directory; continuing startup (check host permissions)"
-            fi
-        elif ! timeout --kill-after=2s 10s chown -R -- "$owner" "$directory"; then
+        # terminates the supervisor if a child is stuck in uninterruptible I/O.
+        # Start supervision before any filesystem probes, including mount
+        # checks and path resolution, and share one deadline for the target.
+        if ! timeout --kill-after=2s 10s bash "$script" --ownership "$directory" "$owner" "$mountinfo"; then
             echo "[cont-init.d] Ownership change failed or timed out for $directory; continuing startup (check host permissions)"
         fi
     done
@@ -311,22 +333,8 @@ configure_permissions() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    if [[ "${1:-}" == --local-ownership ]]; then
-        shopt -s dotglob nullglob
-        # Byte-wise glob order keeps the batched chown operand order stable.
-        export LC_ALL=C
-        # One awk pass over the mount table precomputes the network
-        # mountpoints below the target, so the ownership pass skips and
-        # batches against a string set instead of probing per entry.
-        if has_network_mount "$2" "${4:-/proc/self/mountinfo}" covering; then
-            echo "[cont-init.d] Skipping ownership changes for network mount $2; configure UID/GID on the host"
-        else
-            mount_status=$?
-            if [[ "$mount_status" -eq 1 ]]; then
-                mapfile -t NETWORK_MOUNTS < <(network_mounts_under "$2" "${4:-/proc/self/mountinfo}")
-                own_local_tree "$2" "$3"
-            fi
-        fi
+    if [[ "${1:-}" == --ownership ]]; then
+        configure_target_ownership "$2" "$3" "${4:-/proc/self/mountinfo}"
     else
         # Forward caller arguments (mountinfo, then targets) instead of
         # silently dropping them in favour of the built-in defaults.

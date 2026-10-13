@@ -73,10 +73,10 @@ so the container's `PUID`/`PGID` can read and write the mounted folders. Contain
 startup skips ownership changes on detected network mounts. When a network mount
 is nested inside a local directory, startup still sets ownership of the local
 directory and its local contents while excluding the network subtree. Ownership
-work has a 10-second timeout for each target directory (including any selective
-traversal), followed by a 2-second forced-stop deadline; a
-failure is logged and startup continues. To manage all ownership on the host,
-add `-e PREMIUMIZEARR_SKIP_CHOWN=true` to skip these changes entirely.
+work has a 10-second timeout for each target directory (including path resolution,
+mount checks, and any selective traversal), followed by a 2-second forced-stop
+deadline; a failure is logged and startup continues. To manage all ownership on
+the host, add `-e PREMIUMIZEARR_SKIP_CHOWN=true` to skip these changes entirely.
 
 The four-day download cleanup runs after the HTTP listener starts and before
 the transfer loop begins downloading. A stalled downloads mount can still pause

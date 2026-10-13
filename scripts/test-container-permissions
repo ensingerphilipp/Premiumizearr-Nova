@@ -42,42 +42,17 @@ if has_network_mount /downloads "$tmp/mountinfo"; then fail "local storage treat
 # sees the call only with -x.
 # shellcheck disable=SC2329
 timeout() { printf '%s\n' "$*" >> "$tmp/calls"; return "${timeout_result:-0}"; }
-# The default-target call strings are byte-exact only while all five defaults
-# are literal (non-symlink) host paths: canonical_target probes the real
-# filesystem, so a symlinked default records its canonical spelling and a
-# hardcoded as-given expectation goes red on the common big-disk pattern
-# (/downloads -> /media/hdd/downloads) for a diff between two spellings of
-# the same directory. Where any default is a symlink, compute the expected
-# spelling from the resolver under test instead of failing the gate; the
-# fixture phases below still run, so only these two phases lose
-# byte-exactness, never the whole script.
+# Dispatch every target using its original spelling. Resolution and mount
+# classification belong to the supervised worker, including symlinked defaults.
 DEFAULT_TARGETS=(/data /downloads /transfers /blackhole /opt)
-SYMLINKED_DEFAULTS=()
-for d in "${DEFAULT_TARGETS[@]}"; do
-    if [[ -L "$d" ]]; then SYMLINKED_DEFAULTS+=("$d"); fi
-done
-if [[ "${#SYMLINKED_DEFAULTS[@]}" -gt 0 ]]; then
-    echo "note: default target(s) ${SYMLINKED_DEFAULTS[*]} are symlinks on this host; the default-target pins below are computed via canonical_target"
-fi
 unset PREMIUMIZEARR_SKIP_CHOWN PUID PGID
 mount_entry /downloads cifs > "$tmp/mountinfo"
 mount_entry /blackhole nfs4 >> "$tmp/mountinfo"
-local_targets=()
-if [[ "${#SYMLINKED_DEFAULTS[@]}" -eq 0 ]]; then
-    local_targets=(/data /transfers /opt)
-else
-    for d in "${DEFAULT_TARGETS[@]}"; do
-        canon="$(canonical_target "$d")"
-        if ! has_network_mount "$canon" "$tmp/mountinfo"; then
-            local_targets+=("$canon")
-        fi
-    done
-fi
 : > "$tmp/calls"
 configure_permissions "$tmp/mountinfo" > "$tmp/output"
 : > "$tmp/expected"
-for t in "${local_targets[@]}"; do
-    printf '%s\n' "--kill-after=2s 10s chown -R -- 1000:1000 $t" >> "$tmp/expected"
+for t in "${DEFAULT_TARGETS[@]}"; do
+    printf '%s\n' "--kill-after=2s 10s bash $root/docker/root/etc/cont-init.d/30-config --ownership $t 1000:1000 $tmp/mountinfo" >> "$tmp/expected"
 done
 diff -u "$tmp/expected" "$tmp/calls"
 
@@ -86,12 +61,9 @@ PGID=456
 timeout_result=124
 : > "$tmp/calls"
 configure_permissions "$tmp/mountinfo" > "$tmp/output"
-[[ "$(wc -l < "$tmp/calls")" -eq "${#local_targets[@]}" ]] || fail "a timeout prevented later targets"
-if [[ "${#local_targets[@]}" -gt 0 ]]; then
-    data_canon="$(canonical_target /data)"
-    grep -q -- "chown -R -- 123:456 $data_canon" "$tmp/calls" || fail "UID/GID not respected"
-    grep -q 'failed or timed out' "$tmp/output" || fail "timeout was not logged"
-fi
+[[ "$(wc -l < "$tmp/calls")" -eq "${#DEFAULT_TARGETS[@]}" ]] || fail "a timeout prevented later targets"
+grep -q -- '--ownership /data 123:456' "$tmp/calls" || fail "UID/GID not respected"
+grep -q 'failed or timed out' "$tmp/output" || fail "timeout was not logged"
 
 # Read by the sourced 30-config, not by this script; shellcheck only sees
 # the cross-file use with -x.
@@ -102,10 +74,6 @@ configure_permissions "$tmp/mountinfo" > "$tmp/output"
 [[ ! -s "$tmp/calls" ]] || fail "explicit opt-out still changed ownership"
 
 unset PREMIUMIZEARR_SKIP_CHOWN
-: > "$tmp/calls"
-configure_permissions "$tmp/missing-mountinfo" > "$tmp/output" 2>&1
-[[ ! -s "$tmp/calls" ]] || fail "unknown mounts must not be traversed"
-grep -q 'Cannot read mount information' "$tmp/output" || fail "mount table error was not logged"
 
 # The canonical resolver: a symlink prefix keeps the components that follow
 # it, a parent symlink resolves against the link's location, a plain path
@@ -137,26 +105,6 @@ canonical_target "$tmp/resolve/two/x/z" > "$tmp/twout" 2> "$tmp/twoerr"
     || fail "2-cycle must keep the original spelling, got: $(cat "$tmp/twout")"
 grep -q 'Symlink cycle detected' "$tmp/twoerr" || fail "2-cycle did not raise the cycle diagnostic"
 
-# The flat chown must then target the original spelling, never an in-cycle
-# one: the diagnostic lands on stderr (not in the command-substituted
-# value) and the recorded ownership command stays inside the fixture tree.
-# Read by the sourced 30-config, not by this script; shellcheck only sees
-# the cross-file use with -x.
-# shellcheck disable=SC2034
-PUID=1000
-# shellcheck disable=SC2034
-PGID=1000
-timeout_result=0
-mount_entry "$tmp/resolve" ext4 > "$tmp/mountinfo"
-: > "$tmp/calls"
-configure_permissions "$tmp/mountinfo" "$tmp/resolve/two/x/z" > "$tmp/output" 2> "$tmp/cycerr"
-grep -q 'Symlink cycle detected' "$tmp/cycerr" || fail "configure_permissions lost the cycle diagnostic"
-grep -Fq -- "chown -R -- 1000:1000 $tmp/resolve/two/x/z" "$tmp/calls" \
-    || fail "cycle target must chown the original spelling"
-if grep -Fq "$tmp/resolve/two/y" "$tmp/calls"; then
-    fail "ownership command targeted an in-cycle spelling other than the original"
-fi
-
 # Exercise the real bounded worker against a scratch tree. Stub only chown so
 # the test can run without root and never change ownership outside the fixture.
 mkdir -p "$tmp/bin" "$tmp/local/branch/nested" "$tmp/local/network"
@@ -177,6 +125,26 @@ PUID=1000
 # shellcheck disable=SC2034
 PGID=1000
 timeout() { printf '%s\n' "$*" >> "$tmp/deadlines"; command timeout "$@"; }
+
+# Missing mount information must skip ownership without probing the target.
+: > "$OWNERSHIP_CALLS"
+configure_permissions "$tmp/missing-mountinfo" "$tmp/local" > "$tmp/output" 2>&1
+[[ ! -s "$OWNERSHIP_CALLS" ]] || fail "unknown mounts must not be traversed"
+grep -q 'Cannot read mount information' "$tmp/output" || fail "mount table error was not logged"
+
+# The flat chown must target the original spelling, never an in-cycle one:
+# the supervised resolver keeps its diagnostic on stderr and ownership stays
+# inside the fixture tree.
+mount_entry "$tmp/resolve" ext4 > "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+configure_permissions "$tmp/mountinfo" "$tmp/resolve/two/x/z" > "$tmp/output" 2> "$tmp/cycerr"
+grep -q 'Symlink cycle detected' "$tmp/cycerr" || fail "configure_permissions lost the cycle diagnostic"
+grep -Fxq -- "-R -- 1000:1000 $tmp/resolve/two/x/z" "$OWNERSHIP_CALLS" \
+    || fail "cycle target must chown the original spelling"
+if grep -Fq "$tmp/resolve/two/y" "$OWNERSHIP_CALLS"; then
+    fail "ownership command targeted an in-cycle spelling other than the original"
+fi
+
 mount_entry "$tmp/local" ext4 > "$tmp/mountinfo"
 mount_entry "$tmp/local/network" cifs >> "$tmp/mountinfo"
 mount_entry "$tmp/local/branch/nested" nfs4 >> "$tmp/mountinfo"
@@ -199,7 +167,8 @@ mount_entry "$tmp/local" cifs > "$tmp/mountinfo"
 : > "$OWNERSHIP_CALLS"
 : > "$tmp/deadlines"
 configure_permissions "$tmp/mountinfo" "$tmp/local" > "$tmp/output"
-[[ ! -s "$OWNERSHIP_CALLS" && ! -s "$tmp/deadlines" ]] || fail "covered target must stay untouched"
+[[ ! -s "$OWNERSHIP_CALLS" ]] || fail "covered target must stay untouched"
+[[ "$(wc -l < "$tmp/deadlines")" -eq 1 ]] || fail "network detection must share the ownership deadline"
 
 # Ownership errors in a selective pass are logged without failing container init.
 mount_entry "$tmp/local/network" cifs > "$tmp/mountinfo"
@@ -229,5 +198,55 @@ if grep -Fq "$tmp/local/network" "$OWNERSHIP_CALLS" || grep -Fq "$tmp/local/bran
     fail "normalised target pass touched a network subtree"
 fi
 [[ "$(wc -l < "$tmp/deadlines")" -eq 3 ]] || fail "each normalised target must get its own bounded selective pass"
+
+# Aliases of a covering network mount must also be skipped after resolution.
+mount_entry "$tmp/local" cifs > "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+configure_permissions "$tmp/mountinfo" "$tmp/alias" "$tmp/twin" "$tmp/local/" > "$tmp/output"
+[[ ! -s "$OWNERSHIP_CALLS" ]] || fail "alias of a covering network mount was chowned"
+[[ "$(grep -c 'Skipping ownership changes for network mount' "$tmp/output")" -eq 3 ]] || fail "network aliases were not skipped"
+
+# A stalled metadata operation during canonicalisation must share the ownership
+# deadline. Delay readlink on a real symlink, ignore TERM to exercise the forced
+# stop, and check that initialization still handles the following local target.
+mkdir -p "$tmp/after-stall"
+ln -s local "$tmp/stalled-alias"
+REAL_READLINK="$(command -v readlink)"
+export REAL_READLINK
+export BLOCKED_SYMLINK="$tmp/stalled-alias"
+export METADATA_BLOCK_MARKER="$tmp/metadata-blocked"
+cat > "$tmp/bin/readlink" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "$BLOCKED_SYMLINK" ]]; then
+    echo blocked > "$METADATA_BLOCK_MARKER"
+    trap '' TERM
+    sleep 30
+    exit 1
+fi
+exec "$REAL_READLINK" "$@"
+STUB
+chmod +x "$tmp/bin/readlink"
+: > "$OWNERSHIP_CALLS"
+# Shorten the production deadlines only in this test, retaining a separate
+# watchdog so the old, unbounded canonicalisation fails promptly as well.
+cat > "$tmp/stalled-check" <<'CHECK'
+source "$1"
+timeout() {
+    [[ "$1" == --kill-after=2s && "$2" == 10s ]] || exit 1
+    shift 2
+    command timeout --kill-after=0.2s 1s "$@"
+}
+configure_permissions "$2" "$3" "$4"
+CHECK
+if ! command timeout --kill-after=1s 4s bash "$tmp/stalled-check" "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" "$tmp/stalled-alias" "$tmp/after-stall" > "$tmp/stalled-output" 2>&1; then
+    cat "$tmp/stalled-output" >&2
+    fail "stalled path resolution prevented initialization from continuing"
+fi
+[[ -s "$METADATA_BLOCK_MARKER" ]] || fail "stalled metadata fixture was not reached"
+grep -q 'failed or timed out' "$tmp/stalled-output" || fail "stalled path resolution was not logged"
+grep -Fxq -- "-R -- 1000:1000 $tmp/after-stall" "$OWNERSHIP_CALLS" || fail "stalled path resolution skipped the next local target"
+if grep -Fq "$tmp/stalled-alias" "$OWNERSHIP_CALLS"; then
+    fail "stalled target reached chown"
+fi
 
 echo "Container permission regressions passed"
