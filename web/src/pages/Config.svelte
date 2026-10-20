@@ -32,6 +32,7 @@
     BindPort: "",
     WebRoot: "",
     SimultaneousDownloads: 0,
+    MaxActivePremiumizeTransfers: 20,
     DownloadSpeedLimit: 100,
     EnableTlsCheck: false,
     TransferOnlyMode: false,
@@ -50,6 +51,7 @@
     ["ArrHistoryUpdateIntervalSeconds", "Arr Update History Interval (seconds)"],
     ["PollBlackholeIntervalMinutes", "Poll Blackhole Interval Minutes"],
     ["SimultaneousDownloads", "Simultaneous Downloads"],
+    ["MaxActivePremiumizeTransfers", "Maximum Active Premiumize Transfers"],
     ["DownloadSpeedLimit", "SpeedLimit per Download in Megabytes / s"],
   ];
 
@@ -386,6 +388,14 @@
           disabled={inputDisabled}
           bind:toggled={config.EnableTlsCheck}
           labelText="Check TLS-Certificate at Download (enabling can break certain CDNs)"
+        />
+        <TextInput
+          type="number"
+          min={1}
+          disabled={inputDisabled}
+          labelText="Maximum Active Premiumize Transfers"
+          helperText="Default 20 leaves five slots for manually added transfers when your Premiumize limit is 25."
+          bind:value={config.MaxActivePremiumizeTransfers}
         />
         <TextInput
           type="number"

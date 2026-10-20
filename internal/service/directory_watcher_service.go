@@ -1,10 +1,12 @@
 package service
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,15 +19,17 @@ import (
 )
 
 type DirectoryWatcherService struct {
-	mu                 sync.RWMutex
-	premiumizemeClient *premiumizeme.Premiumizeme
-	config             *config.Config
-	Queue              *stringqueue.StringQueue
-	status             string
-	quotaBlocked       bool
-	quotaCheckFailed   bool
-	downloadsFolderID  string
-	watchDirectory     *directory_watcher.WatchDirectory
+	mu                             sync.RWMutex
+	premiumizemeClient             *premiumizeme.Premiumizeme
+	config                         *config.Config
+	Queue                          *stringqueue.StringQueue
+	status                         string
+	quotaBlocked                   bool
+	quotaCheckFailed               bool
+	activeTransferLimitBlocked     bool
+	activeTransferCountCheckFailed bool
+	downloadsFolderID              string
+	watchDirectory                 *directory_watcher.WatchDirectory
 }
 
 const (
@@ -181,17 +185,40 @@ func (dw *DirectoryWatcherService) processUploads() {
 	}
 }
 
-// processUploadCycle checks the account once and processes the files that were
-// queued at the start of the cycle. Files added during processing wait for the
-// next cycle and its fresh quota check.
+// processUploadCycle checks the account and Premiumize's active transfer count
+// before each blackhole submission. Successfully submitted transfers are also
+// reserved locally so a delayed transfer/list response cannot overfill the cap.
 func (dw *DirectoryWatcherService) processUploadCycle() int {
 	queuedFiles := dw.Queue.Len()
 	if queuedFiles == 0 || !dw.submissionsAllowed() {
 		return 0
 	}
 
+	maxActiveTransfers := dw.config.MaxActivePremiumizeTransfers
+	reservedActiveTransfers := -1
 	processed := 0
 	for range queuedFiles {
+		if processed > 0 {
+			time.Sleep(2 * time.Second)
+		}
+
+		activeTransfers := 0
+		if maxActiveTransfers > 0 {
+			var err error
+			activeTransfers, err = dw.activePremiumizeTransferCount()
+			if err != nil {
+				dw.pauseForTransferCountError(err)
+				return processed
+			}
+			if reservedActiveTransfers > activeTransfers {
+				activeTransfers = reservedActiveTransfers
+			}
+			dw.updateActiveTransferLimitStatus(activeTransfers, maxActiveTransfers)
+			if activeTransfers >= maxActiveTransfers {
+				return processed
+			}
+		}
+
 		isQueueFile, filePath := dw.Queue.PopTopOfQueue()
 		if !isQueueFile {
 			break
@@ -201,20 +228,73 @@ func (dw *DirectoryWatcherService) processUploadCycle() int {
 			continue
 		}
 
-		if processed > 0 {
-			time.Sleep(2 * time.Second)
-		}
 		processed++
-		if dw.processUpload(filePath) {
-			// The account check and transfer submission are separate requests, so
-			// the limit can be reached between them. Put the file back in the
-			// queue and stop this batch so watcher mode retries it after backoff.
+		retry, submitted := dw.processUpload(filePath)
+		if retry {
+			// Premiumize may reach its own limit between the list check and the
+			// submission. Keep the source queued and retry after the next poll.
 			dw.Queue.Add(filePath)
 			return 0
+		}
+		if submitted {
+			reservedActiveTransfers = activeTransfers + 1
 		}
 	}
 
 	return processed
+}
+
+func (dw *DirectoryWatcherService) activePremiumizeTransferCount() (int, error) {
+	transfers, err := dw.premiumizemeClient.GetTransfers()
+	if err != nil {
+		return 0, err
+	}
+
+	active := 0
+	for _, transfer := range transfers {
+		switch strings.ToLower(strings.TrimSpace(transfer.Status)) {
+		case "queued", "running":
+			active++
+		}
+	}
+	return active, nil
+}
+
+func (dw *DirectoryWatcherService) pauseForTransferCountError(err error) {
+	dw.mu.Lock()
+	alreadyFailed := dw.activeTransferCountCheckFailed
+	dw.activeTransferCountCheckFailed = true
+	dw.activeTransferLimitBlocked = false
+	dw.status = "Paused: Premiumize active transfer count unavailable"
+	dw.mu.Unlock()
+
+	if !alreadyFailed {
+		log.Warnf("Could not check active Premiumize transfers; blackhole submissions are paused: %s", err)
+	}
+}
+
+func (dw *DirectoryWatcherService) updateActiveTransferLimitStatus(active, limit int) {
+	dw.mu.Lock()
+	wasBlocked := dw.activeTransferLimitBlocked
+	checkRecovered := dw.activeTransferCountCheckFailed
+	dw.activeTransferCountCheckFailed = false
+	blocked := active >= limit
+	dw.activeTransferLimitBlocked = blocked
+	if blocked {
+		dw.status = fmt.Sprintf("Paused: %d active Premiumize transfers (limit %d)", active, limit)
+	} else {
+		dw.status = "Okay"
+	}
+	dw.mu.Unlock()
+
+	if checkRecovered {
+		log.Info("Premiumize active transfer count is available again; resuming transfer checks")
+	}
+	if blocked && !wasBlocked {
+		log.Warnf("Premiumize has %d active transfers; pausing blackhole submissions at configured limit %d", active, limit)
+	} else if !blocked && wasBlocked {
+		log.Info("Premiumize active transfer count is below the configured limit; resuming blackhole submissions")
+	}
 }
 
 func (dw *DirectoryWatcherService) submissionsAllowed() bool {
@@ -254,8 +334,8 @@ func (dw *DirectoryWatcherService) submissionsAllowed() bool {
 	return !exhausted
 }
 
-// processUpload returns true when the source should be queued for a later retry.
-func (dw *DirectoryWatcherService) processUpload(filePath string) bool {
+// processUpload returns whether the source needs a retry and whether a new transfer was submitted.
+func (dw *DirectoryWatcherService) processUpload(filePath string) (retry, submitted bool) {
 	log.Debugf("Processing %s", filePath)
 	dw.mu.RLock()
 	folderID := dw.downloadsFolderID
@@ -269,7 +349,7 @@ func (dw *DirectoryWatcherService) processUpload(filePath string) bool {
 			dw.status = "Limit of transfers reached!"
 			dw.mu.Unlock()
 			log.Trace("Transfer limit reached; the source file remains in the blackhole directory")
-			return true
+			return true, false
 		case ERROR_ALREADY_UPLOADED:
 			log.Trace("File already uploaded, removing from disk")
 			if err := os.Remove(filePath); err != nil {
@@ -278,7 +358,7 @@ func (dw *DirectoryWatcherService) processUpload(filePath string) bool {
 		default:
 			log.Errorf("Error creating transfer: %s", err)
 		}
-		return false
+		return false, false
 	}
 
 	dw.mu.Lock()
@@ -286,10 +366,10 @@ func (dw *DirectoryWatcherService) processUpload(filePath string) bool {
 	dw.mu.Unlock()
 	if err := os.Remove(filePath); err != nil {
 		log.Errorf("Could not delete %s: %+v", filePath, err)
-		return false
+		return false, true
 	}
 	log.Infof("Removed %s from blackhole queue. Queue size: %d", filePath, dw.Queue.Len())
-	return false
+	return false, true
 }
 
 func (dw *DirectoryWatcherService) setTransferDirectory(newDir string) {
