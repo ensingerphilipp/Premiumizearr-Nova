@@ -74,8 +74,9 @@ func numericConfigFieldFor(key string) (string, bool) {
 // validateConfigPayload rejects a top-level JSON null payload, an incomplete
 // payload for required config fields (missing fields would be silently zeroed
 // by whole-struct replace), and explicit JSON null for numeric fields.
-// MaxActivePremiumizeTransfers stays optional here for older API clients;
-// UpdateConfig supplies its current value or the default.
+// MaxActivePremiumizeTransfers stays optional here for older API clients; a
+// missing value stores 0 (cap disabled) like any other as-is value, and the
+// next config load normalizes it back to the default.
 // An explicit 0 remains valid for settings where 0 has a meaning, such as an
 // unlimited download speed.
 func validateConfigPayload(body []byte) error {
@@ -91,8 +92,8 @@ func validateConfigPayload(body []byte) error {
 	}
 	var missing []string
 	for key := range configJSONKeySet {
-		// Keep the new cap optional for older API clients; UpdateConfig fills
-		// it from the current value or the default.
+		// Keep the new cap optional for older API clients; a missing value
+		// stores 0, which the config load normalizes to the default.
 		if key == "MaxActivePremiumizeTransfers" {
 			continue
 		}

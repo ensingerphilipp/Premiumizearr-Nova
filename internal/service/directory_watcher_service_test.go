@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/stringqueue"
 	log "github.com/sirupsen/logrus"
@@ -24,6 +25,11 @@ func TestProcessUploadCycleQuotaBehavior(t *testing.T) {
 		accountResponse  string
 		wantTransfer     bool
 		wantAccountError bool
+		maxTransfers     int
+		transfersBody    string
+		transfersStatus  int
+		wantCapPause     bool
+		wantCountError   bool
 	}{
 		{
 			name:            "exhausted without booster points",
@@ -55,11 +61,36 @@ func TestProcessUploadCycleQuotaBehavior(t *testing.T) {
 			wantTransfer:     true,
 			wantAccountError: true,
 		},
+		{
+			name:            "transfer cap available",
+			accountStatus:   http.StatusOK,
+			accountResponse: `{"status":"success","limit_used":0.5,"booster_points":0}`,
+			maxTransfers:    2,
+			transfersBody:   `{"status":"success","transfers":[{"id":"1","status":"running"}]}`,
+			wantTransfer:    true,
+		},
+		{
+			name:            "transfer cap exhausted",
+			accountStatus:   http.StatusOK,
+			accountResponse: `{"status":"success","limit_used":0.5,"booster_points":0}`,
+			maxTransfers:    1,
+			transfersBody:   `{"status":"success","transfers":[{"id":"1","status":"running"}]}`,
+			wantCapPause:    true,
+		},
+		{
+			name:            "transfer cap check error",
+			accountStatus:   http.StatusOK,
+			accountResponse: `{"status":"success","limit_used":0.5,"booster_points":0}`,
+			maxTransfers:    2,
+			transfersStatus: http.StatusInternalServerError,
+			wantCountError:  true,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var accountRequests atomic.Int32
+			var transfersRequests atomic.Int32
 			var transferRequests atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 				switch request.URL.Path {
@@ -67,6 +98,18 @@ func TestProcessUploadCycleQuotaBehavior(t *testing.T) {
 					accountRequests.Add(1)
 					response.WriteHeader(test.accountStatus)
 					_, _ = response.Write([]byte(test.accountResponse))
+				case "/api/transfer/list":
+					transfersRequests.Add(1)
+					if test.transfersStatus != 0 {
+						response.WriteHeader(test.transfersStatus)
+						_, _ = response.Write([]byte(`{"status":"error"}`))
+						return
+					}
+					body := test.transfersBody
+					if body == "" {
+						body = `{"status":"success","transfers":[]}`
+					}
+					_, _ = response.Write([]byte(body))
 				case "/api/transfer/create":
 					transferRequests.Add(1)
 					_, _ = response.Write([]byte(`{"status":"success"}`))
@@ -77,7 +120,7 @@ func TestProcessUploadCycleQuotaBehavior(t *testing.T) {
 			defer server.Close()
 
 			const apiKey = "secret-api-key"
-			service, filePath := newQuotaTestService(t, server, apiKey, "request.magnet")
+			service, filePath := newQuotaTestService(t, server, apiKey, "request.magnet", test.maxTransfers)
 			var logs bytes.Buffer
 			logger := log.StandardLogger()
 			oldOutput := logger.Out
@@ -96,6 +139,13 @@ func TestProcessUploadCycleQuotaBehavior(t *testing.T) {
 			if got := transferRequests.Load(); got != wantTransfers {
 				t.Fatalf("transfer requests = %d, want %d", got, wantTransfers)
 			}
+			wantTransfersListChecks := int32(0)
+			if test.maxTransfers > 0 {
+				wantTransfersListChecks = 1
+			}
+			if got := transfersRequests.Load(); got != wantTransfersListChecks {
+				t.Fatalf("transfer list checks = %d, want %d", got, wantTransfersListChecks)
+			}
 
 			_, statErr := os.Stat(filePath)
 			if test.wantTransfer && !os.IsNotExist(statErr) {
@@ -109,6 +159,12 @@ func TestProcessUploadCycleQuotaBehavior(t *testing.T) {
 			}
 			if test.wantAccountError && !strings.Contains(logs.String(), "Could not check Premiumize fair-use quota") {
 				t.Fatalf("account error was not logged: %s", logs.String())
+			}
+			if test.wantCapPause && !strings.Contains(logs.String(), "pausing blackhole submissions at configured limit") {
+				t.Fatalf("cap pause warning was not logged: %s", logs.String())
+			}
+			if test.wantCountError && !strings.Contains(logs.String(), "Could not check active Premiumize transfers; blackhole submissions are paused") {
+				t.Fatalf("transfer count pause warning was not logged: %s", logs.String())
 			}
 			if strings.Contains(logs.String(), apiKey) {
 				t.Fatalf("API key appeared in logs: %s", logs.String())
@@ -138,7 +194,7 @@ func TestProcessUploadCycleResumesAndSuppressesRepeatedWarnings(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service, filePath := newQuotaTestService(t, server, "test-key", "resume.magnet")
+	service, filePath := newQuotaTestService(t, server, "test-key", "resume.magnet", 0)
 	var logs bytes.Buffer
 	logger := log.StandardLogger()
 	oldOutput := logger.Out
@@ -186,7 +242,7 @@ func TestProcessUploadCycleChecksQuotaOnceForMultipleFiles(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service, _ := newQuotaTestService(t, server, "test-key", "first.magnet")
+	service, _ := newQuotaTestService(t, server, "test-key", "first.magnet", 0)
 	secondFile := filepath.Join(t.TempDir(), "second.magnet")
 	if err := os.WriteFile(secondFile, []byte("magnet:?xt=urn:btih:second"), 0o600); err != nil {
 		t.Fatal(err)
@@ -216,7 +272,7 @@ func TestProcessUploadCycleRemovesAlreadyUploadedSource(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service, filePath := newQuotaTestService(t, server, "test-key", "duplicate.magnet")
+	service, filePath := newQuotaTestService(t, server, "test-key", "duplicate.magnet", 0)
 	service.processUploadCycle()
 
 	if !os.IsNotExist(fileExistsError(filePath)) {
@@ -245,7 +301,7 @@ func TestProcessUploadCycleRequeuesLimitRace(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service, filePath := newQuotaTestService(t, server, "test-key", "limit-race.magnet")
+	service, filePath := newQuotaTestService(t, server, "test-key", "limit-race.magnet", 0)
 	if got := service.processUploadCycle(); got != 0 {
 		t.Fatalf("processed count after retryable limit response = %d, want 0", got)
 	}
@@ -265,7 +321,7 @@ func TestProcessUploadCycleRequeuesLimitRace(t *testing.T) {
 	}
 }
 
-func newQuotaTestService(t *testing.T, server *httptest.Server, apiKey, fileName string) (*DirectoryWatcherService, string) {
+func newQuotaTestService(t *testing.T, server *httptest.Server, apiKey, fileName string, maxActiveTransfers int) (*DirectoryWatcherService, string) {
 	t.Helper()
 	client := premiumizeme.NewPremiumizemeClient(apiKey)
 	client.APIBaseURL = server.URL + "/api/"
@@ -277,7 +333,7 @@ func newQuotaTestService(t *testing.T, server *httptest.Server, apiKey, fileName
 	}
 
 	service := NewDirectoryWatcherService()
-	service.premiumizemeClient = &client
+	service.Init(&client, &config.Config{MaxActivePremiumizeTransfers: maxActiveTransfers})
 	service.Queue = stringqueue.NewStringQueue()
 	service.Queue.Add(filePath)
 	service.downloadsFolderID = "folder-id"
@@ -325,7 +381,7 @@ func TestUploadBatchPreservesTransferPacing(t *testing.T) {
 		w.Write([]byte(`{"status":"success"}`))
 	}))
 	defer server.Close()
-	svc, _ := newQuotaTestService(t, server, "test-key", "first.magnet")
+	svc, _ := newQuotaTestService(t, server, "test-key", "first.magnet", 0)
 	second := filepath.Join(t.TempDir(), "second.magnet")
 	if err := os.WriteFile(second, []byte("magnet:?xt=urn:btih:second"), 0600); err != nil {
 		t.Fatal(err)
@@ -344,7 +400,7 @@ func TestQuotaLookupFailurePreservesLastKnownState(t *testing.T) {
 	response := `{"status":"success","limit_used":1,"booster_points":0}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(response)) }))
 	defer server.Close()
-	svc, _ := newQuotaTestService(t, server, "test-key", "state.magnet")
+	svc, _ := newQuotaTestService(t, server, "test-key", "state.magnet", 0)
 	var logs bytes.Buffer
 	logger := log.StandardLogger()
 	old := logger.Out

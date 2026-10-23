@@ -10,15 +10,6 @@ func (c *Config) UpdateConfig(_newConfig Config) {
 		_newConfig.Arrs = []ArrConfig{}
 	}
 
-	// Older API clients omit the transfer cap. Preserve a configured value,
-	// and fall back to the default if neither config has a positive value.
-	if _newConfig.MaxActivePremiumizeTransfers <= 0 {
-		_newConfig.MaxActivePremiumizeTransfers = c.MaxActivePremiumizeTransfers
-		if _newConfig.MaxActivePremiumizeTransfers <= 0 {
-			_newConfig.MaxActivePremiumizeTransfers = DefaultMaxActivePremiumizeTransfers
-		}
-	}
-
 	//move private fields over
 	_newConfig.appCallback = c.appCallback
 	_newConfig.altConfigLocation = c.altConfigLocation
