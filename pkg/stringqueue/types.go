@@ -4,6 +4,6 @@ import "sync"
 
 type StringQueue struct {
 	queue  []string
-	queued map[string]struct{}
+	counts map[string]int
 	mutex  *sync.Mutex
 }

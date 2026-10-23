@@ -3,8 +3,10 @@ package service
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -393,5 +395,187 @@ func TestDuplicateQueueAdditionIsNotLoggedAsAdded(t *testing.T) {
 	svc.addFileToQueue("same.magnet")
 	if n := strings.Count(logs.String(), "added to Queue"); n != 1 {
 		t.Fatalf("addition logs = %d", n)
+	}
+}
+
+type uploadTestTransport func(*http.Request) (*http.Response, error)
+
+func (f uploadTestTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestFailedUploadRetriesWithoutRescan(t *testing.T) {
+	for _, failure := range []string{"temporary backend failure", "Limit of transfers reached!", "account_limit_reached", "new provider limit wording"} {
+		t.Run(failure, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					w.Write([]byte(`{"status":"error","message":"` + failure + `"}`))
+					return
+				}
+				w.Write([]byte(`{"status":"success"}`))
+			}))
+			defer server.Close()
+			target, _ := url.Parse(server.URL)
+			original := http.DefaultTransport
+			http.DefaultTransport = uploadTestTransport(func(r *http.Request) (*http.Response, error) {
+				copy := r.Clone(r.Context())
+				copy.URL.Scheme = target.Scheme
+				copy.URL.Host = target.Host
+				return original.RoundTrip(copy)
+			})
+			defer func() { http.DefaultTransport = original }()
+			file := filepath.Join(t.TempDir(), "retry.magnet")
+			if err := os.WriteFile(file, []byte("magnet:?xt=urn:btih:test"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			client := premiumizeme.NewPremiumizemeClient("dummy-test-key")
+			svc := NewDirectoryWatcherService()
+			svc.Queue = stringqueue.NewStringQueue()
+			svc.premiumizemeClient = &client
+			// The processor has just popped this path. No watcher event/rescan follows.
+			if delay := svc.processUpload(file); delay < 10*time.Second {
+				t.Errorf("retry delay = %s", delay)
+			}
+			if _, err := os.Stat(file); err != nil {
+				t.Fatal("failed upload lost source")
+			}
+			ok, retry := svc.Queue.PopTopOfQueue()
+			if !ok || retry != file {
+				t.Fatal("failed upload was stranded outside queue")
+			}
+			if delay := svc.processUpload(retry); delay != 2*time.Second {
+				t.Fatalf("success delay = %s", delay)
+			}
+			if _, err := os.Stat(file); !os.IsNotExist(err) {
+				t.Fatal("successful upload retained source")
+			}
+			if svc.Queue.Len() != 0 || calls.Load() != 2 {
+				t.Fatal("unexpected retry count")
+			}
+		})
+	}
+}
+
+func TestPollingDoesNotDuplicateQueuedUploads(t *testing.T) {
+	svc := NewDirectoryWatcherService()
+	svc.Queue = stringqueue.NewStringQueue()
+	var logs bytes.Buffer
+	logger := log.StandardLogger()
+	old := logger.Out
+	logger.SetOutput(&logs)
+	defer logger.SetOutput(old)
+	svc.addFileToQueue("request.magnet")
+	svc.addFileToQueue("request.magnet")
+	if svc.Queue.Len() != 1 {
+		t.Fatal("polling added duplicate work")
+	}
+	if strings.Count(logs.String(), "added to Queue") != 1 {
+		t.Fatal("duplicate insertion logged")
+	}
+}
+
+func TestAlreadyUploadedSourceIsRemoved(t *testing.T) {
+	original := http.DefaultTransport
+	http.DefaultTransport = uploadTestTransport(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"status":"error","message":" YOU ALREADY ADDED THIS JOB! "}`)), Header: make(http.Header)}, nil
+	})
+	defer func() { http.DefaultTransport = original }()
+	file := filepath.Join(t.TempDir(), "duplicate.magnet")
+	if err := os.WriteFile(file, []byte("magnet:?xt=urn:btih:test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pm := premiumizeme.NewPremiumizemeClient("dummy-key")
+	svc := NewDirectoryWatcherService()
+	svc.Queue = stringqueue.NewStringQueue()
+	svc.premiumizemeClient = &pm
+	if delay := svc.processUpload(file); delay != 2*time.Second {
+		t.Fatalf("terminal delay = %s", delay)
+	}
+	if _, err := os.Stat(file); !os.IsNotExist(err) {
+		t.Fatal("already-uploaded source retained")
+	}
+	if svc.Queue.Len() != 0 || svc.GetStatus() != "Okay" {
+		t.Fatal("terminal job queued for retry")
+	}
+}
+
+func TestRemovedSourceDoesNotRetry(t *testing.T) {
+	pm := premiumizeme.NewPremiumizemeClient("dummy-key")
+	svc := NewDirectoryWatcherService()
+	svc.Queue = stringqueue.NewStringQueue()
+	svc.premiumizemeClient = &pm
+	svc.processUpload(filepath.Join(t.TempDir(), "missing.magnet"))
+	if svc.Queue.Len() != 0 {
+		t.Fatal("missing source queued forever")
+	}
+}
+
+func TestUploadRetrySurvivesQuotaPauseWithoutRescan(t *testing.T) {
+	for _, failure := range []string{"temporary backend failure", "Limit of transfers reached!", "account_limit_reached", "new provider limit wording"} {
+		t.Run(failure, func(t *testing.T) {
+			var exhausted atomic.Bool
+			var accountRequests atomic.Int32
+			var transferRequests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/account/info":
+					accountRequests.Add(1)
+					if exhausted.Load() {
+						w.Write([]byte(`{"status":"success","limit_used":1,"booster_points":0}`))
+					} else {
+						w.Write([]byte(`{"status":"success","limit_used":0.5,"booster_points":0}`))
+					}
+				case "/api/transfer/create":
+					if transferRequests.Add(1) == 1 {
+						fmt.Fprintf(w, `{"status":"error","message":%q}`, failure)
+					} else {
+						w.Write([]byte(`{"status":"success"}`))
+					}
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			svc, first := newQuotaTestService(t, server, "test-key", "retry.magnet")
+			second := filepath.Join(t.TempDir(), "next.magnet")
+			if err := os.WriteFile(second, []byte("magnet:?xt=urn:btih:next"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			svc.addFileToQueue(second)
+
+			if got := svc.processUploadCycle(); got != 0 {
+				t.Fatalf("retry cycle processed count = %d, want 0 for backoff", got)
+			}
+			if got := transferRequests.Load(); got != 1 {
+				t.Fatalf("transfer requests before backoff = %d, want 1", got)
+			}
+			// A poll or watcher event must not duplicate the retry already queued.
+			svc.addFileToQueue(first)
+			exhausted.Store(true)
+			if got := svc.processUploadCycle(); got != 0 {
+				t.Fatalf("quota-paused processed count = %d, want 0", got)
+			}
+			if svc.Queue.Len() != 2 || transferRequests.Load() != 1 {
+				t.Fatal("quota pause changed pending work or submitted a transfer")
+			}
+			for _, file := range []string{first, second} {
+				if _, err := os.Stat(file); err != nil {
+					t.Fatalf("source changed before recovery: %v", err)
+				}
+			}
+
+			exhausted.Store(false)
+			if got := svc.processUploadCycle(); got != 2 {
+				t.Fatalf("recovery processed count = %d, want 2", got)
+			}
+			if svc.Queue.Len() != 0 || transferRequests.Load() != 3 || accountRequests.Load() != 3 {
+				t.Fatal("retry did not finish exactly once after quota recovery")
+			}
+			for _, file := range []string{first, second} {
+				if !os.IsNotExist(fileExistsError(file)) {
+					t.Fatal("successful retry retained a source")
+				}
+			}
+		})
 	}
 }
