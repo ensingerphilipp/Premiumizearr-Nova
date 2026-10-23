@@ -68,6 +68,10 @@ func (dw *DirectoryWatcherService) ConfigUpdatedCallback(currentConfig config.Co
 	if currentConfig.PollBlackholeDirectory != newConfig.PollBlackholeDirectory {
 		log.Info("Poll blackhole directory changed, restarting directory watcher...")
 	}
+
+	if currentConfig.MaxActivePremiumizeTransfers != newConfig.MaxActivePremiumizeTransfers {
+		log.Infof("MaxActivePremiumizeTransfers changed from %d to %d; the new value takes effect on the next upload cycle", currentConfig.MaxActivePremiumizeTransfers, newConfig.MaxActivePremiumizeTransfers)
+	}
 }
 
 func (dw *DirectoryWatcherService) GetStatus() string {
@@ -185,9 +189,15 @@ func (dw *DirectoryWatcherService) processUploads() {
 	}
 }
 
-// processUploadCycle checks the account and Premiumize's active transfer count
-// before each blackhole submission. Successfully submitted transfers are also
-// reserved locally so a delayed transfer/list response cannot overfill the cap.
+// processUploadCycle checks the account before each blackhole submission and
+// fetches the active Premiumize transfer count once per cycle: each
+// /transfer/list call downloads and decodes the account's complete unpaginated
+// transfer history, so a per-file re-list would grow the cycle's request
+// volume with queue depth. Successfully submitted transfers are also reserved
+// locally so the cycle's own submissions count against the cap without
+// re-fetching; external additions or completions are picked up by the next
+// cycle's fetch, and a limit-reached create failure requeues the file as the
+// backstop.
 func (dw *DirectoryWatcherService) processUploadCycle() int {
 	queuedFiles := dw.Queue.Len()
 	if queuedFiles == 0 || !dw.submissionsAllowed() {
@@ -197,6 +207,15 @@ func (dw *DirectoryWatcherService) processUploadCycle() int {
 	maxActiveTransfers := dw.config.MaxActivePremiumizeTransfers
 	reservedActiveTransfers := -1
 	processed := 0
+	var cycleActiveTransfers int
+	if maxActiveTransfers > 0 {
+		var err error
+		cycleActiveTransfers, err = dw.activePremiumizeTransferCount()
+		if err != nil {
+			dw.pauseForTransferCountError(err)
+			return 0
+		}
+	}
 	for range queuedFiles {
 		if processed > 0 {
 			time.Sleep(2 * time.Second)
@@ -204,12 +223,7 @@ func (dw *DirectoryWatcherService) processUploadCycle() int {
 
 		activeTransfers := 0
 		if maxActiveTransfers > 0 {
-			var err error
-			activeTransfers, err = dw.activePremiumizeTransferCount()
-			if err != nil {
-				dw.pauseForTransferCountError(err)
-				return processed
-			}
+			activeTransfers = cycleActiveTransfers
 			if reservedActiveTransfers > activeTransfers {
 				activeTransfers = reservedActiveTransfers
 			}
@@ -295,10 +309,22 @@ func (dw *DirectoryWatcherService) pauseForTransferCountError(err error) {
 }
 
 func (dw *DirectoryWatcherService) updateActiveTransferLimitStatus(active, limit int) {
+	dw.mu.RLock()
+	quotaUnknown := dw.quotaCheckFailed
+	dw.mu.RUnlock()
+
 	blocked := active >= limit
 	status := "Okay"
-	if blocked {
+	switch {
+	case blocked:
 		status = fmt.Sprintf("Paused: %d active Premiumize transfers (limit %d)", active, limit)
+	case quotaUnknown:
+		// The quota branch owns the quota-unknown status: a healthy cap
+		// check must not clobber it with "Okay" while the fair-use quota is
+		// unknown and the submission is failing, so the recovery write is
+		// gated on the quota lookup being known-good. The cap-paused branch
+		// stays unconditional: a real pause at the limit is always reported.
+		status = "Premiumize fair-use quota unknown; continuing submissions"
 	}
 	checkRecovered, wasBlocked := dw.setPausedState(&dw.activeTransferCountCheckFailed, &dw.activeTransferLimitBlocked, false, blocked, status)
 

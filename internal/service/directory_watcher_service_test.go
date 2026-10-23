@@ -360,6 +360,83 @@ func TestProcessUploadCycleCapPauseNotRefiredAfterCountError(t *testing.T) {
 	}
 }
 
+// TestProcessUploadCycleCapCheckPreservesQuotaUnknownStatus is the probe for
+// review finding R1-1: with the cap enabled, a failed /api/account/info
+// lookup fails open and sets the honest quota-unknown status; the cycle then
+// runs a healthy cap check below the limit, and the transfer create fails
+// with a non-limit error. The cap-status update must not clobber the
+// quota-unknown status with "Okay" while the fair-use quota is still
+// unknown — pre-PR the same sequence ended on the quota-unknown status.
+// Once the account lookup recovers, the status returns to "Okay".
+func TestProcessUploadCycleCapCheckPreservesQuotaUnknownStatus(t *testing.T) {
+	var accountRequests atomic.Int32
+	var transferRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/account/info":
+			if accountRequests.Add(1) == 1 {
+				response.WriteHeader(http.StatusInternalServerError)
+				_, _ = response.Write([]byte(`{"status":"error"}`))
+				return
+			}
+			_, _ = response.Write([]byte(`{"status":"success","limit_used":0.5,"booster_points":0}`))
+		case "/api/transfer/list":
+			_, _ = response.Write([]byte(`{"status":"success","transfers":[{"id":"1","status":"running"}]}`))
+		case "/api/transfer/create":
+			transferRequests.Add(1)
+			response.WriteHeader(http.StatusInternalServerError)
+			_, _ = response.Write([]byte(`{"status":"error"}`))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	service, filePath := newQuotaTestService(t, server, "test-key", "degraded.magnet", 2)
+	recoveryPath := filepath.Join(t.TempDir(), "recovery.magnet")
+	if err := os.WriteFile(recoveryPath, []byte("magnet:?xt=urn:btih:recovery"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	logger := log.StandardLogger()
+	oldOutput := logger.Out
+	logger.SetOutput(&logs)
+	t.Cleanup(func() { logger.SetOutput(oldOutput) })
+
+	if got := service.processUploadCycle(); got != 1 {
+		t.Fatalf("processed count in the degraded window = %d, want 1", got)
+	}
+	if got := service.GetStatus(); got != "Premiumize fair-use quota unknown; continuing submissions" {
+		t.Fatalf("status with quota unknown and a healthy cap check = %q, want the quota-unknown status", got)
+	}
+	if got := transferRequests.Load(); got != 1 {
+		t.Fatalf("transfer requests in the degraded window = %d, want 1", got)
+	}
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("source file was removed during the degraded window: %v", err)
+	}
+
+	service.Queue.Add(recoveryPath)
+	if got := service.processUploadCycle(); got != 1 {
+		t.Fatalf("processed count after the account lookup recovers = %d, want 1", got)
+	}
+	if got := service.GetStatus(); got != "Okay" {
+		t.Fatalf("status after the account lookup recovers = %q, want Okay", got)
+	}
+	if got := transferRequests.Load(); got != 2 {
+		t.Fatalf("transfer requests after recovery = %d, want 2", got)
+	}
+	if _, err := os.Stat(recoveryPath); err != nil {
+		t.Fatalf("recovery source file was removed while the create still fails: %v", err)
+	}
+	if n := strings.Count(logs.String(), "Could not check Premiumize fair-use quota; continuing with existing submission behavior"); n != 1 {
+		t.Fatalf("quota-unknown warning count = %d, want 1; logs: %s", n, logs.String())
+	}
+	if n := strings.Count(logs.String(), "Error creating transfer:"); n != 2 {
+		t.Fatalf("create error count = %d, want 2; logs: %s", n, logs.String())
+	}
+}
+
 // TestActivePremiumizeTransferCountCountsOnlyQueuedAndRunning is the
 // acceptance test for review finding R1-13: the counter must count
 // case/whitespace-insensitive "queued" and "running" statuses and exclude
@@ -674,5 +751,149 @@ func TestDuplicateQueueAdditionIsNotLoggedAsAdded(t *testing.T) {
 	svc.addFileToQueue("same.magnet")
 	if n := strings.Count(logs.String(), "added to Queue"); n != 1 {
 		t.Fatalf("addition logs = %d", n)
+	}
+}
+
+// TestConfigUpdatedCallbackLogsCapChange is the probe for review finding
+// R1-8: a MaxActivePremiumizeTransfers change reaching the running service
+// must leave a log trace with the old and new values. The callback branch is
+// log-only — it reads its arguments and never reassigns dw.config, so the
+// cycle picks the new value up on its next live read.
+func TestConfigUpdatedCallbackLogsCapChange(t *testing.T) {
+	client := premiumizeme.NewPremiumizemeClient("test-key")
+	svc := NewDirectoryWatcherService()
+	svc.Init(&client, &config.Config{MaxActivePremiumizeTransfers: 20})
+	var logs bytes.Buffer
+	logger := log.StandardLogger()
+	old := logger.Out
+	logger.SetOutput(&logs)
+	defer logger.SetOutput(old)
+
+	svc.ConfigUpdatedCallback(config.Config{MaxActivePremiumizeTransfers: 20}, config.Config{MaxActivePremiumizeTransfers: 5})
+	if n := strings.Count(logs.String(), "MaxActivePremiumizeTransfers changed from 20 to 5"); n != 1 {
+		t.Fatalf("cap change logs = %d, want 1; logs: %s", n, logs.String())
+	}
+	logs.Reset()
+
+	svc.ConfigUpdatedCallback(config.Config{MaxActivePremiumizeTransfers: 20}, config.Config{MaxActivePremiumizeTransfers: 20})
+	if n := strings.Count(logs.String(), "MaxActivePremiumizeTransfers changed"); n != 0 {
+		t.Fatalf("unchanged cap produced a change log; logs: %s", logs.String())
+	}
+}
+
+// TestProcessUploadCycleFetchesTransferListOncePerCycle is the probe for
+// review finding R1-7: the cycle fetches /transfer/list once and decides
+// later iterations from the local reservation of its own submissions, so a
+// deep blackhole queue does not turn every queued file into a fresh round
+// trip downloading the account's complete transfer history. The old
+// per-file re-list made list calls grow with queue depth; a mutation that
+// re-fetches per file fails this test (want 1, gets 3).
+func TestProcessUploadCycleFetchesTransferListOncePerCycle(t *testing.T) {
+	var listRequests atomic.Int32
+	var transferRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/account/info":
+			_, _ = response.Write([]byte(`{"status":"success","limit_used":0.5,"booster_points":0}`))
+		case "/api/transfer/list":
+			listRequests.Add(1)
+			_, _ = response.Write([]byte(`{"status":"success","transfers":[{"id":"1","status":"running"}]}`))
+		case "/api/transfer/create":
+			transferRequests.Add(1)
+			_, _ = response.Write([]byte(`{"status":"success"}`))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	service, firstPath := newQuotaTestService(t, server, "test-key", "once-first.magnet", 5)
+	secondPath := filepath.Join(t.TempDir(), "once-second.magnet")
+	if err := os.WriteFile(secondPath, []byte("magnet:?xt=urn:btih:second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	thirdPath := filepath.Join(t.TempDir(), "once-third.magnet")
+	if err := os.WriteFile(thirdPath, []byte("magnet:?xt=urn:btih:third"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service.Queue.Add(secondPath)
+	service.Queue.Add(thirdPath)
+
+	if got := service.processUploadCycle(); got != 3 {
+		t.Fatalf("processed count = %d, want 3", got)
+	}
+	if got := listRequests.Load(); got != 1 {
+		t.Fatalf("transfer list fetches = %d, want 1 (once per cycle)", got)
+	}
+	if got := transferRequests.Load(); got != 3 {
+		t.Fatalf("transfer requests = %d, want 3", got)
+	}
+	for _, p := range []string{firstPath, secondPath, thirdPath} {
+		if !os.IsNotExist(fileExistsError(p)) {
+			t.Fatalf("source file %s still exists after the cycle", p)
+		}
+	}
+	if got := service.GetStatus(); got != "Okay" {
+		t.Fatalf("status after the cycle = %q, want Okay", got)
+	}
+}
+
+// TestProcessUploadCycleReservationStopsStaleListBatch is the acceptance
+// test for review finding R1-10: the local reservation of the cycle's own
+// submissions must stop a multi-file batch from running against a stale
+// /transfer/list response that never shows the transfers created earlier in
+// the batch. With the reservation bump in the submitted branch removed, the
+// second file is consumed against the stale list and this test flips
+// PASS -> FAIL (transfer creates = 2, want 1).
+func TestProcessUploadCycleReservationStopsStaleListBatch(t *testing.T) {
+	var transferRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/account/info":
+			_, _ = response.Write([]byte(`{"status":"success","limit_used":0.5,"booster_points":0}`))
+		case "/api/transfer/list":
+			// The stale count never reflects the cycle's own submission.
+			_, _ = response.Write([]byte(`{"status":"success","transfers":[{"id":"1","status":"running"}]}`))
+		case "/api/transfer/create":
+			transferRequests.Add(1)
+			_, _ = response.Write([]byte(`{"status":"success"}`))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	service, firstPath := newQuotaTestService(t, server, "test-key", "stale-first.magnet", 2)
+	secondPath := filepath.Join(t.TempDir(), "stale-second.magnet")
+	if err := os.WriteFile(secondPath, []byte("magnet:?xt=urn:btih:second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service.Queue.Add(secondPath)
+	var logs bytes.Buffer
+	logger := log.StandardLogger()
+	oldOutput := logger.Out
+	logger.SetOutput(&logs)
+	t.Cleanup(func() { logger.SetOutput(oldOutput) })
+
+	if got := service.processUploadCycle(); got != 1 {
+		t.Fatalf("processed count = %d, want 1", got)
+	}
+	if got := transferRequests.Load(); got != 1 {
+		t.Fatalf("transfer creates = %d, want 1 (the reservation stops the second file)", got)
+	}
+	if !os.IsNotExist(fileExistsError(firstPath)) {
+		t.Fatal("first source file still exists after its successful create")
+	}
+	if _, err := os.Stat(secondPath); err != nil {
+		t.Fatalf("second source file was consumed against the stale list: %v", err)
+	}
+	if got := service.Queue.Len(); got != 1 {
+		t.Fatalf("queue length = %d, want 1 (second file stays queued)", got)
+	}
+	if got := service.GetStatus(); got != "Paused: 2 active Premiumize transfers (limit 2)" {
+		t.Fatalf("status = %q, want the cap-paused message", got)
+	}
+	if n := strings.Count(logs.String(), "Premiumize has 2 active transfers; pausing blackhole submissions at configured limit 2"); n != 1 {
+		t.Fatalf("cap pause warning count = %d, want 1; logs: %s", n, logs.String())
 	}
 }

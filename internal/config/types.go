@@ -52,8 +52,10 @@ type Config struct {
 	WebRoot string `yaml:"WebRoot" json:"WebRoot"`
 
 	SimultaneousDownloads int `yaml:"SimultaneousDownloads" json:"SimultaneousDownloads"`
-	// MaxActivePremiumizeTransfers limits queued and running transfers created from blackhole files.
-	// Missing or non-positive values in config files are reset to the default during config loading.
+	// MaxActivePremiumizeTransfers caps blackhole submissions at this many
+	// total queued/running transfers on the account; transfers added outside
+	// the blackhole count against the limit too. Missing or non-positive
+	// values in config files are reset to the default during config loading.
 	MaxActivePremiumizeTransfers int  `yaml:"MaxActivePremiumizeTransfers" json:"MaxActivePremiumizeTransfers"`
 	DownloadSpeedLimit           int  `yaml:"DownloadSpeedLimit" json:"DownloadSpeedLimit"`
 	EnableTlsCheck               bool `yaml:"EnableTlsCheck" json:"EnableTlsCheck"`
