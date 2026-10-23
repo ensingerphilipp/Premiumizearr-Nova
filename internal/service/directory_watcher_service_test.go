@@ -300,6 +300,66 @@ func TestProcessUploadCycleCapBlockedRecoversBelowCap(t *testing.T) {
 	}
 }
 
+// TestProcessUploadCycleCapPauseNotRefiredAfterCountError is the probe for
+// review finding R1-16: a cap pause interrupted by a transient
+// transfer-count check failure must keep its block state, so the pause
+// warning fires exactly once per pause episode — re-firing it on every
+// failure/recovery at the cap would page anything keyed on that line with
+// no state change.
+func TestProcessUploadCycleCapPauseNotRefiredAfterCountError(t *testing.T) {
+	var listRequests atomic.Int32
+	var transferRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/account/info":
+			_, _ = response.Write([]byte(`{"status":"success","limit_used":0.5,"booster_points":0}`))
+		case "/api/transfer/list":
+			if listRequests.Add(1) == 2 {
+				response.WriteHeader(http.StatusInternalServerError)
+				_, _ = response.Write([]byte(`{"status":"error"}`))
+				return
+			}
+			_, _ = response.Write([]byte(`{"status":"success","transfers":[{"id":"1","status":"running"}]}`))
+		case "/api/transfer/create":
+			transferRequests.Add(1)
+			_, _ = response.Write([]byte(`{"status":"success"}`))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	service, filePath := newQuotaTestService(t, server, "test-key", "still-paused.magnet", 1)
+	var logs bytes.Buffer
+	logger := log.StandardLogger()
+	oldOutput := logger.Out
+	logger.SetOutput(&logs)
+	t.Cleanup(func() { logger.SetOutput(oldOutput) })
+
+	service.processUploadCycle()
+	service.processUploadCycle()
+	service.processUploadCycle()
+
+	if got := transferRequests.Load(); got != 0 {
+		t.Fatalf("transfer requests = %d, want 0 (still at the cap)", got)
+	}
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("source file was changed while paused: %v", err)
+	}
+	if got := service.GetStatus(); got != "Paused: 1 active Premiumize transfers (limit 1)" {
+		t.Fatalf("status after recovery at the cap = %q, want the cap-paused message", got)
+	}
+	if n := strings.Count(logs.String(), "pausing blackhole submissions at configured limit"); n != 1 {
+		t.Fatalf("cap pause warning count = %d, want 1 (the pause never lifted); logs: %s", n, logs.String())
+	}
+	if n := strings.Count(logs.String(), "Could not check active Premiumize transfers; blackhole submissions are paused"); n != 1 {
+		t.Fatalf("count pause warning count = %d, want 1; logs: %s", n, logs.String())
+	}
+	if n := strings.Count(logs.String(), "Premiumize active transfer count is available again; resuming transfer checks"); n != 1 {
+		t.Fatalf("recovery log count = %d, want 1; logs: %s", n, logs.String())
+	}
+}
+
 // TestActivePremiumizeTransferCountCountsOnlyQueuedAndRunning is the
 // acceptance test for review finding R1-13: the counter must count
 // case/whitespace-insensitive "queued" and "running" statuses and exclude

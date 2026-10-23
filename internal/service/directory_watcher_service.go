@@ -266,10 +266,10 @@ func (dw *DirectoryWatcherService) activePremiumizeTransferCount() (int, error) 
 // check-failed flag with failedValue, replaces the blocked flag with
 // blockedValue unless blockedFlag is nil (which preserves its last value),
 // and stores status. It returns the previous flag values so the caller can
-// log the transition. The quota error path passes a nil blockedFlag on
-// purpose: a failed lookup must preserve the last known quota state so a
-// transient error does not duplicate pause logs or hide recovery, while the
-// transfer-count error path clears the block instead.
+// log the transition. Both failed-check paths (quota and transfer count)
+// pass a nil blockedFlag on purpose: a failed lookup must preserve the last
+// known block state so a transient error does not re-arm the pause warning
+// or hide recovery; only the successful-check paths replace the blocked flag.
 func (dw *DirectoryWatcherService) setPausedState(failedFlag, blockedFlag *bool, failedValue, blockedValue bool, status string) (previouslyFailed, wasBlocked bool) {
 	dw.mu.Lock()
 	previouslyFailed = *failedFlag
@@ -284,7 +284,10 @@ func (dw *DirectoryWatcherService) setPausedState(failedFlag, blockedFlag *bool,
 }
 
 func (dw *DirectoryWatcherService) pauseForTransferCountError(err error) {
-	alreadyFailed, _ := dw.setPausedState(&dw.activeTransferCountCheckFailed, &dw.activeTransferLimitBlocked, true, false, "Paused: Premiumize active transfer count unavailable")
+	// A failed count check preserves the block state (nil blockedFlag), as
+	// the quota error path does, so a transient failure while at the cap does
+	// not re-arm the pause warning when the check recovers still at the cap.
+	alreadyFailed, _ := dw.setPausedState(&dw.activeTransferCountCheckFailed, nil, true, false, "Paused: Premiumize active transfer count unavailable")
 
 	if !alreadyFailed {
 		log.Warnf("Could not check active Premiumize transfers; blackhole submissions are paused: %s", err)
