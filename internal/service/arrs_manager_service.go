@@ -18,19 +18,23 @@ import (
 )
 
 type ArrsManagerService struct {
-	mu             *sync.RWMutex
-	arrs           []arr.IArr
-	config         *config.Config
-	failureTargets []directFailureTarget
-	// failureTargetStrikes counts CONSECUTIVE erroring report passes per
-	// (job, target) pair: once a target reaches two, it is skipped for
-	// that job's remaining passes so its error can no longer pin the
-	// pass's error set (see ReportDirectTorrentFailure). Entries are
-	// bounded in practice: the manager stops calling the reporter for a
-	// dead-lettered job, and a target that queries cleanly again has its
-	// strike removed.
-	failureTargetStrikes map[string]int
+	mu                   *sync.RWMutex
+	arrs                 []arr.IArr
+	config               *config.Config
+	failureTargets       []directFailureTarget
+	failureTargetRetries map[string]failureTargetRetry
+	failureReportNow     func() time.Time
 }
+
+type failureTargetRetry struct {
+	attempt    uint64
+	created    time.Time
+	errors     int
+	misses     int
+	retryAfter time.Time
+}
+
+const directFailureHistoryPollCap = 8
 
 type directFailureTarget struct {
 	key    string
@@ -41,7 +45,7 @@ func (am ArrsManagerService) New() ArrsManagerService {
 	am.mu = &sync.RWMutex{}
 	am.arrs = []arr.IArr{}
 	am.failureTargets = nil
-	am.failureTargetStrikes = make(map[string]int)
+	am.failureTargetRetries = make(map[string]failureTargetRetry)
 	return am
 }
 
@@ -97,6 +101,7 @@ func (am *ArrsManagerService) Start() {
 	}
 	am.mu.Lock()
 	am.arrs, am.failureTargets = clients, targets
+	am.failureTargetRetries = make(map[string]failureTargetRetry)
 	am.mu.Unlock()
 	log.Debugf("Created %d Arrs", len(clients))
 }
@@ -129,22 +134,21 @@ func (am *ArrsManagerService) GetArrs() []arr.IArr {
 // qBittorrent's error state is a warning in *arr, so terminal direct torrent
 // failures must explicitly mark the corresponding grabbed history record.
 //
-// The per-target strike isolation is what keeps the manager's report cap
-// reachable: the manager only advances its no-error-pass counter on a
-// pass that returns no error, so a permanently erroring *arr (a revoked
-// API key, a black-holed instance) would otherwise make EVERY pass fail
-// and the failedReportPollCap dead-letter would never fire — while each
-// pass still forces a full-history refetch against every healthy *arr.
-// A target that errors on two consecutive passes is therefore skipped
-// for this job's remaining passes, which restores the no-error pass; a
-// target that queries cleanly again has its strike reset and is
-// re-reported.
+// Failed targets back off but remain eligible for recovery probes. A
+// deferred retry is still an error to the manager, so an outage cannot
+// consume its no-error report budget. Each healthy target without a
+// matching grab has its own finite lookup budget, preventing an offline
+// sibling from causing unlimited history refetches against healthy apps.
 func (am *ArrsManagerService) ReportDirectTorrentFailure(job directclient.Job) ([]string, error) {
 	am.mu.RLock()
 	targets := append([]directFailureTarget(nil), am.failureTargets...)
 	am.mu.RUnlock()
 	var acknowledged []string
 	var failures []error
+	now := time.Now()
+	if am.failureReportNow != nil {
+		now = am.failureReportNow()
+	}
 	for _, target := range targets {
 		alreadyReported := false
 		for _, key := range job.ReportedFailures {
@@ -158,9 +162,16 @@ func (am *ArrsManagerService) ReportDirectTorrentFailure(job directclient.Job) (
 		}
 		strikeKey := job.ID + "\x00" + target.key
 		am.mu.RLock()
-		strikes := am.failureTargetStrikes[strikeKey]
+		retry := am.failureTargetRetries[strikeKey]
 		am.mu.RUnlock()
-		if strikes >= 2 {
+		if retry.attempt != job.Attempt || !retry.created.Equal(job.Created) {
+			retry = failureTargetRetry{attempt: job.Attempt, created: job.Created}
+		}
+		if retry.misses >= directFailureHistoryPollCap {
+			continue
+		}
+		if now.Before(retry.retryAfter) {
+			failures = append(failures, fmt.Errorf("%s: failure report retry deferred", target.client.GetArrName()))
 			continue
 		}
 		id, found, err := target.client.HistoryContainsDownloadIDFresh(job.ID)
@@ -171,11 +182,28 @@ func (am *ArrsManagerService) ReportDirectTorrentFailure(job directclient.Job) (
 			}
 		}
 		am.mu.Lock()
-		if err != nil {
-			am.failureTargetStrikes[strikeKey] = strikes + 1
-		} else {
-			delete(am.failureTargetStrikes, strikeKey)
+		if am.failureTargetRetries == nil {
+			am.failureTargetRetries = make(map[string]failureTargetRetry)
 		}
+		if err != nil {
+			retry.errors++
+			if retry.errors >= 2 {
+				delay := 15 * time.Second
+				for n := 2; n < retry.errors && delay < 5*time.Minute; n++ {
+					delay *= 2
+				}
+				if delay > 5*time.Minute {
+					delay = 5 * time.Minute
+				}
+				retry.retryAfter = now.Add(delay)
+			}
+		} else {
+			retry.errors, retry.retryAfter = 0, time.Time{}
+			if !found {
+				retry.misses++
+			}
+		}
+		am.failureTargetRetries[strikeKey] = retry
 		am.mu.Unlock()
 		if err != nil {
 			failures = append(failures, fmt.Errorf("%s: %w", target.client.GetArrName(), err))

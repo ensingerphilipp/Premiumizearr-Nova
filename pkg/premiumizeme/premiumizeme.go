@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -133,7 +135,18 @@ func (pm *Premiumizeme) redactRequestError(err error) error {
 
 var (
 	ErrAPIKeyNotSet = fmt.Errorf("premiumize.me API key not set")
+	// ErrTransferNotSubmitted identifies a failure known to precede sending
+	// a transfer-create request. Other failures may have committed remotely.
+	ErrTransferNotSubmitted = errors.New("transfer request was not submitted")
 )
+
+type transferNotSubmittedError struct{ error }
+
+func (e *transferNotSubmittedError) Is(target error) bool {
+	return target == ErrTransferNotSubmitted
+}
+
+func (e *transferNotSubmittedError) Unwrap() error { return e.error }
 
 func (pm *Premiumizeme) GetTransfers() ([]Transfer, error) {
 	if pm.APIKey == "" {
@@ -155,6 +168,9 @@ func (pm *Premiumizeme) GetTransfers() ([]Transfer, error) {
 	}
 
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ret, fmt.Errorf("transfer list request failed: %s (%d)", resp.Status, resp.StatusCode)
+	}
 	res := ListTransfersResponse{}
 	err = json.NewDecoder(resp.Body).Decode(&res)
 
@@ -334,8 +350,13 @@ func (pm *Premiumizeme) CreateTransfer(filePath string, parentID string) error {
 // temporary file. name is used as the uploaded filename for torrent and NZB
 // sources; magnet sources are sent as a multipart text field. The returned
 // response includes Premiumize's transfer ID for subsequent tracking.
-func (pm *Premiumizeme) CreateTransferFromBytes(ctx context.Context, kind TransferSourceKind, data []byte, name, parentID string) (CreateTransferResponse, error) {
-	var result CreateTransferResponse
+func (pm *Premiumizeme) CreateTransferFromBytes(ctx context.Context, kind TransferSourceKind, data []byte, name, parentID string) (result CreateTransferResponse, err error) {
+	requestAttempted := false
+	defer func() {
+		if err != nil && !requestAttempted {
+			err = &transferNotSubmittedError{err}
+		}
+	}()
 	if pm.APIKey == "" {
 		return result, ErrAPIKeyNotSet
 	}
@@ -392,9 +413,18 @@ func (pm *Premiumizeme) CreateTransferFromBytes(ctx context.Context, kind Transf
 		return result, pm.redactRequestError(err)
 	}
 	request.Header.Set("Content-Type", writer.FormDataContentType())
+	if err := requestContext.Err(); err != nil {
+		return result, err
+	}
+	requestAttempted = true
 	resp, err := pm.httpClient().Do(request)
 	if err != nil {
-		return result, pm.redactRequestError(err)
+		redacted := pm.redactRequestError(err)
+		var networkError *net.OpError
+		if errors.As(err, &networkError) && networkError.Op == "dial" {
+			return result, &transferNotSubmittedError{redacted}
+		}
+		return result, redacted
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

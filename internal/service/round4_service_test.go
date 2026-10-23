@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,40 +23,26 @@ import (
 
 // TestRound4ArrsManagerStrikeIsolatesFailingTarget is the regression test
 // for R2-3: failureTargets had no per-target fault isolation — a
-// permanently erroring *arr made EVERY report pass return an error, so the
-// err-gated failureReportPolls increment never ran and the manager's cap
-// dead-letter was unreachable, while every pass still forced a full
-// history refetch against every healthy *arr. A target that errors on two
-// consecutive passes is skipped for the job's remaining passes; a target
-// that queries cleanly again has its strike reset. (The pinned round-2
-// manager test still requires outage PASSES to keep not counting — this
-// isolates per TARGET, not per pass.)
+// permanently erroring *arr caused unlimited full-history queries. Failed
+// targets must back off without consuming the report budget; acknowledged
+// healthy targets must not be queried again while their sibling is offline.
 func TestRound4ArrsManagerStrikeIsolatesFailingTarget(t *testing.T) {
 	healthy := &round4FakeArr{name: "sonarr"}
 	broken := &round4FakeArr{name: "radarr", permanentError: true}
-	a := ArrsManagerService{}
-	a.mu = &sync.RWMutex{}
-	a.failureTargetStrikes = make(map[string]int)
+	a := ArrsManagerService{}.New()
+	now := time.Unix(1000, 0)
+	a.failureReportNow = func() time.Time { return now }
 	a.failureTargets = []directFailureTarget{{key: "sonarr", client: healthy}, {key: "radarr", client: broken}}
 
 	job := directclient.Job{ID: "job-1"}
 	for pass := 1; pass <= 12; pass++ {
 		acked, err := a.ReportDirectTorrentFailure(job)
-		switch pass {
-		case 1:
-			if err == nil {
-				t.Fatalf("pass 1: err = nil, want the failing target's error")
-			}
+		if err == nil {
+			t.Fatalf("pass %d consumed the no-error report budget during an outage", pass)
+		}
+		if pass == 1 {
 			if len(acked) != 1 || acked[0] != "sonarr" {
 				t.Fatalf("pass 1: acknowledgements = %#v, want the healthy target only", acked)
-			}
-		case 2:
-			if err == nil {
-				t.Fatalf("pass 2: err = nil, want the failing target's second error")
-			}
-		default:
-			if err != nil {
-				t.Fatalf("pass %d: err = %v, want none (a struck-out target must not pin the pass's error set, or the manager's no-error-pass cap is unreachable)", pass, err)
 			}
 		}
 		// The manager appends the acknowledged targets to the row's ack
@@ -67,9 +52,10 @@ func TestRound4ArrsManagerStrikeIsolatesFailingTarget(t *testing.T) {
 				job.ReportedFailures = append(job.ReportedFailures, k)
 			}
 		}
+		now = now.Add(15 * time.Second)
 	}
-	if got := broken.queryCalls.Load(); got != 2 {
-		t.Fatalf("failing target query calls = %d, want 2 (two consecutive errors strike the target out of the job's remaining passes)", got)
+	if got := broken.queryCalls.Load(); got != 5 {
+		t.Fatalf("failing target query calls = %d, want 5 under exponential backoff", got)
 	}
 	if got := healthy.queryCalls.Load(); got != 1 {
 		t.Fatalf("healthy target query calls = %d, want 1 (acknowledged once, then skipped by the row's ack list)", got)
@@ -82,6 +68,7 @@ func TestRound4ArrsManagerStrikeIsolatesFailingTarget(t *testing.T) {
 type round4FakeArr struct {
 	name           string
 	permanentError bool
+	noHistory      bool
 	queryCalls     atomic.Int32
 	markCalls      atomic.Int32
 }
@@ -103,7 +90,7 @@ func (f *round4FakeArr) HistoryContainsDownloadIDFresh(downloadID string) (int64
 	if f.permanentError {
 		return 0, false, errors.New("permanent 401")
 	}
-	return 7, true, nil
+	return 7, !f.noHistory, nil
 }
 func (f *round4FakeArr) MarkHistoryItemAsFailed(id int64) error {
 	f.markCalls.Add(1)

@@ -266,7 +266,8 @@ func TestAddRequeueResetsFailureReportState(t *testing.T) {
 // regression test for the finding that a re-queued job kept its previous
 // attempt's transfer ID and cleanup-pending flag: the transfers pass
 // re-failed the fresh job against the stale transfer, and the deletion
-// pass deleted the cloud folder the fresh submission reuses.
+// pass deleted the cloud folder the fresh submission reuses. Old resources
+// now remain tracked separately while the new attempt reserves its own folder.
 func TestAddRequeueClearsStaleTransferAndCleanupState(t *testing.T) {
 	pm := managerTestPremiumize(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -312,8 +313,11 @@ func TestAddRequeueClearsStaleTransferAndCleanupState(t *testing.T) {
 	if got.CleanupPending {
 		t.Fatal("stale CleanupPending survives the re-grab; the deletion pass would delete the folder the fresh submission reuses")
 	}
-	if got.CloudFolder != "folder-1" {
-		t.Fatalf("cloud folder reference after re-grab = %q, want folder-1 (the fresh submission reuses the reserved folder)", got.CloudFolder)
+	if got.CloudFolder != "" {
+		t.Fatalf("fresh attempt retained the old cleanup folder %q", got.CloudFolder)
+	}
+	if len(got.PendingCleanup) != 1 || got.PendingCleanup[0].Folder != "folder-1" || got.PendingCleanup[0].TransferID != "transfer-1" {
+		t.Fatalf("previous attempt's resources lost their cleanup handles: %+v", got.PendingCleanup)
 	}
 	waitQuiescent(t, manager)
 }

@@ -38,6 +38,11 @@ type Job struct {
 	DeleteRequested  bool     `json:"delete_requested,omitempty"`
 	DeleteFiles      bool     `json:"delete_files,omitempty"`
 	ReportedFailures []string `json:"reported_failures,omitempty"`
+	// Attempt distinguishes a re-grab from an earlier failure report.
+	Attempt uint64 `json:"attempt,omitempty"`
+	// PendingCleanup retains resources from previous attempts separately
+	// from the folder used by the current submission.
+	PendingCleanup []cloudCleanup `json:"pending_cleanup,omitempty"`
 	// CleanupPending marks a completed job whose Premiumize folder could
 	// not be deleted at completion time. The poll deletion pass retries
 	// the folder deletion for such jobs until it succeeds, without
@@ -59,6 +64,12 @@ type Job struct {
 	Created         time.Time `json:"created"`
 }
 
+type cloudCleanup struct {
+	Folder          string `json:"folder"`
+	TransferID      string `json:"transfer_id,omitempty"`
+	TransferUnknown bool   `json:"transfer_unknown,omitempty"`
+}
+
 // Manager owns the direct-download namespace. The existing blackhole path
 // uses a different Premiumize folder and remains independent.
 type Manager struct {
@@ -76,11 +87,12 @@ type Manager struct {
 	// it bounds the reporter calls so a job no configured *arr ever
 	// acknowledges cannot pin the *arr stack with a full-history refetch
 	// every poll forever.
-	failureReportPolls map[string]int
-	rootMu             sync.Mutex // guards rootDir/rootID: submit may race the poll loop
-	rootDir            string
-	rootID             string
-	stop               chan struct{}
+	failureReportPolls   map[string]int
+	missingTransferPolls map[string]int
+	rootMu               sync.Mutex // guards rootDir/rootID: submit may race the poll loop
+	rootDir              string
+	rootID               string
+	stop                 chan struct{}
 }
 
 func NewManager(pm *premiumizeme.Premiumizeme, cfg *config.Config, configDir string) (*Manager, error) {
@@ -91,7 +103,7 @@ func NewManager(pm *premiumizeme.Premiumizeme, cfg *config.Config, configDir str
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return nil, err
 	}
-	m := &Manager{pm: pm, config: *cfg, stateDir: stateDir, jobs: make(map[string]*Job), categories: make(map[string]bool), active: make(map[string]context.CancelFunc), removing: make(map[string]bool), failureReportPolls: make(map[string]int), stop: make(chan struct{})}
+	m := &Manager{pm: pm, config: *cfg, stateDir: stateDir, jobs: make(map[string]*Job), categories: make(map[string]bool), active: make(map[string]context.CancelFunc), removing: make(map[string]bool), failureReportPolls: make(map[string]int), missingTransferPolls: make(map[string]int), stop: make(chan struct{})}
 	data, err := os.ReadFile(filepath.Join(stateDir, "jobs.json"))
 	if err == nil {
 		var stored []Job
@@ -348,6 +360,14 @@ func (m *Manager) add(kind string, data []byte, filename, category string) (Job,
 	if old := m.jobs[id]; old != nil {
 		if old.Kind != "nzb" && old.Category == category {
 			if old.Phase == "failed" && !old.DeleteRequested {
+				if old.CleanupPending && old.CloudFolder != "" {
+					old.PendingCleanup = append(old.PendingCleanup, cloudCleanup{
+						Folder: old.CloudFolder, TransferID: old.TransferID,
+						TransferUnknown: old.TransferUnknown,
+					})
+					old.CloudFolder = ""
+				}
+				old.Attempt++
 				// The *arr clients re-issue a grab through this
 				// endpoint when they want a retry, and a terminally
 				// failed job has no other retry path: reset the row
@@ -364,11 +384,9 @@ func (m *Manager) add(kind string, data []byte, filename, category string) (Job,
 				// would otherwise never be reported to *arr again.
 				old.ReportedFailures = nil
 				m.failureReportPolls[old.ID] = 0
-				// And the cleanup state of the attempt it re-queues is
-				// dropped: a stale transfer ID re-fails the fresh job in
-				// the transfers pass, and a cleanup-pending flag would
-				// hand the folder the fresh submission reuses to the
-				// deletion pass.
+				delete(m.missingTransferPolls, old.ID)
+				// Previous cleanup handles above belong to the old attempt;
+				// clear only the new attempt's transfer and cleanup state.
 				old.CleanupPending = false
 				old.TransferUnknown = false
 				old.TransferID = ""
@@ -632,6 +650,19 @@ func (m *Manager) remove(id string, deleteFiles bool) error {
 		delete(m.removing, id)
 		m.mu.Unlock()
 	}()
+	var pendingCleanupErr error
+	pendingCleanupIncomplete := false
+	for _, pending := range job.PendingCleanup {
+		done, err := m.cleanupCloudResources(pending)
+		if err != nil || !done {
+			pendingCleanupIncomplete = true
+			pendingCleanupErr = errors.Join(pendingCleanupErr, err)
+			continue
+		}
+		if err := m.finishCloudCleanup(id, job.Attempt, pending); err != nil {
+			return err
+		}
+	}
 
 	// The remote transfer and folder are deleted BEFORE the durable row:
 	// a failure in between must not leave a Premiumize object that the
@@ -695,6 +726,10 @@ func (m *Manager) remove(id string, deleteFiles bool) error {
 			return err
 		}
 	}
+	if pendingCleanupIncomplete {
+		m.markCleanupPending(id, deleteFiles, "Remote cleanup pending for a previous submission; the removal will be retried")
+		return pendingCleanupErr
+	}
 	// The snapshot above was captured before a concurrent caller's flag
 	// could be folded into the row through the removing-guard merge;
 	// re-read the row so the local cleanup decision sees the merged value.
@@ -732,6 +767,7 @@ func (m *Manager) remove(id string, deleteFiles bool) error {
 	// A re-added job with the same derived ID would otherwise inherit the
 	// removed job's report counter and start dead-lettered.
 	delete(m.failureReportPolls, id)
+	delete(m.missingTransferPolls, id)
 	if err := m.saveLocked(); err != nil {
 		m.jobs[id] = cur
 		if hadPolls {
@@ -770,6 +806,50 @@ func (m *Manager) reconcileOrphanTransfer(folderID string) (int, error) {
 		deleted++
 	}
 	return deleted, nil
+}
+
+// cleanupCloudResources leaves uncertain outcomes pending until an orphan
+// is positively found. Its record belongs to one attempt, not the folder
+// that a concurrent re-grab may reserve for its next submission.
+func (m *Manager) cleanupCloudResources(cleanup cloudCleanup) (bool, error) {
+	if cleanup.TransferID != "" {
+		if err := m.pm.DeleteTransfer(cleanup.TransferID); err != nil && !transferDeleteGone(err) {
+			return false, err
+		}
+	}
+	if err := m.pm.DeleteFolder(cleanup.Folder); err != nil && !folderDeleteGone(err) {
+		return false, err
+	}
+	if cleanup.TransferUnknown {
+		deleted, err := m.reconcileOrphanTransfer(cleanup.Folder)
+		return deleted > 0, err
+	}
+	return true, nil
+}
+
+func (m *Manager) finishCloudCleanup(id string, attempt uint64, cleanup cloudCleanup) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cur := m.jobs[id]; cur != nil {
+		previous := *cur
+		if cur.Attempt == attempt && cur.CloudFolder == cleanup.Folder {
+			cur.CloudFolder = ""
+			cur.CleanupPending = false
+			cur.TransferUnknown = false
+		}
+		pending := make([]cloudCleanup, 0, len(cur.PendingCleanup))
+		for _, old := range cur.PendingCleanup {
+			if old != cleanup {
+				pending = append(pending, old)
+			}
+		}
+		cur.PendingCleanup = pending
+		if err := m.saveLocked(); err != nil {
+			*cur = previous
+			return err
+		}
+	}
+	return nil
 }
 
 // Persist each remote deletion separately so an outage or restart resumes
@@ -841,6 +921,10 @@ func (m *Manager) SetTorrentFailureReporter(reporter func(Job) ([]string, error)
 // it stays failed and *arr-visible until it is removed.
 const failedReportPollCap = 8
 
+// Require repeated successful account listings before treating an absent
+// transfer as lost. An unavailable API must not fail healthy cloud jobs.
+const missingTransferPollLimit = 3
+
 func (m *Manager) reportFailedTorrents() {
 	m.mu.RLock()
 	reporter := m.failureReporter
@@ -880,7 +964,7 @@ func (m *Manager) reportFailedTorrents() {
 		// episode's acks on the fresh episode would dead-letter it on its
 		// very first pass. Only a row still in the same failure episode
 		// receives the write-back.
-		if j := m.jobs[job.ID]; j != nil && j.Phase == "failed" {
+		if j := m.jobs[job.ID]; j != nil && j.Phase == "failed" && j.Attempt == job.Attempt {
 			// Only no-error passes count against the cap: a transient *arr
 			// outage must not permanently dead-letter the report — the
 			// cap exists to bound the no-ack refetch storm, and error
@@ -945,82 +1029,41 @@ func (m *Manager) PollOnce(ctx context.Context) {
 	for _, j := range deleting {
 		_ = m.remove(j.ID, j.DeleteFiles)
 	}
-	// A completed job whose folder deletion failed at completion keeps a
-	// cleanup-pending flag: retry the folder deletion until it succeeds,
-	// WITHOUT deleting the job row (the download is delivered and *arr may
-	// still be tracking it).
+	// Snapshot cleanup handles by attempt. Re-grabs move old handles into
+	// PendingCleanup before reserving a new folder, so completing an old
+	// cleanup cannot erase or delete the current attempt's resources.
+	type cleanupTask struct {
+		id        string
+		attempt   uint64
+		resources cloudCleanup
+	}
 	m.mu.RLock()
-	cleanup := make([]Job, 0)
+	var cleanup []cleanupTask
 	for _, j := range m.jobs {
-		if j.CleanupPending && !j.DeleteRequested && j.CloudFolder != "" {
-			cleanup = append(cleanup, *j)
+		if j.DeleteRequested {
+			continue
+		}
+		for _, pending := range j.PendingCleanup {
+			cleanup = append(cleanup, cleanupTask{j.ID, j.Attempt, pending})
+		}
+		if j.CleanupPending && j.CloudFolder != "" {
+			cleanup = append(cleanup, cleanupTask{j.ID, j.Attempt, cloudCleanup{
+				Folder: j.CloudFolder, TransferUnknown: j.TransferUnknown,
+			}})
 		}
 	}
 	m.mu.RUnlock()
-	for _, j := range cleanup {
-		cleared := false
-		if err := m.pm.DeleteFolder(j.CloudFolder); err != nil {
-			if !folderDeleteGone(err) {
-				log.Warnf("Direct job %s cloud folder cleanup failed again: %v", j.ID, err)
-				continue
-			}
-			// Already deleted out-of-band: clear the reference.
-			cleared = true
-		} else {
-			cleared = true
+	for _, task := range cleanup {
+		done, err := m.cleanupCloudResources(task.resources)
+		if err != nil {
+			log.Warnf("Direct job %s cloud cleanup failed: %v", task.id, err)
+			continue
 		}
-		if cleared {
-			// A failed job whose submission outcome was unknown (a
-			// post-commit create failure, or a restart mid-"submitting")
-			// may own a server-side transfer no row references: the
-			// just-cleared folder is the last handle on it. Reconcile
-			// against the live row — a job re-queued in the meantime owns
-			// a fresh transfer and must not be treated as an orphan —
-			// and on failure keep the folder reference and the flag so
-			// the next poll's cleanup pass retries.
-			var needsReconcile bool
-			m.mu.RLock()
-			if cur := m.jobs[j.ID]; cur != nil {
-				needsReconcile = cur.Phase == "failed" && cur.TransferID == "" && cur.TransferUnknown
-				// The guard must not be one-sided: a re-queue across the
-				// DeleteFolder round-trip above resets the row to a fresh
-				// episode (phase queued, a fresh unknown flag) while the
-				// pass's snapshot still carries the PREVIOUS episode's
-				// unknown flag. The failed-phase test alone then reads the
-				// reset row and skips the reconcile, so the previous
-				// episode's orphan transfer is named by no remaining code
-				// path and stays on the account permanently.
-				needsReconcile = needsReconcile ||
-					(cur.Phase == "queued" && cur.TransferID == "" && j.TransferUnknown)
-			}
-			m.mu.RUnlock()
-			if needsReconcile {
-				deleted, err := m.reconcileOrphanTransfer(j.CloudFolder)
-				if err != nil {
-					log.Warnf("Direct job %s orphan transfer reconcile failed: %v", j.ID, err)
-					continue
-				}
-				if deleted == 0 {
-					// An empty listing is not proof the submission never
-					// committed: the commit may still be in flight. Keep the
-					// folder reference and the unknown-outcome flag so the
-					// next poll's cleanup pass retries the reconcile; clearing
-					// them now would leave a later-committed transfer named by
-					// no row.
-					continue
-				}
+		if done {
+			if err := m.finishCloudCleanup(task.id, task.attempt, task.resources); err != nil {
+				log.Warnf("Could not persist direct job %s cleanup: %v", task.id, err)
 			}
 		}
-		m.mu.Lock()
-		if cur := m.jobs[j.ID]; cur != nil {
-			if cleared {
-				cur.CloudFolder = ""
-			}
-			cur.CleanupPending = false
-			cur.TransferUnknown = false
-			_ = m.saveLocked()
-		}
-		m.mu.Unlock()
 	}
 	m.mu.RLock()
 	queued := make([]Job, 0)
@@ -1050,6 +1093,26 @@ func (m *Manager) PollOnce(ctx context.Context) {
 		log.Warnf("Could not refresh direct transfer status: %v", err)
 		return
 	}
+	seen := make(map[string]bool, len(transfers))
+	for _, transfer := range transfers {
+		seen[transfer.ID] = true
+	}
+	m.mu.Lock()
+	for id, j := range m.jobs {
+		if j.Phase != "cloud" || j.DeleteRequested || j.TransferID == "" || seen[j.TransferID] {
+			delete(m.missingTransferPolls, id)
+			continue
+		}
+		m.missingTransferPolls[id]++
+		if m.missingTransferPolls[id] >= missingTransferPollLimit {
+			m.markFailedLocked(j, "Premiumize transfer is no longer present on the account")
+			delete(m.missingTransferPolls, id)
+			if err := m.saveLocked(); err != nil {
+				log.Errorf("Could not persist missing direct transfer %s: %v", id, err)
+			}
+		}
+	}
+	m.mu.Unlock()
 	for _, transfer := range transfers {
 		m.mu.Lock()
 		var id string
@@ -1216,7 +1279,7 @@ func (m *Manager) submit(ctx context.Context, id string) error {
 		// reconcile the orphan once the folder deletion converges.
 		m.mu.Lock()
 		if j := m.jobs[id]; j != nil {
-			j.TransferUnknown = true
+			j.TransferUnknown = !errors.Is(err, premiumizeme.ErrTransferNotSubmitted)
 		}
 		m.mu.Unlock()
 		m.fail(id, "Premiumize submission failed; check whether a transfer was created before retrying: "+err.Error())
