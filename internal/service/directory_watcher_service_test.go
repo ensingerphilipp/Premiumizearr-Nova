@@ -173,6 +173,133 @@ func TestProcessUploadCycleQuotaBehavior(t *testing.T) {
 	}
 }
 
+// TestProcessUploadCycleCapCountErrorRecovers is the two-phase probe for
+// review finding R1-9: a transfer-count check failure pauses blackhole
+// submissions, and the next successful check must clear the paused status and
+// resume. Dropping the activeTransferCountCheckFailed reset re-fires the
+// recovery log and fails this test.
+func TestProcessUploadCycleCapCountErrorRecovers(t *testing.T) {
+	var listRequests atomic.Int32
+	var transferRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/account/info":
+			_, _ = response.Write([]byte(`{"status":"success","limit_used":0.5,"booster_points":0}`))
+		case "/api/transfer/list":
+			if listRequests.Add(1) == 1 {
+				response.WriteHeader(http.StatusInternalServerError)
+				_, _ = response.Write([]byte(`{"status":"error"}`))
+				return
+			}
+			_, _ = response.Write([]byte(`{"status":"success","transfers":[{"id":"1","status":"running"}]}`))
+		case "/api/transfer/create":
+			transferRequests.Add(1)
+			_, _ = response.Write([]byte(`{"status":"success"}`))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	service, filePath := newQuotaTestService(t, server, "test-key", "recover.magnet", 2)
+	var logs bytes.Buffer
+	logger := log.StandardLogger()
+	oldOutput := logger.Out
+	logger.SetOutput(&logs)
+	t.Cleanup(func() { logger.SetOutput(oldOutput) })
+
+	if got := service.processUploadCycle(); got != 0 {
+		t.Fatalf("processed count while the count check fails = %d, want 0", got)
+	}
+	if got := service.GetStatus(); got != "Paused: Premiumize active transfer count unavailable" {
+		t.Fatalf("status while paused = %q, want the paused message", got)
+	}
+	if got := transferRequests.Load(); got != 0 {
+		t.Fatalf("transfer requests while paused = %d, want 0", got)
+	}
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("source file was changed while paused: %v", err)
+	}
+
+	service.processUploadCycle()
+	if got := transferRequests.Load(); got != 1 {
+		t.Fatalf("transfer requests after recovery = %d, want 1", got)
+	}
+	if !os.IsNotExist(fileExistsError(filePath)) {
+		t.Fatal("source file still exists after recovery")
+	}
+	if got := service.GetStatus(); got != "Okay" {
+		t.Fatalf("status after recovery = %q, want Okay", got)
+	}
+	if n := strings.Count(logs.String(), "Could not check active Premiumize transfers; blackhole submissions are paused"); n != 1 {
+		t.Fatalf("pause warning count = %d, want 1; logs: %s", n, logs.String())
+	}
+	if n := strings.Count(logs.String(), "Premiumize active transfer count is available again; resuming transfer checks"); n != 1 {
+		t.Fatalf("recovery log count = %d, want 1; logs: %s", n, logs.String())
+	}
+}
+
+// TestProcessUploadCycleCapBlockedRecoversBelowCap covers the
+// wasBlocked/blocked transition pair of updateActiveTransferLimitStatus: a
+// cap-blocked cycle pauses submissions, and the next successful check below
+// the cap must log the resume exactly once and clear the paused status.
+func TestProcessUploadCycleCapBlockedRecoversBelowCap(t *testing.T) {
+	var listRequests atomic.Int32
+	var transferRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/account/info":
+			_, _ = response.Write([]byte(`{"status":"success","limit_used":0.5,"booster_points":0}`))
+		case "/api/transfer/list":
+			if listRequests.Add(1) == 1 {
+				_, _ = response.Write([]byte(`{"status":"success","transfers":[{"id":"1","status":"running"}]}`))
+				return
+			}
+			_, _ = response.Write([]byte(`{"status":"success","transfers":[]}`))
+		case "/api/transfer/create":
+			transferRequests.Add(1)
+			_, _ = response.Write([]byte(`{"status":"success"}`))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+
+	service, filePath := newQuotaTestService(t, server, "test-key", "blocked.magnet", 1)
+	var logs bytes.Buffer
+	logger := log.StandardLogger()
+	oldOutput := logger.Out
+	logger.SetOutput(&logs)
+	t.Cleanup(func() { logger.SetOutput(oldOutput) })
+
+	if got := service.processUploadCycle(); got != 0 {
+		t.Fatalf("processed count while blocked = %d, want 0", got)
+	}
+	if got := service.GetStatus(); got != "Paused: 1 active Premiumize transfers (limit 1)" {
+		t.Fatalf("status while blocked = %q, want the cap-paused message", got)
+	}
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("source file was changed while blocked: %v", err)
+	}
+
+	service.processUploadCycle()
+	if got := transferRequests.Load(); got != 1 {
+		t.Fatalf("transfer requests after resume = %d, want 1", got)
+	}
+	if !os.IsNotExist(fileExistsError(filePath)) {
+		t.Fatal("source file still exists after resume")
+	}
+	if got := service.GetStatus(); got != "Okay" {
+		t.Fatalf("status after resume = %q, want Okay", got)
+	}
+	if n := strings.Count(logs.String(), "pausing blackhole submissions at configured limit"); n != 1 {
+		t.Fatalf("cap pause warning count = %d, want 1; logs: %s", n, logs.String())
+	}
+	if n := strings.Count(logs.String(), "resuming blackhole submissions"); n != 1 {
+		t.Fatalf("resume log count = %d, want 1; logs: %s", n, logs.String())
+	}
+}
+
 func TestProcessUploadCycleResumesAndSuppressesRepeatedWarnings(t *testing.T) {
 	var accountRequests atomic.Int32
 	var transferRequests atomic.Int32
