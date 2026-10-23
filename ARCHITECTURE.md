@@ -138,7 +138,7 @@ serves the SPA from ./static + JSON API. No authentication by design.
 - `verify.yml` — PR-triggered, runs `scripts/verify` (below); the
   `verify (scripts/verify)` check is a required merge check on `main`
   (rule set `main-quality-gate`).
-- Version 1.5.1 is hardcoded manually (banner in `main.go`, README, git tag).
+- Version 1.5.5 is hardcoded manually (banner in `main.go`, README, git tag).
 
 ## Approved technical decisions
 
@@ -211,9 +211,12 @@ checks; never downloads or installs toolchains (verification exports
      read under `mu` elsewhere.
    - `WebServerService.ConfigUpdatedCallback` does `srv.Close()` + `Start()`
      from a handler goroutine and overwrites the global `indexBytes`.
-3. `HandleErrorTransfer` goroutine storm: spawned every 15s per still-errored,
-   history-matched transfer → concurrent/repeated `Fail()` +
-   `DeleteTransfer()`.
+3. FIXED (PR #76): `HandleErrorTransfer` goroutine storm (spawned every 15s
+   per still-errored, history-matched transfer → concurrent/repeated
+   `Fail()` + `DeleteTransfer()`) — the transfer manager now gates each
+   errored transfer on a per-ID processing slot and settles its tracking
+   state only after a successful report/delete, so report/delete is never
+   repeated concurrently.
 
 **Other risks:**
 

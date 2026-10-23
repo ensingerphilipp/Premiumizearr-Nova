@@ -23,6 +23,8 @@ type DirectoryWatcherService struct {
 	config             *config.Config
 	Queue              *stringqueue.StringQueue
 	status             string
+	quotaBlocked       bool
+	quotaCheckFailed   bool
 	downloadsFolderID  string
 	watchDirectory     *directory_watcher.WatchDirectory
 }
@@ -128,12 +130,10 @@ func (dw *DirectoryWatcherService) directoryScan(p string) {
 	}
 
 	for _, file := range files {
-		go func(file os.FileInfo) {
-			file_path := path.Join(p, file.Name())
-			if dw.checkFile(file_path) == 1 {
-				dw.addFileToQueue(file_path)
-			}
-		}(file)
+		filePath := path.Join(p, file.Name())
+		if dw.checkFile(filePath) == 1 {
+			dw.addFileToQueue(filePath)
+		}
 	}
 }
 
@@ -168,22 +168,89 @@ func (dw *DirectoryWatcherService) addFileToQueue(path string) {
 
 func (dw *DirectoryWatcherService) processUploads() {
 	for {
-		if dw.Queue.Len() < 1 {
-			log.Trace("No files in Queue, sleeping for 10 seconds")
+		processed := dw.processUploadCycle()
+		if processed == 0 {
+			if dw.Queue.Len() == 0 {
+				log.Trace("No files in queue, sleeping for 10 seconds")
+			} else {
+				log.Trace("Blackhole submissions are paused, checking quota again in 10 seconds")
+			}
 			time.Sleep(time.Second * time.Duration(10))
+		} else {
+			time.Sleep(2 * time.Second)
 		}
+	}
+}
 
+// processUploadCycle checks the account once and processes the files that were
+// queued at the start of the cycle. Files added during processing wait for the
+// next cycle and its fresh quota check.
+func (dw *DirectoryWatcherService) processUploadCycle() int {
+	queuedFiles := dw.Queue.Len()
+	if queuedFiles == 0 || !dw.submissionsAllowed() {
+		return 0
+	}
+
+	processed := 0
+	for range queuedFiles {
 		isQueueFile, filePath := dw.Queue.PopTopOfQueue()
 		if !isQueueFile {
-			time.Sleep(time.Second * time.Duration(10))
+			break
+		}
+		if filePath == "" {
+			log.Error("Received an empty path from the blackhole queue")
 			continue
 		}
 
-		if filePath == "" {
-			continue
+		if processed > 0 {
+			time.Sleep(2 * time.Second)
 		}
-		time.Sleep(dw.processUpload(filePath))
+		processed++
+		if delay := dw.processUpload(filePath); delay > 2*time.Second {
+			// processUpload has requeued the failed source. Stop this batch so
+			// the worker backs off before retrying with a fresh quota check.
+			return 0
+		}
 	}
+
+	return processed
+}
+
+func (dw *DirectoryWatcherService) submissionsAllowed() bool {
+	accountInfo, err := dw.premiumizemeClient.GetAccountInfo()
+	if err != nil {
+		dw.mu.Lock()
+		alreadyFailed := dw.quotaCheckFailed
+		dw.quotaCheckFailed = true
+		dw.status = "Premiumize fair-use quota unknown; continuing submissions"
+		// Preserve the last known quota state across failed lookups so a
+		// transient error does not duplicate pause logs or hide recovery.
+		dw.mu.Unlock()
+		if !alreadyFailed {
+			log.Warnf("Could not check Premiumize fair-use quota; continuing with existing submission behavior: %s", err)
+		}
+		return true
+	}
+
+	exhausted := accountInfo.QuotaExhausted()
+	dw.mu.Lock()
+	dw.quotaCheckFailed = false
+	wasBlocked := dw.quotaBlocked
+	dw.quotaBlocked = exhausted
+	if exhausted {
+		dw.status = "Paused: Premiumize fair-use quota exhausted"
+	} else {
+		dw.status = "Okay"
+	}
+	dw.mu.Unlock()
+
+	if exhausted && !wasBlocked {
+		log.Warn("Premiumize fair-use quota is exhausted and no booster points are available; new blackhole submissions are paused and files will remain untouched")
+	} else if !exhausted && wasBlocked {
+		log.Info("Premiumize fair-use quota is available; resuming blackhole submissions")
+	}
+
+	return !exhausted
 }
 
 // processUpload handles one queue entry and returns the delay before the next.

@@ -54,4 +54,11 @@ type Config struct {
 	TransferOnlyMode      bool `yaml:"TransferOnlyMode" json:"TransferOnlyMode"`
 
 	ArrHistoryUpdateIntervalSeconds int `yaml:"ArrHistoryUpdateIntervalSeconds" json:"ArrHistoryUpdateIntervalSeconds"`
+
+	// ErroredTransferDeleteGracePeriodSeconds is how long an errored
+	// premiumize.me transfer without a matching "grabbed" *arr history
+	// record is kept (and re-checked against all configured *arrs) before
+	// it is deleted from premiumize.me. Values <= 0 fall back to the
+	// default of 300 seconds (5 minutes).
+	ErroredTransferDeleteGracePeriodSeconds int `yaml:"ErroredTransferDeleteGracePeriodSeconds" json:"ErroredTransferDeleteGracePeriodSeconds"`
 }

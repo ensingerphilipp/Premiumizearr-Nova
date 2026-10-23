@@ -7,6 +7,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -123,6 +124,7 @@ func TestAPITransportErrorsRedactKeys(t *testing.T) {
 	})
 	defer func() { http.DefaultTransport = old }()
 	cases := map[string]func() error{
+		"account/info":    func() error { _, err := client.GetAccountInfo(); return err },
 		"transfer/create": func() error { return client.CreateTransfer(file.Name(), "folder") },
 		"transfer/list":   func() error { _, err := client.GetTransfers(); return err },
 		"folder/list":     func() error { _, err := client.ListFolder("folder"); return err },
@@ -140,6 +142,9 @@ func TestAPITransportErrorsRedactKeys(t *testing.T) {
 			err := call()
 			if err == nil {
 				t.Fatal("expected transport error")
+			}
+			if errors.Unwrap(err) != nil {
+				t.Fatal("redacted error retained its credential-bearing cause")
 			}
 			for _, format := range []string{"%s", "%v", "%+v", "%#v"} {
 				message := fmt.Sprintf(format, err)
@@ -182,5 +187,67 @@ func TestTransferFailuresHaveStableClassification(t *testing.T) {
 				t.Fatal("unknown failure misclassified")
 			}
 		})
+	}
+}
+
+func TestAccountErrorIncludesRedactedReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"status":"error","message":"invalid key secret-key"}`))
+	}))
+	defer server.Close()
+	client := NewPremiumizemeClient("secret-key")
+	client.APIBaseURL = server.URL
+	_, err := client.GetAccountInfo()
+	if err == nil || !strings.Contains(err.Error(), "invalid key") || strings.Contains(err.Error(), "secret-key") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestRequestErrorsRedactsAPIKey verifies that network-level request errors
+// (a *url.Error whose message embeds the request URL, and therefore the
+// apikey query parameter) are returned with the API key redacted, so they
+// can be logged without leaking the key. A key with URL-special characters
+// is exercised too, so the QueryEscape/PathEscape replacement arms run:
+// the request URL carries the key in its escaped form.
+func TestRequestErrorsRedactsAPIKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	baseURL := server.URL + "/api/"
+	// Closing the server makes the request fail at the network level with
+	// a *url.Error containing the full request URL.
+	server.Close()
+
+	for _, apiKey := range []string{"super-secret-api-key", "my key+with/special&chars"} {
+		client := NewPremiumizemeClient(apiKey)
+		client.APIBaseURL = baseURL
+
+		operations := []struct {
+			name string
+			run  func() error
+		}{
+			{
+				name: "GetTransfers",
+				run: func() error {
+					_, err := client.GetTransfers()
+					return err
+				},
+			},
+			{
+				name: "DeleteTransfer",
+				run: func() error {
+					return client.DeleteTransfer("t1")
+				},
+			},
+		}
+		for _, op := range operations {
+			err := op.run()
+			if err == nil || !strings.Contains(err.Error(), "[REDACTED]") {
+				t.Fatalf("%s with key %q: error = %v, want a network error containing [REDACTED]", op.name, apiKey, err)
+			}
+			for _, secret := range []string{apiKey, url.QueryEscape(apiKey), url.PathEscape(apiKey)} {
+				if secret != "" && strings.Contains(err.Error(), secret) {
+					t.Fatalf("%s with key %q: error leaks the API key (form %q): %v", op.name, apiKey, secret, err)
+				}
+			}
+		}
 	}
 }
