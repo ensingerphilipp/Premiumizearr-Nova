@@ -300,6 +300,44 @@ func TestProcessUploadCycleCapBlockedRecoversBelowCap(t *testing.T) {
 	}
 }
 
+// TestActivePremiumizeTransferCountCountsOnlyQueuedAndRunning is the
+// acceptance test for review finding R1-13: the counter must count
+// case/whitespace-insensitive "queued" and "running" statuses and exclude
+// inactive and empty statuses. Mutating the switch to "running" only makes
+// this fail (the fixture contains four queued/running variants).
+func TestActivePremiumizeTransferCountCountsOnlyQueuedAndRunning(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/transfer/list" {
+			http.NotFound(response, request)
+			return
+		}
+		_, _ = response.Write([]byte(`{"status":"success","transfers":[` +
+			`{"id":"1","status":"queued"},` +
+			`{"id":"2","status":"running"},` +
+			`{"id":"3","status":"QUEUED"},` +
+			`{"id":"4","status":" running "},` +
+			`{"id":"5","status":"done"},` +
+			`{"id":"6"}` +
+			`]}`))
+	}))
+	defer server.Close()
+
+	client := premiumizeme.NewPremiumizemeClient("test-key")
+	client.APIBaseURL = server.URL + "/api/"
+	client.HTTPClient = server.Client()
+
+	service := NewDirectoryWatcherService()
+	service.Init(&client, &config.Config{})
+
+	got, err := service.activePremiumizeTransferCount()
+	if err != nil {
+		t.Fatalf("activePremiumizeTransferCount() error = %v, want nil", err)
+	}
+	if got != 4 {
+		t.Fatalf("active count = %d, want 4 (queued/running variants only; inactive and empty statuses excluded)", got)
+	}
+}
+
 func TestProcessUploadCycleResumesAndSuppressesRepeatedWarnings(t *testing.T) {
 	var accountRequests atomic.Int32
 	var transferRequests atomic.Int32
