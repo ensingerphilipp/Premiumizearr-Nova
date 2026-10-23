@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/stringqueue"
 	log "github.com/sirupsen/logrus"
@@ -393,5 +394,85 @@ func TestDuplicateQueueAdditionIsNotLoggedAsAdded(t *testing.T) {
 	svc.addFileToQueue("same.magnet")
 	if n := strings.Count(logs.String(), "added to Queue"); n != 1 {
 		t.Fatalf("addition logs = %d", n)
+	}
+}
+
+// TestBlackholeWatcherStartsWhenDirectoryAppears is the regression test
+// for the finding that a blackhole directory missing at boot left the
+// watcher nil forever: a later config update to an existing directory
+// logged a restart but never started the watcher, so files dropped in
+// the new directory were silently ignored.
+func TestBlackholeWatcherStartsWhenDirectoryAppears(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/folder/list":
+			fmt.Fprint(w, `{"status":"success","content":[]}`)
+		case "/api/folder/create":
+			fmt.Fprint(w, `{"status":"success","id":"downloads-root"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	pm := premiumizeme.NewPremiumizemeClient("test-secret")
+	pm.APIBaseURL = server.URL + "/api/"
+	pm.HTTPClient = server.Client()
+
+	missingDir := filepath.Join(t.TempDir(), "not-yet")
+	cfg := &config.Config{
+		TransferDirectory:      "arrDownloads",
+		BlackholeDirectory:     missingDir,
+		PollBlackholeDirectory: false,
+	}
+	newSvc := NewDirectoryWatcherService()
+	svc := &newSvc
+	svc.premiumizemeClient = &pm
+	svc.config = cfg
+
+	svc.Start()
+
+	svc.mu.RLock()
+	watcher := svc.watchDirectory
+	svc.mu.RUnlock()
+	if watcher != nil {
+		t.Fatal("watcher started for a missing blackhole directory")
+	}
+
+	// The directory now exists. UpdateConfig mutates the shared struct
+	// before the callbacks run; emulate that mutation here.
+	newDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(newDir, "drop.magnet"), []byte("magnet:?xt=urn:btih:appears-later"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldCfg := *cfg
+	cfg.BlackholeDirectory = newDir
+	svc.ConfigUpdatedCallback(oldCfg, *cfg)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		svc.mu.RLock()
+		watcher = svc.watchDirectory
+		svc.mu.RUnlock()
+		if watcher != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("watcher did not start after the blackhole directory appeared")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Cleanup(func() { _ = watcher.Stop() })
+
+	// The initial scan must have picked up the already-dropped file.
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if svc.Queue.Len() == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("queue length = %d, want 1 after the initial scan", svc.Queue.Len())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

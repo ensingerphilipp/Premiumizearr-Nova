@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
+	"github.com/ensingerphilipp/premiumizearr-nova/internal/directclient"
 	"github.com/gorilla/mux"
 	log "github.com/sirupsen/logrus"
 )
@@ -31,6 +32,7 @@ type WebServerService struct {
 	directoryWatcherService *DirectoryWatcherService
 	arrsManagerService      *ArrsManagerService
 	config                  *config.Config
+	directManager           *directclient.Manager
 	srv                     *http.Server
 	listener                net.Listener
 }
@@ -48,6 +50,12 @@ func normalizeWebRoot(webRoot string) string {
 	return webRoot
 }
 
+// compatAPIPrefixes are the fixed root prefixes the direct *arr compat
+// handlers (qBittorrent and SABnzbd) are mounted at in Start. A WebRoot on
+// one of those prefixes would make the SPA route and the compat API fight
+// over the same paths, so the prefixes are reserved during validation.
+var compatAPIPrefixes = []string{"/qbit", "/sab"}
+
 // validateWebRoot returns the canonical WebRoot usable as a mux route
 // pattern, or an error. The WebRoot becomes a gorilla/mux route pattern on
 // every (re)start (see issue #90 review R2-1), so values with mux
@@ -55,11 +63,19 @@ func normalizeWebRoot(webRoot string) string {
 // route construction or otherwise take down the running web surface.
 // Allowed: the empty string (host root) and plain nested paths such as
 // "/apps/nova" — non-empty segments of ASCII letters, digits, ".", "_" and
-// "-", separated by single slashes.
+// "-", separated by single slashes. The compat API prefixes are reserved.
 func validateWebRoot(webRoot string) (string, error) {
 	webRoot = normalizeWebRoot(webRoot)
 	if webRoot == "" {
 		return "", nil
+	}
+	for _, reserved := range compatAPIPrefixes {
+		// Exact match, the ". "-suffixed variant (a UI under "/qbit."
+		// would still sit in front of the API in browser paths), and any
+		// path nested under the prefix (mux PathPrefix semantics).
+		if webRoot == reserved || webRoot == reserved+"." || strings.HasPrefix(webRoot, reserved+"/") {
+			return "", fmt.Errorf("invalid WebRoot %q: collides with the reserved direct *arr compat API prefix %q (the built-in qBittorrent/SABnzbd endpoints are mounted at fixed root paths); choose a different path", webRoot, reserved)
+		}
 	}
 	for _, segment := range strings.Split(strings.TrimPrefix(webRoot, "/"), "/") {
 		if segment == "" {
@@ -84,6 +100,9 @@ func (s WebServerService) New() WebServerService {
 	s.transferManager = nil
 	s.directoryWatcherService = nil
 	s.arrsManagerService = nil
+	// Re-initialization must not keep serving the previous direct
+	// manager (and its credentials) on the compat endpoints.
+	s.directManager = nil
 	s.srv = nil
 	s.listener = nil
 	return s
@@ -92,7 +111,8 @@ func (s WebServerService) New() WebServerService {
 func (s *WebServerService) ConfigUpdatedCallback(currentConfig config.Config, newConfig config.Config) {
 	if currentConfig.BindIP != newConfig.BindIP ||
 		currentConfig.BindPort != newConfig.BindPort ||
-		currentConfig.WebRoot != newConfig.WebRoot {
+		currentConfig.WebRoot != newConfig.WebRoot ||
+		currentConfig.DirectClientAPIKey != newConfig.DirectClientAPIKey {
 		// Validate before touching the running server: a rejected change
 		// must leave the current web surface up (R2-1).
 		if _, err := validateWebRoot(newConfig.WebRoot); err != nil {
@@ -116,6 +136,10 @@ func (s *WebServerService) Init(transferManager *TransferManagerService, directo
 	s.directoryWatcherService = directoryWatcher
 	s.arrsManagerService = arrManager
 	s.config = config
+}
+
+func (s *WebServerService) SetDirectManager(manager *directclient.Manager) {
+	s.directManager = manager
 }
 
 func (s *WebServerService) Start() {
@@ -160,6 +184,11 @@ func (s *WebServerService) Start() {
 	}
 
 	r := mux.NewRouter()
+	if s.directManager != nil {
+		// *arr speaks these protocols directly, independent of UI WebRoot.
+		r.PathPrefix("/qbit/").Handler(http.StripPrefix("/qbit", directclient.NewQBitHandler(s.directManager, "premiumizearr", s.config.DirectClientAPIKey)))
+		r.PathPrefix("/sab/").Handler(http.StripPrefix("/sab", directclient.NewSABHandler(s.directManager, s.config.DirectClientAPIKey)))
+	}
 	registerAPIRoutes := func(rt *mux.Router) {
 		rt.HandleFunc("/api/transfers", s.TransfersHandler)
 		rt.HandleFunc("/api/downloads", s.DownloadsHandler)

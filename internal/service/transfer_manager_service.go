@@ -10,6 +10,7 @@ import (
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/arr"
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
+	"github.com/ensingerphilipp/premiumizearr-nova/internal/directclient"
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/progress_downloader"
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/utils"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
@@ -37,6 +38,7 @@ type TransferManagerService struct {
 	premiumizemeClient    *premiumizeme.Premiumizeme
 	arrsManager           *ArrsManagerService
 	config                *config.Config
+	directManager         *directclient.Manager
 	lastUpdated           int64
 	transfers             []premiumizeme.Transfer
 	runningTask           bool
@@ -80,6 +82,10 @@ func (t *TransferManagerService) Init(pme *premiumizeme.Premiumizeme, arrsManage
 	t.CleanUpDownloadDirPeriod()
 }
 
+func (t *TransferManagerService) SetDirectManager(manager *directclient.Manager) {
+	t.directManager = manager
+}
+
 func (t *TransferManagerService) CleanUpDownloadDirPeriod() {
 	log.Info("Cleaning download directory - deleting files older than 4 days")
 
@@ -101,6 +107,9 @@ func (t *TransferManagerService) CleanUpDownloadDirPeriod() {
 		// Skip the base directory itself
 		if path == downloadBase {
 			return nil
+		}
+		if path == filepath.Join(downloadBase, "direct") && info.IsDir() {
+			return filepath.SkipDir // Direct jobs are retained until *arr removes them.
 		}
 
 		// Check if the file/directory is older than 4 days
@@ -130,7 +139,21 @@ func (t *TransferManagerService) CleanUpDownloadDir() {
 		return
 	}
 
-	err = utils.RemoveContents(downloadBase)
+	// Changing the legacy download directory must not delete completed
+	// direct jobs still waiting for an *arr import.
+	entries, readErr := os.ReadDir(downloadBase)
+	if readErr != nil {
+		log.Errorf("Error reading download directory: %s", readErr)
+		return
+	}
+	for _, entry := range entries {
+		if entry.Name() == "direct" {
+			continue
+		}
+		if removeErr := os.RemoveAll(filepath.Join(downloadBase, entry.Name())); removeErr != nil {
+			err = removeErr
+		}
+	}
 	if err != nil {
 		log.Errorf("Error cleaning download directory: %s", err.Error())
 		return
@@ -193,6 +216,9 @@ func (manager *TransferManagerService) TaskUpdateTransfersList() {
 	for i := range transfers {
 		transfer := &transfers[i]
 		currentTransferIDs[transfer.ID] = true
+		if manager.directManager != nil && manager.directManager.OwnsTransfer(transfer.ID) {
+			continue // Direct jobs report their own status and failures to *arr.
+		}
 		if transfer.Status != "error" {
 			// No longer errored: stop tracking so the transfer is not
 			// carried over into a later grace period.
@@ -555,7 +581,10 @@ func (manager *TransferManagerService) TaskCheckPremiumizeDownloadsFolder() {
 			continue
 		}
 
-		if manager.countDownloads() < manager.config.SimultaneousDownloads {
+		// A non-positive limit means unlimited here, the same contract
+		// the direct slot gate uses: a config that carries 0 through
+		// this door must not silently stall every completed transfer.
+		if manager.config.SimultaneousDownloads <= 0 || manager.countDownloads() < manager.config.SimultaneousDownloads {
 			log.Debugf("Processing completed item: %s", item.Name)
 			manager.HandleFinishedItem(item, manager.config.DownloadsDirectory)
 			//Sleep for one Second to let Asynchronous Downloads Start and Update
@@ -741,6 +770,19 @@ func (manager *TransferManagerService) downloadFolderRecursively(item premiumize
 			err = progress_downloader.DownloadFile(checkcertificate, ratelimit, link, fileSavePath, manager.downloadList[item.Name].ProgressDownloader)
 			if err != nil {
 				manager.removeDownload(item.Name)
+				// This caller writes straight to the FINAL name inside the
+				// *arr-watched folder, so a failed download leaves a
+				// truncated file there: the blackhole would import the
+				// partial content, and a later resume (wget -c) would
+				// accept the stale bytes against different content. The
+				// directclient caller is exempt — it stages under an
+				// invisible ID-suffixed name and renames on success — so
+				// the keep-on-failure there is safe. Remove the file here
+				// to restore "a file in the watched folder is a completed
+				// download".
+				if rerr := os.Remove(fileSavePath); rerr != nil && !os.IsNotExist(rerr) {
+					log.Warnf("could not remove failed partial file %s: %s", fileSavePath, rerr)
+				}
 				manager.markDownloadFailed(item.Name)
 				log.Errorf("Error downloading file %s: %s, continuing with other files", item.Name, err)
 				folderHasErrors = true
