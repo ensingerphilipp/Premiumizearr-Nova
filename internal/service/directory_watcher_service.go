@@ -260,13 +260,31 @@ func (dw *DirectoryWatcherService) activePremiumizeTransferCount() (int, error) 
 	return active, nil
 }
 
-func (dw *DirectoryWatcherService) pauseForTransferCountError(err error) {
+// setPausedState applies one pause/recovery transition of a pause mechanism
+// (the fair-use quota or the active transfer count) under dw.mu: it
+// snapshots the mechanism's check-failed and blocked flags, replaces the
+// check-failed flag with failedValue, replaces the blocked flag with
+// blockedValue unless blockedFlag is nil (which preserves its last value),
+// and stores status. It returns the previous flag values so the caller can
+// log the transition. The quota error path passes a nil blockedFlag on
+// purpose: a failed lookup must preserve the last known quota state so a
+// transient error does not duplicate pause logs or hide recovery, while the
+// transfer-count error path clears the block instead.
+func (dw *DirectoryWatcherService) setPausedState(failedFlag, blockedFlag *bool, failedValue, blockedValue bool, status string) (previouslyFailed, wasBlocked bool) {
 	dw.mu.Lock()
-	alreadyFailed := dw.activeTransferCountCheckFailed
-	dw.activeTransferCountCheckFailed = true
-	dw.activeTransferLimitBlocked = false
-	dw.status = "Paused: Premiumize active transfer count unavailable"
+	previouslyFailed = *failedFlag
+	if blockedFlag != nil {
+		wasBlocked = *blockedFlag
+		*blockedFlag = blockedValue
+	}
+	*failedFlag = failedValue
+	dw.status = status
 	dw.mu.Unlock()
+	return previouslyFailed, wasBlocked
+}
+
+func (dw *DirectoryWatcherService) pauseForTransferCountError(err error) {
+	alreadyFailed, _ := dw.setPausedState(&dw.activeTransferCountCheckFailed, &dw.activeTransferLimitBlocked, true, false, "Paused: Premiumize active transfer count unavailable")
 
 	if !alreadyFailed {
 		log.Warnf("Could not check active Premiumize transfers; blackhole submissions are paused: %s", err)
@@ -274,18 +292,12 @@ func (dw *DirectoryWatcherService) pauseForTransferCountError(err error) {
 }
 
 func (dw *DirectoryWatcherService) updateActiveTransferLimitStatus(active, limit int) {
-	dw.mu.Lock()
-	wasBlocked := dw.activeTransferLimitBlocked
-	checkRecovered := dw.activeTransferCountCheckFailed
-	dw.activeTransferCountCheckFailed = false
 	blocked := active >= limit
-	dw.activeTransferLimitBlocked = blocked
+	status := "Okay"
 	if blocked {
-		dw.status = fmt.Sprintf("Paused: %d active Premiumize transfers (limit %d)", active, limit)
-	} else {
-		dw.status = "Okay"
+		status = fmt.Sprintf("Paused: %d active Premiumize transfers (limit %d)", active, limit)
 	}
-	dw.mu.Unlock()
+	checkRecovered, wasBlocked := dw.setPausedState(&dw.activeTransferCountCheckFailed, &dw.activeTransferLimitBlocked, false, blocked, status)
 
 	if checkRecovered {
 		log.Info("Premiumize active transfer count is available again; resuming transfer checks")
@@ -300,13 +312,7 @@ func (dw *DirectoryWatcherService) updateActiveTransferLimitStatus(active, limit
 func (dw *DirectoryWatcherService) submissionsAllowed() bool {
 	accountInfo, err := dw.premiumizemeClient.GetAccountInfo()
 	if err != nil {
-		dw.mu.Lock()
-		alreadyFailed := dw.quotaCheckFailed
-		dw.quotaCheckFailed = true
-		dw.status = "Premiumize fair-use quota unknown; continuing submissions"
-		// Preserve the last known quota state across failed lookups so a
-		// transient error does not duplicate pause logs or hide recovery.
-		dw.mu.Unlock()
+		alreadyFailed, _ := dw.setPausedState(&dw.quotaCheckFailed, nil, true, false, "Premiumize fair-use quota unknown; continuing submissions")
 		if !alreadyFailed {
 			log.Warnf("Could not check Premiumize fair-use quota; continuing with existing submission behavior: %s", err)
 		}
@@ -314,16 +320,11 @@ func (dw *DirectoryWatcherService) submissionsAllowed() bool {
 	}
 
 	exhausted := accountInfo.QuotaExhausted()
-	dw.mu.Lock()
-	dw.quotaCheckFailed = false
-	wasBlocked := dw.quotaBlocked
-	dw.quotaBlocked = exhausted
+	status := "Okay"
 	if exhausted {
-		dw.status = "Paused: Premiumize fair-use quota exhausted"
-	} else {
-		dw.status = "Okay"
+		status = "Paused: Premiumize fair-use quota exhausted"
 	}
-	dw.mu.Unlock()
+	_, wasBlocked := dw.setPausedState(&dw.quotaCheckFailed, &dw.quotaBlocked, false, exhausted, status)
 
 	if exhausted && !wasBlocked {
 		log.Warn("Premiumize fair-use quota is exhausted and no booster points are available; new blackhole submissions are paused and files will remain untouched")
