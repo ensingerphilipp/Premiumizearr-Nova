@@ -39,7 +39,7 @@ Next Steps:
 
 New blackhole submissions pause automatically when the Premiumize fair-use quota is exhausted and no booster points are available. Existing cloud transfers are not affected. Source files remain in the blackhole directory and are processed automatically after quota replenishment or booster activation.
 
-Blackhole submissions are capped at 20 active Premiumize transfers by default. This leaves five slots free for downloads added manually when your Premiumize limit is 25. Set `MaxActivePremiumizeTransfers` in the configuration to choose a different cap.
+Blackhole submissions are capped at 20 active Premiumize transfers by default. The cap counts every active transfer on the account, including downloads added manually, so it is a shared pool: keep the cap below your Premiumize limit if you want headroom for manual transfers. Set `MaxActivePremiumizeTransfers` in the configuration to choose a different cap.
 
 ## Install
 

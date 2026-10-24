@@ -394,7 +394,7 @@
           min={1}
           disabled={inputDisabled}
           labelText="Maximum Active Premiumize Transfers"
-          helperText="Default 20 leaves five slots for manually added transfers when your Premiumize limit is 25."
+          helperText="Counts every active transfer on the account, including manually added ones - keep it below your Premiumize limit for headroom for manual transfers."
           bind:value={config.MaxActivePremiumizeTransfers}
         />
         <TextInput
