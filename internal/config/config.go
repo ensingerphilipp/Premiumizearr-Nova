@@ -161,6 +161,12 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 		updated = true
 	}
 
+	if configInterface["MaxActivePremiumizeTransfers"] == nil || config.MaxActivePremiumizeTransfers <= 0 {
+		log.Info("MaxActivePremiumizeTransfers not set to a positive value, setting to 20")
+		config.MaxActivePremiumizeTransfers = DefaultMaxActivePremiumizeTransfers
+		updated = true
+	}
+
 	config.altConfigLocation = altConfigLocation
 
 	if updated {
@@ -198,6 +204,7 @@ func defaultConfig() Config {
 		BindPort:                                "8182",
 		WebRoot:                                 "",
 		SimultaneousDownloads:                   5,
+		MaxActivePremiumizeTransfers:            DefaultMaxActivePremiumizeTransfers,
 		DownloadSpeedLimit:                      100,
 		EnableTlsCheck:                          false,
 		TransferOnlyMode:                        false,
