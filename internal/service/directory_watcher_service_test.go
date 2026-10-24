@@ -192,11 +192,18 @@ func TestProcessUploadCycleQuotaBehavior(t *testing.T) {
 	}
 }
 
-// TestProcessUploadCycleCapCountErrorRecovers is the two-phase probe for
-// review finding R1-9: a transfer-count check failure pauses blackhole
-// submissions, and the next successful check must clear the paused status and
-// resume. Dropping the activeTransferCountCheckFailed reset re-fires the
-// recovery log and fails this test.
+// TestProcessUploadCycleCapCountErrorRecovers is the probe for review
+// finding R1-9: a transfer-count check failure pauses blackhole
+// submissions, and the next successful check must clear the paused status
+// and resume. A single fail->recover phase cannot observe the
+// activeTransferCountCheckFailed reset — the recovery log is gated on
+// previouslyFailed, read before the write, and the second cycle
+// re-establishes the identical state — so the body runs a second
+// fail->recover oscillation: the second failure episode must re-fire the
+// pause warning (final count 2), which only happens if the successful check
+// reset the flag. Dropping the reset leaves the flag true, the second
+// episode is treated as a repeat of the first, the warning fires only once,
+// and the final pause-warning-count assertion goes red.
 func TestProcessUploadCycleCapCountErrorRecovers(t *testing.T) {
 	var listRequests atomic.Int32
 	var transferRequests atomic.Int32
@@ -205,7 +212,10 @@ func TestProcessUploadCycleCapCountErrorRecovers(t *testing.T) {
 		case "/api/account/info":
 			_, _ = response.Write([]byte(`{"status":"success","limit_used":0.5,"booster_points":0}`))
 		case "/api/transfer/list":
-			if listRequests.Add(1) == 1 {
+			// The 1st and 3rd list calls fail: the body oscillates
+			// fail, recover, fail, recover, so the pause warning is
+			// expected once per failure episode.
+			if n := listRequests.Add(1); n == 1 || n == 3 {
 				response.WriteHeader(http.StatusInternalServerError)
 				_, _ = response.Write([]byte(`{"status":"error"}`))
 				return
@@ -255,6 +265,41 @@ func TestProcessUploadCycleCapCountErrorRecovers(t *testing.T) {
 	}
 	if n := strings.Count(logs.String(), "Premiumize active transfer count is available again; resuming transfer checks"); n != 1 {
 		t.Fatalf("recovery log count = %d, want 1; logs: %s", n, logs.String())
+	}
+
+	// Second fail->recover oscillation: the second failure episode must
+	// re-fire the pause warning (total 2). That count is the discriminator
+	// for the activeTransferCountCheckFailed reset in the recovery branch:
+	// drop the reset and the second episode is a silent repeat of the
+	// first (count 1, red below).
+	secondPath := filepath.Join(t.TempDir(), "second.magnet")
+	if err := os.WriteFile(secondPath, []byte("magnet:?xt=urn:btih:second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service.Queue.Add(secondPath)
+
+	if got := service.processUploadCycle(); got != 0 {
+		t.Fatalf("processed count while the second count check fails = %d, want 0", got)
+	}
+	if got := service.GetStatus(); got != "Paused: Premiumize active transfer count unavailable" {
+		t.Fatalf("status while paused again = %q, want the paused message", got)
+	}
+
+	service.processUploadCycle()
+	if got := transferRequests.Load(); got != 2 {
+		t.Fatalf("transfer requests after the second recovery = %d, want 2", got)
+	}
+	if !os.IsNotExist(fileExistsError(secondPath)) {
+		t.Fatal("second source file still exists after the second recovery")
+	}
+	if got := service.GetStatus(); got != "Okay" {
+		t.Fatalf("status after the second recovery = %q, want Okay", got)
+	}
+	if n := strings.Count(logs.String(), "Could not check active Premiumize transfers; blackhole submissions are paused"); n != 2 {
+		t.Fatalf("pause warning count = %d, want 2 (a dropped activeTransferCountCheckFailed reset suppresses the second failure episode's warning); logs: %s", n, logs.String())
+	}
+	if n := strings.Count(logs.String(), "Premiumize active transfer count is available again; resuming transfer checks"); n != 2 {
+		t.Fatalf("recovery log count = %d, want 2; logs: %s", n, logs.String())
 	}
 }
 
