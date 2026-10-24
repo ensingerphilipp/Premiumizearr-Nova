@@ -30,6 +30,7 @@ func TestProcessUploadCycleQuotaBehavior(t *testing.T) {
 		transfersStatus  int
 		wantCapPause     bool
 		wantCountError   bool
+		wantStatus       string
 	}{
 		{
 			name:            "exhausted without booster points",
@@ -76,6 +77,21 @@ func TestProcessUploadCycleQuotaBehavior(t *testing.T) {
 			maxTransfers:    1,
 			transfersBody:   `{"status":"success","transfers":[{"id":"1","status":"running"}]}`,
 			wantCapPause:    true,
+		},
+		{
+			// R2-1 pin: the cap-reached and quota-unknown states driven
+			// together — the cap-paused message must win, because the user
+			// is actually paused. A swap of the two switch arms in
+			// updateActiveTransferLimitStatus reports the quota-unknown
+			// string instead and makes this case red.
+			name:             "transfer cap exhausted with quota unknown",
+			accountStatus:    http.StatusInternalServerError,
+			accountResponse:  `{"status":"error"}`,
+			maxTransfers:     1,
+			transfersBody:    `{"status":"success","transfers":[{"id":"1","status":"running"}]}`,
+			wantAccountError: true,
+			wantCapPause:     true,
+			wantStatus:       "Paused: 1 active Premiumize transfers (limit 1)",
 		},
 		{
 			name:            "transfer cap check error",
@@ -165,6 +181,9 @@ func TestProcessUploadCycleQuotaBehavior(t *testing.T) {
 			}
 			if test.wantCountError && !strings.Contains(logs.String(), "Could not check active Premiumize transfers; blackhole submissions are paused") {
 				t.Fatalf("transfer count pause warning was not logged: %s", logs.String())
+			}
+			if got := service.GetStatus(); test.wantStatus != "" && got != test.wantStatus {
+				t.Fatalf("status = %q, want %q", got, test.wantStatus)
 			}
 			if strings.Contains(logs.String(), apiKey) {
 				t.Fatalf("API key appeared in logs: %s", logs.String())
