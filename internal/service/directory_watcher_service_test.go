@@ -781,6 +781,63 @@ func TestConfigUpdatedCallbackLogsCapChange(t *testing.T) {
 	}
 }
 
+// TestConfigUpdatedCallbackClearsCapStateOnDisable drives a cap-blocked
+// state and disables the cap through the callback, asserting the callback
+// clears the cap-derived pause state instead of leaving it stale: the
+// blocked flag and status must return to the normal state ("Okay", or the
+// quota branch's quota-unknown status when the quota lookup is failing),
+// so the UI does not stay pinned at Paused and the one-per-episode pause
+// warning fires again when the cap is re-enabled at the limit.
+func TestConfigUpdatedCallbackClearsCapStateOnDisable(t *testing.T) {
+	t.Run("disabling the cap clears the blocked state", func(t *testing.T) {
+		client := premiumizeme.NewPremiumizemeClient("test-key")
+		svc := NewDirectoryWatcherService()
+		svc.Init(&client, &config.Config{MaxActivePremiumizeTransfers: 2})
+
+		svc.updateActiveTransferLimitStatus(2, 2)
+		if !svc.activeTransferLimitBlocked {
+			t.Fatalf("drive: expected the cap to be blocked, status %q", svc.GetStatus())
+		}
+
+		svc.ConfigUpdatedCallback(config.Config{MaxActivePremiumizeTransfers: 2}, config.Config{MaxActivePremiumizeTransfers: 0})
+
+		if svc.activeTransferLimitBlocked {
+			t.Fatalf("after disabling the cap, activeTransferLimitBlocked = true, want false (status %q)", svc.GetStatus())
+		}
+		if svc.activeTransferCountCheckFailed {
+			t.Fatalf("after disabling the cap, activeTransferCountCheckFailed = true, want false")
+		}
+		if got := svc.GetStatus(); got != "Okay" {
+			t.Fatalf("after disabling the cap, status = %q, want Okay", got)
+		}
+	})
+
+	t.Run("disabling the cap keeps the quota-unknown status", func(t *testing.T) {
+		client := premiumizeme.NewPremiumizemeClient("test-key")
+		svc := NewDirectoryWatcherService()
+		svc.Init(&client, &config.Config{MaxActivePremiumizeTransfers: 2})
+		svc.quotaCheckFailed = true
+
+		svc.updateActiveTransferLimitStatus(2, 2)
+		if !svc.activeTransferLimitBlocked {
+			t.Fatalf("drive: expected the cap to be blocked, status %q", svc.GetStatus())
+		}
+
+		svc.ConfigUpdatedCallback(config.Config{MaxActivePremiumizeTransfers: 2}, config.Config{MaxActivePremiumizeTransfers: 0})
+
+		if svc.activeTransferLimitBlocked {
+			t.Fatalf("after disabling the cap, activeTransferLimitBlocked = true, want false (status %q)", svc.GetStatus())
+		}
+		if svc.activeTransferCountCheckFailed {
+			t.Fatalf("after disabling the cap, activeTransferCountCheckFailed = true, want false")
+		}
+		want := "Premiumize fair-use quota unknown; continuing submissions"
+		if got := svc.GetStatus(); got != want {
+			t.Fatalf("after disabling the cap, status = %q, want %q", got, want)
+		}
+	})
+}
+
 // TestProcessUploadCycleFetchesTransferListOncePerCycle is the probe for
 // review finding R1-7: the cycle fetches /transfer/list once and decides
 // later iterations from the local reservation of its own submissions, so a

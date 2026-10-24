@@ -71,6 +71,14 @@ func (dw *DirectoryWatcherService) ConfigUpdatedCallback(currentConfig config.Co
 
 	if currentConfig.MaxActivePremiumizeTransfers != newConfig.MaxActivePremiumizeTransfers {
 		log.Infof("MaxActivePremiumizeTransfers changed from %d to %d; the new value takes effect on the next upload cycle", currentConfig.MaxActivePremiumizeTransfers, newConfig.MaxActivePremiumizeTransfers)
+		if newConfig.MaxActivePremiumizeTransfers <= 0 {
+			// Disabling the cap drops the next cycle's cap gate, so no
+			// cap-owned status write happens; clear the pause state the cap
+			// left behind, or the Paused status stays pinned and a stale
+			// blocked flag suppresses the one-per-episode pause warning
+			// when the cap is re-enabled at the limit.
+			dw.resetActiveTransferLimitState()
+		}
 	}
 }
 
@@ -306,6 +314,22 @@ func (dw *DirectoryWatcherService) pauseForTransferCountError(err error) {
 	if !alreadyFailed {
 		log.Warnf("Could not check active Premiumize transfers; blackhole submissions are paused: %s", err)
 	}
+}
+
+// resetActiveTransferLimitState clears the cap-derived pause state after the
+// cap has been disabled, restoring the status the quota branch still owns.
+func (dw *DirectoryWatcherService) resetActiveTransferLimitState() {
+	dw.mu.RLock()
+	quotaUnknown := dw.quotaCheckFailed
+	dw.mu.RUnlock()
+
+	status := "Okay"
+	if quotaUnknown {
+		// The quota branch owns the quota-unknown status, mirroring the
+		// healthy-cap branch of updateActiveTransferLimitStatus.
+		status = "Premiumize fair-use quota unknown; continuing submissions"
+	}
+	dw.setPausedState(&dw.activeTransferCountCheckFailed, &dw.activeTransferLimitBlocked, false, false, status)
 }
 
 func (dw *DirectoryWatcherService) updateActiveTransferLimitStatus(active, limit int) {
