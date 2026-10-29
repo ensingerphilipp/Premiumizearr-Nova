@@ -27,7 +27,7 @@ func (arr *SonarrArr) GetHistory() (sonarr.History, error) {
 	defer arr.LastUpdateCountMutex.Unlock()
 
 	if time.Since(arr.LastUpdate) > time.Duration(arr.Config.ArrHistoryUpdateIntervalSeconds)*time.Second || arr.History == nil {
-		his, err := arr.Client.GetHistory(0, 1000)
+		his, err := loadHistoryPages(arr.Client.GetHistoryPage, func(h *sonarr.History) (int, int) { return len(h.Records), h.TotalRecords }, func(dst, page *sonarr.History) { dst.Records = append(dst.Records, page.Records...) })
 		if err != nil {
 			return sonarr.History{}, err
 		}
