@@ -1,6 +1,7 @@
 package arr
 
 import (
+	"fmt"
 	"golift.io/starr"
 	"testing"
 )
@@ -76,5 +77,34 @@ func TestLoadHistoryPagesStopsOnEmptyPage(t *testing.T) {
 	}
 	if len(h.records) != served {
 		t.Fatalf("records = %d, want %d (everything the server actually served)", len(h.records), served)
+	}
+}
+
+// TestLoadHistoryPagesPageFailureDropsPartialHistory pins the
+// mid-pagination error contract: a fetch failure on page >= 2 discards the
+// collected pages and returns (nil, err) - never partial data with a nil
+// error. All three *arr adapters route through this helper, and a refactor
+// that serves the partial history as a successful lookup would let
+// HistoryContains read the incomplete history as an authoritative no-match
+// (IArr contract: a non-nil error must NOT be treated as one) and delete an
+// errored transfer whose matching grab sits in the dropped tail.
+func TestLoadHistoryPagesPageFailureDropsPartialHistory(t *testing.T) {
+	const total = 1500
+	fetch := func(req *starr.PageReq) (*testHistory, error) {
+		if req.Page == 1 {
+			h := &testHistory{total: total}
+			for i := 0; i < 1000; i++ {
+				h.records = append(h.records, i)
+			}
+			return h, nil
+		}
+		return nil, fmt.Errorf("history page %d fetch failed", req.Page)
+	}
+	h, err := loadHistoryPages(fetch, func(h *testHistory) (int, int) { return len(h.records), h.total }, func(a, b *testHistory) { a.records = append(a.records, b.records...) })
+	if err == nil {
+		t.Fatalf("loadHistoryPages = (%v, nil) after a page-2 fetch failure, want (nil, non-nil err): the partial history must not be served as a successful lookup", h)
+	}
+	if h != nil {
+		t.Fatalf("loadHistoryPages returned a partial result (%d records) with an error, want nil", len(h.records))
 	}
 }
