@@ -105,3 +105,21 @@ func TestHistoryContainsOnlyNonGrabbedRecords(t *testing.T) {
 func TestHistoryContainsLookupFailureReturnsError(t *testing.T) {
 	runHistoryLookupFailureTest(t, newTestSonarrArr, "v3")
 }
+
+// TestSonarrGetHistoryCollectsAllRecords pins the Sonarr wrapper's history
+// call site to the paginated loadHistoryPages fetch: with >1000 records the
+// old single arr.Client.GetHistory(0, 1000) call re-reads offset-shifted
+// pages and misses most of the history.
+func TestSonarrGetHistoryCollectsAllRecords(t *testing.T) {
+	runGetHistoryPaginatesAllRecordsTest(t, newTestSonarrArr, "v3", func(a IArr) ([]int64, error) {
+		his, err := a.(*SonarrArr).GetHistory()
+		if err != nil {
+			return nil, err
+		}
+		ids := make([]int64, len(his.Records))
+		for i, rec := range his.Records {
+			ids[i] = rec.ID
+		}
+		return ids, nil
+	})
+}
