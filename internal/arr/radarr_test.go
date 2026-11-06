@@ -38,3 +38,21 @@ func TestRadarrHistoryContainsOnlyNonGrabbedRecords(t *testing.T) {
 func TestRadarrHistoryContainsLookupFailureReturnsError(t *testing.T) {
 	runHistoryLookupFailureTest(t, newTestRadarrArr, "v3")
 }
+
+// TestRadarrGetHistoryCollectsAllRecords pins the Radarr wrapper's history
+// call site to the paginated loadHistoryPages fetch: with >1000 records the
+// old single arr.Client.GetHistory(0, 1000) call re-reads offset-shifted
+// pages and misses most of the history.
+func TestRadarrGetHistoryCollectsAllRecords(t *testing.T) {
+	runGetHistoryPaginatesAllRecordsTest(t, newTestRadarrArr, "v3", func(a IArr) ([]int64, error) {
+		his, err := a.(*RadarrArr).GetHistory()
+		if err != nil {
+			return nil, err
+		}
+		ids := make([]int64, len(his.Records))
+		for i, rec := range his.Records {
+			ids[i] = rec.ID
+		}
+		return ids, nil
+	})
+}

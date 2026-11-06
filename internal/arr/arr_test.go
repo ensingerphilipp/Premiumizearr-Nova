@@ -62,9 +62,31 @@ func newFakeArrServer(t *testing.T, apiVersion string, records []fakeHistoryReco
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
+		// Honor page/pageSize like the real *arr history endpoints
+		// (PagingResource defaults: page=1, pageSize=10), slicing the
+		// record set at offset (page-1)*pageSize. The small 1-2 record
+		// fixtures of the wrapper tests below still arrive in a single
+		// page, while >1000 record tests drive the client's multi-page
+		// loop.
+		query := r.URL.Query()
+		page, pageSize := 1, 10
+		if v, err := strconv.Atoi(query.Get("page")); err == nil && v > 0 {
+			page = v
+		}
+		if v, err := strconv.Atoi(query.Get("pageSize")); err == nil && v > 0 {
+			pageSize = v
+		}
+		start := (page - 1) * pageSize
+		if start > len(fake.records) {
+			start = len(fake.records)
+		}
+		end := start + pageSize
+		if end > len(fake.records) {
+			end = len(fake.records)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"records":      fake.records,
+			"records":      fake.records[start:end],
 			"totalRecords": len(fake.records),
 		})
 	})
@@ -360,5 +382,47 @@ func runHistoryLookupFailureTest(t *testing.T, newArr newArrFunc, apiVersion str
 	}
 	if len(fake.failedIDs) != 0 {
 		t.Fatalf("expected no failed-history calls, got %v", fake.failedIDs)
+	}
+}
+
+// runGetHistoryPaginatesAllRecordsTest pins the wrapper's history call site
+// to the paginated loadHistoryPages fetch. The paging-aware fake serves
+// (page-1)*pageSize-sliced pages like the real endpoints, so with 1076
+// records a call site reverted to the old single arr.Client.GetHistory(0,
+// 1000) call shrinks its page size between requests (AdjustPerPage leaves
+// page 2 at pageSize 76), shifts the server offset (re-reading records
+// 77-152 instead of 1001-1076), and stops at collected >= total with most
+// of the history never fetched; asserting that every record id was
+// collected exactly once then goes red, while the paginating fetch passes.
+func runGetHistoryPaginatesAllRecordsTest(t *testing.T, newArr newArrFunc, apiVersion string, extractIDs func(a IArr) ([]int64, error)) {
+	t.Helper()
+
+	const total = 1076
+	records := make([]fakeHistoryRecord, total)
+	for i := range records {
+		records[i] = fakeHistoryRecord{ID: int64(i + 1), EventType: "grabbed", SourceTitle: fmt.Sprintf("Show.S%03dE01.720p.WEB.x264-GRP.mkv", i+1), Message: "Grabbed"}
+	}
+
+	fake := newFakeArrServer(t, apiVersion, records)
+
+	a := newArr(fake.URL)
+	ids, err := extractIDs(a)
+	if err != nil {
+		t.Fatalf("GetHistory error = %v, want nil", err)
+	}
+	if len(ids) != total {
+		t.Fatalf("GetHistory collected %d records, want %d", len(ids), total)
+	}
+	seen := make(map[int64]int, total)
+	for _, id := range ids {
+		seen[id]++
+	}
+	if len(seen) != total {
+		t.Fatalf("GetHistory collected %d unique record ids, want %d (an offset-shifting page size re-reads earlier records and misses later ones)", len(seen), total)
+	}
+	for _, id := range ids {
+		if seen[id] != 1 {
+			t.Fatalf("record %d collected %d times, want exactly 1", id, seen[id])
+		}
 	}
 }
