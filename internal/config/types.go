@@ -33,6 +33,9 @@ type Config struct {
 
 	//PremiumizemeAPIKey string with yaml and json tag
 	PremiumizemeAPIKey string `yaml:"PremiumizemeAPIKey" json:"PremiumizemeAPIKey"`
+	// DirectClientAPIKey authenticates the qBittorrent and SABnzbd-compatible
+	// interfaces used by *arr. Generated on first start when missing.
+	DirectClientAPIKey string `yaml:"DirectClientAPIKey" json:"DirectClientAPIKey"`
 
 	Arrs []ArrConfig `yaml:"Arrs" json:"Arrs"`
 

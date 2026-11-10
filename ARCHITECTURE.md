@@ -182,6 +182,13 @@ checks; never downloads or installs toolchains (verification exports
   `toolchain go1.24.2` is never edited to make this pass).
 - Node major == 22; npm present.
 - C compiler resolvable (`cc`/`gcc`/`clang`) — required for `go test -race`.
+- `wget` present — the production cloud-folder downloader shells out to it.
+- GNU coreutils `stdbuf` present — the downloader line-buffers wget through
+  it. The gate requires a GNU userland: on non-GNU hosts (e.g. macOS, whose
+  Homebrew ships only the different-named `gstdbuf`) the preflight fails
+  with the platform-accurate requirement instead of an inapplicable
+  install command; run the gate on a GNU/Linux host (CI runs on
+  ubuntu-22.04).
 
 **Mandatory checks, in order (any failure fails the gate):**
 
