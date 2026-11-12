@@ -1,0 +1,570 @@
+#!/usr/bin/env bash
+set -eu
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+# Deliberate tripwire: any direct chown in this process must fail. The
+# fixture phases reach the PATH stub binary instead, because the ownership
+# work runs in a subprocess; xargs can only ever invoke that binary, never
+# this function.
+# shellcheck disable=SC2032
+chown() { echo "Unbounded chown must not run" >&2; exit 1; }
+# The sourced entrypoint is linted on its own; run shellcheck with -x to
+# follow this source (with -x, nothing below this line reports).
+# shellcheck disable=SC1091
+source "$root/docker/root/etc/cont-init.d/30-config"
+
+# canonical_target emits the resolved spelling with exactly one trailing
+# "x" sentinel so $(...) cannot strip newlines that are part of the
+# spelling; strip exactly that one (a spelling may legitimately end in
+# "x" itself, so only one sentinel is ever removed here).
+ct() {
+    local r
+    r="$(canonical_target "$1")"
+    r="${r%x}"
+    printf '%s' "$r"
+}
+# A spelling that ends in a newline cannot cross a $(...) capture at all,
+# so compare those byte-exact through NUL-terminated files instead.
+ctn() {
+    local r
+    r="$(canonical_target "$1")"
+    r="${r%x}"
+    printf '%s\0' "$r"
+}
+
+mount_entry() {
+    printf '20 10 0:1 / %s rw shared:1 - %s server rw\n' "$1" "$2"
+}
+fail() { echo "$*" >&2; exit 1; }
+
+for type in cifs smb3 nfs nfs4 9p ceph glusterfs fuse.sshfs fuse.rclone; do
+    for mount in /downloads /downloads/nested /; do
+        mount_entry "$mount" "$type" > "$tmp/mountinfo"
+        has_network_mount /downloads "$tmp/mountinfo" || fail "missed $type at $mount"
+    done
+done
+mount_entry /media cifs > "$tmp/mountinfo"
+has_network_mount /media/downloads "$tmp/mountinfo" || fail "missed ancestor mount"
+mount_entry '/downloads/with\040spaces' cifs > "$tmp/mountinfo"
+has_network_mount '/downloads/with spaces/subdir' "$tmp/mountinfo" || fail "escaped mountpoint not decoded"
+mount_entry /downloads-other cifs > "$tmp/mountinfo"
+if has_network_mount /downloads "$tmp/mountinfo"; then fail "path prefix matched a sibling"; fi
+mount_entry /downloads ext4 > "$tmp/mountinfo"
+if has_network_mount /downloads "$tmp/mountinfo"; then fail "local storage treated as network"; fi
+
+# A local FUSE overlay (the rootless container runtime's own root
+# filesystem) must stay local at any depth in both of its spellings - the
+# helper name and the kernel-reported "fuse.fuse-overlayfs" (the fuse
+# module prefixes the helper's name) - while the fuse.* mounts above
+# remain network.
+for fstype in fuse-overlayfs fuse.fuse-overlayfs; do
+    for mount in / /downloads /downloads/nested; do
+        mount_entry "$mount" "$fstype" > "$tmp/mountinfo"
+        if has_network_mount /downloads "$tmp/mountinfo"; then
+            fail "$fstype at $mount treated as network"
+        fi
+    done
+done
+
+# The kernel's other escapes decode the same way. The backslash case also
+# pins the ENVIRON transport: a target carrying a literal backslash must
+# reach awk byte-exact (an awk -v value would be re-processed).
+mount_entry '/downloads/a\012b' cifs > "$tmp/mountinfo"
+has_network_mount $'/downloads/a\nb' "$tmp/mountinfo" || fail "newline mountpoint missed by detection"
+mapfile -d '' -t under < <(network_mounts_under /downloads "$tmp/mountinfo")
+[[ "${#under[@]}" -eq 1 ]] || fail "newline mountpoint split the exclusion set into ${#under[@]} elements"
+[[ "${under[0]:-}" == $'/downloads/a\nb' ]] || fail "newline mountpoint not reassembled in the exclusion set"
+mount_entry '/downloads/t\011b' cifs > "$tmp/mountinfo"
+has_network_mount $'/downloads/t\tb' "$tmp/mountinfo" || fail "tab mountpoint not decoded"
+mount_entry '/downloads/w\134x' cifs > "$tmp/mountinfo"
+has_network_mount '/downloads/w\x' "$tmp/mountinfo" || fail "backslash mountpoint not decoded"
+
+# fstype is per record: a record without a " - " separator must not
+# inherit the previous record's fstype, and a record with an empty
+# options field still exposes its fstype at field 7.
+{
+    mount_entry /media cifs
+    printf '30 20 0:2 / /downloads/noinfo rw shared:2\n'
+} > "$tmp/mountinfo"
+has_network_mount /media "$tmp/mountinfo" || fail "cifs record lost next to a separatorless record"
+if has_network_mount /downloads/noinfo "$tmp/mountinfo"; then
+    fail "fstype inherited from the previous record"
+fi
+printf '40 30 0:3 / /opt/x - cifs rw\n' > "$tmp/mountinfo"
+has_network_mount /opt/x "$tmp/mountinfo" || fail "empty-options record not classified (fstype scan must start at field 6)"
+
+# A directory is not a readable mount table: it must report status 2 (the
+# caller skips ownership), not a "no network found" 1.
+mkdir "$tmp/dirinfo"
+set +e
+has_network_mount /downloads "$tmp/dirinfo"
+dirinfo_rc=$?
+set -e
+[[ "$dirinfo_rc" -eq 2 ]] || fail "directory mountinfo returned $dirinfo_rc instead of 2 (would fail open)"
+
+# Stub the supervisor: assert every ownership command is bounded and that
+# failures do not abort initialization or prevent later directories being tried.
+# Invoked from the sourced 30-config as the command name `timeout`; shellcheck
+# sees the call only with -x.
+# shellcheck disable=SC2329
+timeout() { printf '%s\n' "$*" >> "$tmp/calls"; return "${timeout_result:-0}"; }
+# Dispatch every target using its original spelling. Resolution and mount
+# classification belong to the supervised worker, including symlinked defaults.
+DEFAULT_TARGETS=(/data /downloads /transfers /blackhole /opt)
+unset PREMIUMIZEARR_SKIP_CHOWN PUID PGID
+mount_entry /downloads cifs > "$tmp/mountinfo"
+mount_entry /blackhole nfs4 >> "$tmp/mountinfo"
+: > "$tmp/calls"
+configure_permissions "$tmp/mountinfo" > "$tmp/output"
+: > "$tmp/expected"
+for t in "${DEFAULT_TARGETS[@]}"; do
+    printf '%s\n' "--kill-after=2s 10s bash $root/docker/root/etc/cont-init.d/30-config --ownership $t 1000:1000 $tmp/mountinfo" >> "$tmp/expected"
+done
+diff -u "$tmp/expected" "$tmp/calls"
+
+PUID=123
+PGID=456
+timeout_result=124
+: > "$tmp/calls"
+configure_permissions "$tmp/mountinfo" > "$tmp/output"
+[[ "$(wc -l < "$tmp/calls")" -eq "${#DEFAULT_TARGETS[@]}" ]] || fail "a timeout prevented later targets"
+grep -q -- '--ownership /data 123:456' "$tmp/calls" || fail "UID/GID not respected"
+grep -q 'failed or timed out' "$tmp/output" || fail "timeout was not logged"
+
+# Read by the sourced 30-config, not by this script; shellcheck only sees
+# the cross-file use with -x.
+# shellcheck disable=SC2034
+PREMIUMIZEARR_SKIP_CHOWN=true
+: > "$tmp/calls"
+configure_permissions "$tmp/mountinfo" > "$tmp/output"
+[[ ! -s "$tmp/calls" ]] || fail "explicit opt-out still changed ownership"
+
+unset PREMIUMIZEARR_SKIP_CHOWN
+
+# The canonical resolver: a symlink prefix keeps the components that follow
+# it, a parent symlink resolves against the link's location, a plain path
+# keeps its spelling, and a symlink cycle keeps the original spelling with a
+# distinct diagnostic instead of a cap-terminated in-cycle spelling.
+mkdir -p "$tmp/resolve/real" "$tmp/resolve/plain" "$tmp/resolve/pt/a" "$tmp/resolve/one" "$tmp/resolve/two"
+touch "$tmp/resolve/b" "$tmp/resolve/pt/b"
+ln -s real "$tmp/resolve/alias"
+ln -s a "$tmp/resolve/pt/lnk"
+ln -s one "$tmp/resolve/one/one"
+ln -s y "$tmp/resolve/two/x"
+ln -s x "$tmp/resolve/two/y"
+[[ "$(ct "$tmp/resolve/alias/b/c")" == "$tmp/resolve/real/b/c" ]] \
+    || fail "symlink prefix resolution dropped the path suffix"
+[[ "$(ct "$tmp/resolve/pt/lnk/../b")" == "$tmp/resolve/pt/b" ]] \
+    || fail "parent symlink did not resolve to the parent of the link location"
+[[ "$(ct "$tmp/resolve/pt/a/../b")" == "$tmp/resolve/pt/b" ]] \
+    || fail "plain 'a/../b' spelling did not collapse"
+[[ "$(ct "$tmp/resolve/plain/")" == "$tmp/resolve/plain" ]] \
+    || fail "trailing slash was not stripped"
+ct "$tmp/resolve/one/one" > "$tmp/oneout" 2> "$tmp/oneerr"
+[[ "$(cat "$tmp/oneout")" == "$tmp/resolve/one/one" ]] \
+    || fail "1-cycle target must stay a fixed point and keep its spelling"
+if grep -q 'cycle' "$tmp/oneerr"; then
+    fail "1-cycle raised the cycle diagnostic"
+fi
+ct "$tmp/resolve/two/x/z" > "$tmp/twout" 2> "$tmp/twoerr"
+[[ "$(cat "$tmp/twout")" == "$tmp/resolve/two/x/z" ]] \
+    || fail "2-cycle must keep the original spelling, got: $(cat "$tmp/twout")"
+grep -q 'Symlink cycle detected' "$tmp/twoerr" || fail "2-cycle did not raise the cycle diagnostic"
+
+# An absolute link target replaces the prefix wholesale; the relative join
+# above covers the other branch.
+mkdir -p "$tmp/resolve/absreal"
+ln -s "$tmp/resolve/absreal" "$tmp/resolve/absalias"
+[[ "$(ct "$tmp/resolve/absalias/sub")" == "$tmp/resolve/absreal/sub" ]] \
+    || fail "absolute symlink target did not replace the prefix"
+
+# A relative input keeps the caller's cwd as its root: a relative link in
+# the first position joins against ".", never "/".
+mkdir -p "$tmp/resolve2/real"
+touch "$tmp/resolve2/real/b"
+ln -s real "$tmp/resolve2/rel"
+(
+    cd "$tmp/resolve2"
+    [[ "$(ct rel/sub)" == "real/sub" ]]
+) || fail "relative input with a relative link joined against / instead of the caller cwd"
+
+# A decoded newline inside a link target must not truncate the components
+# that follow it.
+mkdir -p "$tmp/resolve/nl/real"$'\n'"end"
+ln -s "real"$'\n'"end" "$tmp/resolve/nl/lnk"
+[[ "$(ct "$tmp/resolve/nl/lnk/sub")" == "$tmp/resolve/nl/real"$'\n'"end/sub" ]] \
+    || fail "newline in a link target dropped the following components"
+
+# collapse_path_dots handles the relative "x/.." forms whose pop target has
+# no slash of its own.
+[[ "$(collapse_path_dots "a/../b")" == "b" ]] || fail "relative 'a/../b' did not collapse"
+[[ "$(collapse_path_dots "a/..")" == "." ]] || fail "relative 'a/..' did not collapse to the relative root"
+[[ "$(collapse_path_dots "/a/..")" == "/" ]] || fail "absolute '/a/..' did not collapse to the root"
+
+# A 3-link acyclic chain converges past pass 2 with no diagnostic; the
+# {1..40} cap must stay above chains this long (a cap mutation to 2 leaves
+# the third link unresolved and fails here).
+mkdir -p "$tmp/resolve/four/d"
+ln -s d "$tmp/resolve/four/c"
+ln -s c "$tmp/resolve/four/b"
+ln -s b "$tmp/resolve/four/a"
+ct "$tmp/resolve/four/a/f" > "$tmp/fourout" 2> "$tmp/fourerr"
+[[ "$(cat "$tmp/fourout")" == "$tmp/resolve/four/d/f" ]] \
+    || fail "3-link acyclic chain did not converge, got: $(cat "$tmp/fourout")"
+if [[ -s "$tmp/fourerr" ]]; then
+    fail "3-link acyclic chain raised a resolver diagnostic: $(cat "$tmp/fourerr")"
+fi
+
+# A chain longer than the 40-pass bound is not a cycle: it must keep the
+# original spelling and say so with the convergence diagnostic, not the
+# cycle one.
+mkdir -p "$tmp/resolve/long/last"
+prev_link=last
+for i in $(seq 1 41); do
+    ln -s "$prev_link" "$tmp/resolve/long/l$i"
+    prev_link="l$i"
+done
+ct "$tmp/resolve/long/l41/x" > "$tmp/longout" 2> "$tmp/longerr"
+[[ "$(cat "$tmp/longout")" == "$tmp/resolve/long/l41/x" ]] \
+    || fail "non-converging chain must keep the original spelling, got: $(cat "$tmp/longout")"
+grep -q 'did not converge' "$tmp/longerr" || fail "cap exhaustion was not reported with the convergence diagnostic"
+if grep -q 'cycle detected' "$tmp/longerr"; then
+    fail "acyclic chain was mislabelled as a cycle"
+fi
+
+# Exercise the real bounded worker against a scratch tree. Stub only chown so
+# the test can run without root and never change ownership outside the fixture.
+mkdir -p "$tmp/bin" "$tmp/local/branch/nested" "$tmp/local/network"
+touch "$tmp/local/config.yaml" "$tmp/local/branch/local.txt" "$tmp/local/.hidden" "$tmp/local/with spaces"
+ln -s "$tmp/local/network" "$tmp/local/link"
+cat > "$tmp/bin/chown" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$OWNERSHIP_CALLS"
+exit "${CHOWN_RESULT:-0}"
+STUB
+chmod +x "$tmp/bin/chown"
+export PATH="$tmp/bin:$PATH"
+export OWNERSHIP_CALLS="$tmp/ownership-calls"
+# Read by the sourced 30-config, not by this script; shellcheck only sees
+# the cross-file use with -x.
+# shellcheck disable=SC2034
+PUID=1000
+# shellcheck disable=SC2034
+PGID=1000
+timeout() { printf '%s\n' "$*" >> "$tmp/deadlines"; command timeout "$@"; }
+
+# In-process direct call: the nested-branch bookkeeping (shopts, exported
+# LC_ALL, mount set) must not leak into the sourcing caller, and the walk
+# must issue the same selective pass the supervised call does.
+mount_entry "$tmp/local" ext4 > "$tmp/mountinfo"
+mount_entry "$tmp/local/network" cifs >> "$tmp/mountinfo"
+mount_entry "$tmp/local/branch/nested" nfs4 >> "$tmp/mountinfo"
+# The assertions below check exactly what SC2031 flags: the nested
+# branch's subshell changes must NOT reach the sourcing caller.
+# shellcheck disable=SC2031
+lc_all_before="${LC_ALL-}"
+# shellcheck disable=SC2031
+export LC_ALL=C.utf8
+chown() { printf '%s\n' "$*" >> "$OWNERSHIP_CALLS"; }
+: > "$OWNERSHIP_CALLS"
+configure_target_ownership "$tmp/local" "1000:1000" "$tmp/mountinfo" > "$tmp/output"
+chown() { echo "Unbounded chown must not run" >&2; exit 1; }
+if [[ -n "$lc_all_before" ]]; then export LC_ALL="$lc_all_before"; else unset LC_ALL; fi
+grep -Fxq -- "-h -- 1000:1000 $tmp/local" "$OWNERSHIP_CALLS" || fail "direct call: local target ownership was skipped"
+grep -Fxq -- "-h -- 1000:1000 $tmp/local/branch" "$OWNERSHIP_CALLS" || fail "direct call: local ancestor of deeper mount was skipped"
+grep -Fxq -- "-h -R -- 1000:1000 $tmp/local/.hidden $tmp/local/config.yaml $tmp/local/link $tmp/local/with spaces" "$OWNERSHIP_CALLS" || fail "direct call: mount-free target siblings were not batched into one chown"
+grep -Fxq -- "-h -R -- 1000:1000 $tmp/local/branch/local.txt" "$OWNERSHIP_CALLS" || fail "direct call: mount-free branch sibling was not chowned"
+[[ "$(wc -l < "$OWNERSHIP_CALLS")" -eq 4 ]] || fail "direct call issued unexpected ownership commands"
+if grep -Fq "$tmp/local/network" "$OWNERSHIP_CALLS" || grep -Fq "$tmp/local/branch/nested" "$OWNERSHIP_CALLS"; then
+    fail "direct call touched a network subtree"
+fi
+[[ "$(shopt -p dotglob)" != "shopt -s dotglob" ]] || fail "nested branch leaked dotglob into the sourcing caller"
+[[ "$(shopt -p nullglob)" != "shopt -s nullglob" ]] || fail "nested branch leaked nullglob into the sourcing caller"
+# shellcheck disable=SC2031
+[[ "${LC_ALL:-}" == "$lc_all_before" ]] || fail "nested branch mutated the sourcing caller's LC_ALL"
+# shellcheck disable=SC2031
+[[ -z "${NETWORK_MOUNTS+x}" ]] || fail "nested branch leaked NETWORK_MOUNTS into the sourcing caller"
+
+# Missing mount information must skip ownership without probing the target.
+: > "$OWNERSHIP_CALLS"
+configure_permissions "$tmp/missing-mountinfo" "$tmp/local" > "$tmp/output" 2>&1
+[[ ! -s "$OWNERSHIP_CALLS" ]] || fail "unknown mounts must not be traversed"
+grep -q 'Cannot read mount information' "$tmp/output" || fail "mount table error was not logged"
+
+# The flat chown must target the original spelling, never an in-cycle one:
+# the supervised resolver keeps its diagnostic on stderr and ownership stays
+# inside the fixture tree.
+mount_entry "$tmp/resolve" ext4 > "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+configure_permissions "$tmp/mountinfo" "$tmp/resolve/two/x/z" > "$tmp/output" 2> "$tmp/cycerr"
+grep -q 'Symlink cycle detected' "$tmp/cycerr" || fail "configure_permissions lost the cycle diagnostic"
+grep -Fxq -- "-R -- 1000:1000 $tmp/resolve/two/x/z" "$OWNERSHIP_CALLS" \
+    || fail "cycle target must chown the original spelling"
+if grep -Fq "$tmp/resolve/two/y" "$OWNERSHIP_CALLS"; then
+    fail "ownership command targeted an in-cycle spelling other than the original"
+fi
+
+mount_entry "$tmp/local" ext4 > "$tmp/mountinfo"
+mount_entry "$tmp/local/network" cifs >> "$tmp/mountinfo"
+mount_entry "$tmp/local/branch/nested" nfs4 >> "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+: > "$tmp/deadlines"
+configure_permissions "$tmp/mountinfo" "$tmp/local" > "$tmp/output"
+grep -Fxq -- "-h -- 1000:1000 $tmp/local" "$OWNERSHIP_CALLS" || fail "local target ownership was skipped"
+grep -Fxq -- "-h -- 1000:1000 $tmp/local/branch" "$OWNERSHIP_CALLS" || fail "local ancestor of deeper mount was skipped"
+grep -Fxq -- "-h -R -- 1000:1000 $tmp/local/.hidden $tmp/local/config.yaml $tmp/local/link $tmp/local/with spaces" "$OWNERSHIP_CALLS" || fail "mount-free target siblings were not batched into one chown"
+grep -Fxq -- "-h -R -- 1000:1000 $tmp/local/branch/local.txt" "$OWNERSHIP_CALLS" || fail "mount-free branch sibling was not chowned"
+[[ "$(wc -l < "$OWNERSHIP_CALLS")" -eq 4 ]] || fail "selective pass issued unexpected ownership commands"
+if grep -Fq "$tmp/local/network" "$OWNERSHIP_CALLS" || grep -Fq "$tmp/local/branch/nested" "$OWNERSHIP_CALLS"; then
+    fail "ownership worker touched a network subtree"
+fi
+[[ "$(wc -l < "$tmp/deadlines")" -eq 1 ]] || fail "selective pass must use one deadline for the whole target"
+grep -q '^--kill-after=2s 10s bash ' "$tmp/deadlines" || fail "selective pass was not bounded"
+
+# A mount covering the target must still be skipped completely.
+mount_entry "$tmp/local" cifs > "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+: > "$tmp/deadlines"
+configure_permissions "$tmp/mountinfo" "$tmp/local" > "$tmp/output"
+[[ ! -s "$OWNERSHIP_CALLS" ]] || fail "covered target must stay untouched"
+[[ "$(wc -l < "$tmp/deadlines")" -eq 1 ]] || fail "network detection must share the ownership deadline"
+
+# Ownership errors in a selective pass are logged without failing container init.
+mount_entry "$tmp/local/network" cifs > "$tmp/mountinfo"
+export CHOWN_RESULT=1
+: > "$OWNERSHIP_CALLS"
+configure_permissions "$tmp/mountinfo" "$tmp/local" > "$tmp/output" || fail "selective failure aborted startup"
+grep -q 'failed or timed out' "$tmp/output" || fail "selective failure was not logged"
+grep -Fq "$tmp/local/config.yaml" "$OWNERSHIP_CALLS" || fail "one ownership failure skipped other local files"
+
+# A target spelled as a symlink alias, with a trailing slash, or through a
+# relative symlink must normalise to the canonical spelling before
+# detection, so every spelling follows the same selective pass the canonical
+# target gets.
+unset CHOWN_RESULT
+mount_entry "$tmp/local" ext4 > "$tmp/mountinfo"
+mount_entry "$tmp/local/network" cifs >> "$tmp/mountinfo"
+mount_entry "$tmp/local/branch/nested" nfs4 >> "$tmp/mountinfo"
+ln -s local "$tmp/alias"
+ln -s ./local "$tmp/twin"
+: > "$OWNERSHIP_CALLS"
+: > "$tmp/deadlines"
+configure_permissions "$tmp/mountinfo" "$tmp/alias" "$tmp/twin" "$tmp/local/" > "$tmp/output"
+grep -Fxq -- "-h -- 1000:1000 $tmp/local" "$OWNERSHIP_CALLS" || fail "symlinked target was not normalised to its canonical spelling"
+grep -Fxq -- "-h -R -- 1000:1000 $tmp/local/.hidden $tmp/local/config.yaml $tmp/local/link $tmp/local/with spaces" "$OWNERSHIP_CALLS" || fail "normalised target siblings were not batched"
+[[ "$(wc -l < "$OWNERSHIP_CALLS")" -eq 12 ]] || fail "normalised targets must follow the same selective pass"
+if grep -Fq "$tmp/local/network" "$OWNERSHIP_CALLS" || grep -Fq "$tmp/local/branch/nested" "$OWNERSHIP_CALLS"; then
+    fail "normalised target pass touched a network subtree"
+fi
+[[ "$(wc -l < "$tmp/deadlines")" -eq 3 ]] || fail "each normalised target must get its own bounded selective pass"
+
+# Aliases of a covering network mount must also be skipped after resolution.
+mount_entry "$tmp/local" cifs > "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+configure_permissions "$tmp/mountinfo" "$tmp/alias" "$tmp/twin" "$tmp/local/" > "$tmp/output"
+[[ ! -s "$OWNERSHIP_CALLS" ]] || fail "alias of a covering network mount was chowned"
+[[ "$(grep -c 'Skipping ownership changes for network mount' "$tmp/output")" -eq 3 ]] || fail "network aliases were not skipped"
+
+# A stalled metadata operation during canonicalisation must share the ownership
+# deadline. Delay readlink on a real symlink, ignore TERM to exercise the forced
+# stop, and check that initialization still handles the following local target.
+mkdir -p "$tmp/after-stall"
+ln -s local "$tmp/stalled-alias"
+REAL_READLINK="$(command -v readlink)"
+export REAL_READLINK
+export BLOCKED_SYMLINK="$tmp/stalled-alias"
+export METADATA_BLOCK_MARKER="$tmp/metadata-blocked"
+cat > "$tmp/bin/readlink" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "$BLOCKED_SYMLINK" ]]; then
+    echo blocked > "$METADATA_BLOCK_MARKER"
+    trap '' TERM
+    sleep 30
+    exit 1
+fi
+exec "$REAL_READLINK" "$@"
+STUB
+chmod +x "$tmp/bin/readlink"
+: > "$OWNERSHIP_CALLS"
+# Shorten the production deadlines only in this test, retaining a separate
+# watchdog so the old, unbounded canonicalisation fails promptly as well.
+cat > "$tmp/stalled-check" <<'CHECK'
+source "$1"
+timeout() {
+    [[ "$1" == --kill-after=2s && "$2" == 10s ]] || exit 1
+    shift 2
+    command timeout --kill-after=0.2s 1s "$@"
+}
+configure_permissions "$2" "$3" "$4"
+CHECK
+if ! command timeout --kill-after=1s 4s bash "$tmp/stalled-check" "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" "$tmp/stalled-alias" "$tmp/after-stall" > "$tmp/stalled-output" 2>&1; then
+    cat "$tmp/stalled-output" >&2
+    fail "stalled path resolution prevented initialization from continuing"
+fi
+[[ -s "$METADATA_BLOCK_MARKER" ]] || fail "stalled metadata fixture was not reached"
+grep -q 'failed or timed out' "$tmp/stalled-output" || fail "stalled path resolution was not logged"
+grep -Fxq -- "-R -- 1000:1000 $tmp/after-stall" "$OWNERSHIP_CALLS" || fail "stalled path resolution skipped the next local target"
+if grep -Fq "$tmp/stalled-alias" "$OWNERSHIP_CALLS"; then
+    fail "stalled target reached chown"
+fi
+
+# Direct entrypoint invocation (no --ownership): the else dispatch must
+# forward mountinfo and targets to configure_permissions, and the full pass
+# must hold end to end — local defaults owned, covered network mounts never
+# reaching chown, aliases, ".." spellings, and newline names resolving to
+# the right targets.
+: > "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" > "$tmp/epout" 2>&1
+for t in /data /downloads /transfers /blackhole /opt; do
+    grep -Fxq -- "-R -- 1000:1000 $t" "$OWNERSHIP_CALLS" || fail "entrypoint: local default target $t was not owned"
+done
+[[ "$(wc -l < "$OWNERSHIP_CALLS")" -eq 5 ]] || fail "entrypoint: default pass issued unexpected ownership commands"
+
+mount_entry /downloads cifs > "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" > "$tmp/epout" 2>&1
+grep -Fxq -- "-R -- 1000:1000 /data" "$OWNERSHIP_CALLS" || fail "entrypoint: local sibling of an excluded mount was not owned"
+if grep -Fq -- "-R -- 1000:1000 /downloads" "$OWNERSHIP_CALLS"; then
+    fail "entrypoint: excluded network mount reached chown"
+fi
+grep -q 'Skipping ownership changes for network mount /downloads' "$tmp/epout" || fail "entrypoint: excluded mount was not logged"
+[[ "$(wc -l < "$OWNERSHIP_CALLS")" -eq 4 ]] || fail "entrypoint: excluded mount changed the owned target count"
+
+# An alias target resolves to its canonical destination through the
+# entrypoint, with the same selective pass the canonical target gets.
+mkdir -p "$tmp/local/nw"
+mount_entry "$tmp/local" ext4 > "$tmp/mountinfo"
+mount_entry "$tmp/local/nw" cifs >> "$tmp/mountinfo"
+ln -s local "$tmp/alias2"
+: > "$OWNERSHIP_CALLS"
+bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" "$tmp/alias2" > "$tmp/epout" 2>&1
+grep -Fxq -- "-h -- 1000:1000 $tmp/local" "$OWNERSHIP_CALLS" || fail "entrypoint: alias target did not resolve to its canonical destination"
+if grep -Fq "$tmp/local/nw" "$OWNERSHIP_CALLS"; then
+    fail "entrypoint: alias pass targeted the network mount"
+fi
+
+# A ".." spelling that resolves outside the mount its raw form appears to
+# sit under must not take the raw-spelling fast path.
+: > "$OWNERSHIP_CALLS"
+bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" "$tmp/local/nw/../.." > "$tmp/epout" 2>&1
+grep -Fxq -- "-h -- 1000:1000 $tmp" "$OWNERSHIP_CALLS" || fail "entrypoint: '..' spelling did not resolve to its real destination"
+if grep -Fq "$tmp/local/nw" "$OWNERSHIP_CALLS"; then
+    fail "entrypoint: '..' spelling targeted the network mount it resolves out of"
+fi
+
+# A target whose name contains a newline stays one chown operand end to end.
+mkdir -p "$tmp/nl/a"$'\n'"b"
+touch "$tmp/nl/a"$'\n'"b/file"
+cat > "$tmp/bin/chown" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\0' "$*" >> "$OWNERSHIP_CALLS"
+exit "${CHOWN_RESULT:-0}"
+STUB
+chmod +x "$tmp/bin/chown"
+: > "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" "$tmp/nl/a
+b" > "$tmp/epout" 2>&1
+mapfile -d '' -t epcalls < "$OWNERSHIP_CALLS"
+[[ "${#epcalls[@]}" -eq 1 ]] || fail "entrypoint: newline target split into ${#epcalls[@]} chown calls"
+[[ "${epcalls[0]:-}" == "-R -- 1000:1000 $tmp/nl/a
+b" ]] || fail "entrypoint: newline target not preserved in the ownership command"
+cat > "$tmp/bin/chown" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$OWNERSHIP_CALLS"
+exit "${CHOWN_RESULT:-0}"
+STUB
+chmod +x "$tmp/bin/chown"
+
+# A directory is not a mount table the entrypoint can act on: every target
+# is skipped and named against that table, nothing is traversed.
+mkdir "$tmp/dirinfo2"
+: > "$OWNERSHIP_CALLS"
+bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/dirinfo2" > "$tmp/epout" 2>&1
+[[ ! -s "$OWNERSHIP_CALLS" ]] || fail "entrypoint: directory mountinfo was traversed (fail-open)"
+[[ "$(grep -c "Cannot read mount information from $tmp/dirinfo2" "$tmp/epout")" -eq 5 ]] \
+    || fail "entrypoint: directory mountinfo did not name the table for every target"
+
+# The rootless runtime's local fuse-overlayfs root (in either of its
+# spellings) must not prevent the default local targets from being owned.
+for fstype in fuse-overlayfs fuse.fuse-overlayfs; do
+    mount_entry / "$fstype" > "$tmp/mountinfo"
+    : > "$OWNERSHIP_CALLS"
+    bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" > "$tmp/epout" 2>&1
+    for t in /data /downloads /transfers /blackhole /opt; do
+        grep -Fxq -- "-R -- 1000:1000 $t" "$OWNERSHIP_CALLS" || fail "entrypoint: $fstype at / prevented ownership of $t"
+    done
+    [[ "$(wc -l < "$OWNERSHIP_CALLS")" -eq 5 ]] || fail "entrypoint: $fstype at / changed the owned target count"
+    if grep -q 'Skipping ownership changes' "$tmp/epout"; then
+        fail "entrypoint: $fstype at / was treated as a network mount"
+    fi
+done
+
+# A trailing newline in a link target must survive every $(...) boundary
+# in the path flow (readlink, the resolver, the final target assignment):
+# the recorded chown operand is the intended directory, and the existing
+# sibling directory is left untouched.
+mkdir -p "$tmp/tl/trailing" "$tmp/tl/trailing"$'\n'
+touch "$tmp/tl/trailing/sib" "$tmp/tl/trailing"$'\n'"/intended"
+ln -s "$tmp/tl/trailing"$'\n' "$tmp/tl/alias"
+ctn "$tmp/tl/alias" > "$tmp/ctout"
+printf '%s\0' "$tmp/tl/trailing"$'\n' > "$tmp/ctexp"
+cmp -s "$tmp/ctexp" "$tmp/ctout" \
+    || fail "trailing-newline alias did not keep the trailing newline"
+cat > "$tmp/bin/chown" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\0' "$*" >> "$OWNERSHIP_CALLS"
+exit "${CHOWN_RESULT:-0}"
+STUB
+chmod +x "$tmp/bin/chown"
+: > "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" "$tmp/tl/alias" > "$tmp/epout" 2>&1
+mapfile -d '' -t epcalls < "$OWNERSHIP_CALLS"
+[[ "${#epcalls[@]}" -eq 1 ]] || fail "entrypoint: trailing-newline alias split into ${#epcalls[@]} chown calls"
+[[ "${epcalls[0]:-}" == "-R -- 1000:1000 $tmp/tl/trailing"$'\n' ]] \
+    || fail "entrypoint: trailing-newline alias chowned the wrong directory"
+if [[ "${epcalls[0]:-}" == "-R -- 1000:1000 $tmp/tl/trailing" ]]; then
+    fail "entrypoint: trailing-newline alias chowned the sibling directory"
+fi
+
+# The same trailing-newline destination behind a network mount must be
+# excluded, and the local sibling stays untouched.
+mkdir -p "$tmp/tl2/trailing" "$tmp/tl2/trailing"$'\n'
+mount_entry "$tmp/tl2/trailing\\012" cifs > "$tmp/mountinfo"
+ln -s "$tmp/tl2/trailing"$'\n' "$tmp/tl2/alias"
+: > "$OWNERSHIP_CALLS"
+bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" "$tmp/tl2/alias" > "$tmp/epout" 2>&1
+grep -q 'Skipping ownership changes for network mount' "$tmp/epout" \
+    || fail "entrypoint: trailing-newline network alias was not skipped"
+grep -Fq "network mount $tmp/tl2/trailing" "$tmp/epout" \
+    || fail "entrypoint: skip line lost the trailing newline of the mountpoint"
+[[ ! -s "$OWNERSHIP_CALLS" ]] || fail "entrypoint: trailing-newline network alias reached chown"
+
+# Symlinks and ".." must resolve in filesystem order: a ".." that follows
+# a link resolves against the link's destination, not its spelling.
+# real/pivot -> ../else/nested; link -> real; alias ->
+# link/pivot/../data must land on else/data (collapsing the ".." before
+# resolving the pivot would land on real/data).
+mkdir -p "$tmp/fs3/real/data" "$tmp/fs3/else/data" "$tmp/fs3/else/nested"
+ln -s ../else/nested "$tmp/fs3/real/pivot"
+ln -s real "$tmp/fs3/link"
+ln -s link/pivot/../data "$tmp/fs3/alias"
+[[ "$(ct "$tmp/fs3/alias")" == "$tmp/fs3/else/data" ]] \
+    || fail "filesystem-order resolution: '..' collapsed before the pivot link resolved, got: $(ct "$tmp/fs3/alias")"
+: > "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" "$tmp/fs3/alias" > "$tmp/epout" 2>&1
+mapfile -d '' -t epcalls < "$OWNERSHIP_CALLS"
+[[ "${#epcalls[@]}" -eq 1 ]] || fail "entrypoint: filesystem-order target split into ${#epcalls[@]} chown calls"
+[[ "${epcalls[0]:-}" == "-R -- 1000:1000 $tmp/fs3/else/data" ]] \
+    || fail "entrypoint: filesystem-order target chowned the wrong destination"
+if [[ "${epcalls[0]:-}" == "-R -- 1000:1000 $tmp/fs3/real/data" ]]; then
+    fail "entrypoint: filesystem-order target chowned the spelling-side destination"
+fi
+
+echo "Container permission regressions passed"

@@ -76,7 +76,9 @@ serves the SPA from ./static + JSON API. No authentication by design.
 - Failed items get a 30-minute in-memory cooldown; on success the Premiumize
   folder is deleted.
 - `CleanUpDownloadDirPeriod` deletes files older than 4 days from the
-  downloads directory at startup.
+  downloads directory after the HTTP listener starts, before the first
+  transfer poll and any new downloads. A stalled cleanup can pause the
+  transfer worker while the web UI remains available.
 - `TransferOnlyMode` disables this pipeline entirely.
 
 ### *arr integration
