@@ -118,6 +118,49 @@ func GetDownloadsFolderIDFromPremiumizeme(premiumizemeClient *premiumizeme.Premi
 	return downloadsFolderID
 }
 
+// GetOrCreateSubfolderID finds a folder by name directly under parentID,
+// creating it if missing.
+func GetOrCreateSubfolderID(premiumizemeClient *premiumizeme.Premiumizeme, parentID string, folderName string) (string, error) {
+	items, err := premiumizemeClient.ListFolder(parentID)
+	if err != nil {
+		return "", err
+	}
+
+	if id, ok := findSubfolderID(items, folderName); ok {
+		return id, nil
+	}
+
+	id, err := premiumizemeClient.CreateFolder(folderName, &parentID)
+	if err != nil {
+		// List-then-create race: a concurrent caller (the manager's
+		// resolveArrFolders on the web goroutine and the watcher's
+		// resolveSingleArrFolder on the processUploads goroutine resolve
+		// the same slug independently) may have created the folder in the
+		// window between the list and the create. When the create reports
+		// the folder already exists, re-list and adopt the winner's folder
+		// (one retry); any other create error is returned as-is.
+		if strings.Contains(err.Error(), premiumizeme.ERROR_FOLDER_ALREADY_EXISTS) {
+			if items, listErr := premiumizemeClient.ListFolder(parentID); listErr == nil {
+				if id, ok := findSubfolderID(items, folderName); ok {
+					return id, nil
+				}
+			}
+		}
+		return "", err
+	}
+	return id, nil
+}
+
+// findSubfolderID reports the ID of the folder named folderName among items.
+func findSubfolderID(items []premiumizeme.Item, folderName string) (string, bool) {
+	for _, item := range items {
+		if item.Type == "folder" && item.Name == folderName {
+			return item.ID, true
+		}
+	}
+	return "", false
+}
+
 func EnvOrDefault(envName string, defaultValue string) string {
 	envValue := os.Getenv(envName)
 	if len(envValue) == 0 {
