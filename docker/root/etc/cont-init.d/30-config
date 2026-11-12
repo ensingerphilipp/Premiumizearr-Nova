@@ -10,10 +10,13 @@
 # contains a newline stays one record end to end, a record without a
 # " - " fstype separator cannot inherit the previous record's fstype,
 # and has_network_mount and network_mounts_under classify "network"
-# identically by construction. fuse-overlayfs is excluded: under
-# rootless container runtimes it is the local root filesystem, not a
-# network mount. Matches are NUL-terminated: the container's awk is
-# busybox, where printf "%s\0" truncates at the NUL, while
+# identically by construction. fuse-overlayfs is excluded in both of its
+# spellings - the helper name and the kernel-reported
+# "fuse.fuse-overlayfs", where the fuse module prefixes the helper's
+# name: under rootless container runtimes it is the local root
+# filesystem, not a network mount. Matches are NUL-terminated: the
+# container's awk is busybox, where printf "%s\0" truncates at the NUL,
+# while
 # printf "%s%c", m, 0 writes a real NUL on busybox, gawk and mawk
 # alike; consumers read the stream back with mapfile -d ''.
 network_mount_lines() {
@@ -42,7 +45,8 @@ network_mount_lines() {
                 }
             }
             is_network = (type ~ /^(cifs|smb3|nfs|nfs4|9p|ceph|glusterfs)$/ ||
-                (type ~ /^fuse/ && type != "fuse-overlayfs"))
+                (type ~ /^fuse/ && type != "fuse-overlayfs" &&
+                    type != "fuse.fuse-overlayfs"))
             if (!is_network)
                 next
             if (scope == "under") {
@@ -74,15 +78,22 @@ has_network_mount() {
     [[ "${#matches[@]}" -gt 0 ]]
 }
 
-# Resolve the first symlink prefix of a path, one link per pass: an
-# absolute link replaces the prefix, a relative link joins to its parent
-# directory, and the components after the link are preserved, so
-# "…/mid/a/b/c" with a -> real resolves to "…/mid/real/b/c" — dropping
-# the suffix would silently shorten the target. Every probe is an lstat
-# of the prefix (newfstatat, AT_SYMLINK_NOFOLLOW semantics). Even without
-# following a symlink, lstat or readlink can block on a stalled filesystem,
-# so the entire resolver runs inside the per-target ownership timeout.
-# canonical_target repeats the pass until the spelling stops moving.
+# Resolve a path with filesystem semantics in one left-to-right walk: a
+# component is appended to the resolved prefix and, the moment the prefix
+# is a symlink, its target is read (an lstat-only probe,
+# AT_SYMLINK_NOFOLLOW semantics) and the walk restarts on the target's
+# components - including any ".." or further links inside them - before
+# the original suffix is processed. That is the kernel's order: "…/a/.."
+# with a -> b/c lands on b, so a ".." that follows a link resolves
+# against the link's destination, never against the link's spelling.
+# Every $(...) crossing is sentinel-marked, because command substitution
+# strips trailing newlines: readlink keeps a target that ends in a
+# newline (the appended "x" survives the strip), and this function emits
+# the resolved spelling as <spelling>x<status>, where status is
+# c = the walk finished with no link left, y = a spelling repeated (a
+# link cycle), p = the 40-link walk budget is exhausted with a live link
+# still blocking, or s = a stale link. canonical_target strips the
+# sentinels and repeats the walk until the spelling stops moving.
 resolve_symlink_prefix() {
     local path="$1" prefix link parent absolute=0
     [[ "$path" == /* ]] && absolute=1
@@ -94,22 +105,84 @@ resolve_symlink_prefix() {
     # NUL; the guard swallows that under set -e.
     IFS='/' read -r -d '' -a parts < <(printf '%s' "$path") || true
     prefix=""
-    local i
-    for ((i = 0; i < ${#parts[@]}; i++)); do
-        [[ -z "${parts[i]}" ]] && continue
-        if [[ -z "$prefix" ]]; then
-            if [[ "$absolute" -eq 1 ]]; then prefix="/${parts[i]}"; else prefix="${parts[i]}"; fi
+    local -A seen=()
+    local spelling="" comp
+    for comp in "${parts[@]}"; do
+        if [[ -z "$spelling" ]]; then
+            spelling="$comp"
         else
-            prefix+="/${parts[i]}"
+            spelling+="/$comp"
+        fi
+    done
+    [[ -n "$spelling" ]] && seen["$spelling"]=1
+    local status=c left=40 resolved=0
+    local -a newparts=()
+    local i=0 n=${#parts[@]} j pre post
+    while (( i < n )); do
+        comp="${parts[i]}"
+        if [[ -z "$comp" || "$comp" == "." ]]; then
+            i=$((i + 1))
+            continue
+        fi
+        if [[ "$comp" == ".." ]]; then
+            # The prefix here is fully resolved (a link is resolved the
+            # moment it is appended), so a string pop is exactly what the
+            # kernel does; the root itself stays sticky.
+            if [[ "$prefix" == "/" ]]; then
+                :
+            elif [[ "$prefix" == */* ]]; then
+                prefix="${prefix%/*}"
+                [[ -z "$prefix" ]] && prefix="/"
+            elif [[ -n "$prefix" ]]; then
+                prefix=""
+            fi
+            i=$((i + 1))
+            continue
+        fi
+        if [[ -z "$prefix" || "$prefix" == "." || "$prefix" == "/" ]]; then
+            if [[ "$absolute" -eq 1 ]]; then prefix="/$comp"; else prefix="$comp"; fi
+        else
+            prefix+="/$comp"
         fi
         if [[ -L "$prefix" ]]; then
-            link="$(readlink "$prefix" 2>/dev/null)"
+            # Sentinel: command substitution strips the trailing newlines
+            # of the link target, so the appended "x" survives them;
+            # readlink itself terminates its output with a newline, so
+            # strip exactly that one plus the sentinel, keeping any
+            # newlines that are part of the target itself.
+            link="$(readlink "$prefix" 2>/dev/null; printf x)"
+            if [[ "$link" == "x" ]]; then
+                link=""
+            else
+                link="${link%$'\n'x}"
+            fi
             if [[ -z "$link" ]]; then
                 # Stale link: keep the spelling, let chown report it.
+                status=s
                 break
             fi
+            # The spelling before and after this resolution, built with
+            # the walk's own append rules (dots skipped, root anchored
+            # like the walk, an absolute target rooted on /) so a repeat
+            # is recognised whichever root the walk is anchored on. The
+            # repeat check must run before the budget check so a cycle
+            # whose closing link sits exactly at the budget boundary is
+            # reported as a cycle, like a shorter one.
+            pre="$prefix"
+            for ((j = i + 1; j < n; j++)); do
+                comp="${parts[j]}"
+                if [[ -z "$comp" || "$comp" == "." ]]; then
+                    continue
+                fi
+                if [[ -z "$pre" || "$pre" == "." || "$pre" == "/" ]]; then
+                    if [[ "$pre" == "/" ]]; then pre="/$comp"; else pre="$comp"; fi
+                else
+                    pre+="/$comp"
+                fi
+            done
             if [[ "$link" == /* ]]; then
-                prefix="$link"
+                absolute=1
+                parent=""
             else
                 parent="${prefix%/*}"
                 # A relative target joins to the prefix's parent
@@ -120,29 +193,89 @@ resolve_symlink_prefix() {
                 if [[ -z "$parent" || "$parent" == "$prefix" ]]; then
                     if [[ "$absolute" -eq 1 ]]; then parent="/"; else parent="."; fi
                 fi
-                prefix="$parent/$link"
             fi
-            local j suffix=""
-            for ((j = i + 1; j < ${#parts[@]}; j++)); do
-                [[ -z "${parts[j]}" ]] && continue
-                if [[ -z "$suffix" ]]; then
-                    suffix="${parts[j]}"
+            IFS='/' read -r -d '' -a newparts < <(printf '%s' "$link") || true
+            for ((j = i + 1; j < n; j++)); do
+                newparts+=("${parts[j]}")
+            done
+            post="$parent"
+            # An absolute link target re-roots the walk on /.
+            [[ -z "$post" ]] && post="/"
+            for ((j = 0; j < ${#newparts[@]}; j++)); do
+                comp="${newparts[j]}"
+                if [[ -z "$comp" || "$comp" == "." ]]; then
+                    continue
+                fi
+                if [[ -z "$post" || "$post" == "." || "$post" == "/" ]]; then
+                    if [[ "$post" == "/" ]]; then post="/$comp"; else post="$comp"; fi
                 else
-                    suffix+="/${parts[j]}"
+                    post+="/$comp"
                 fi
             done
-            # Preserve everything after the link (see above).
-            [[ -n "$suffix" ]] && prefix+="/$suffix"
-            break
+            if [[ "$post" == "$pre" ]]; then
+                # The link leads back to its own spelling: a one-link
+                # fixed point, which converges silently.
+                status=c
+                break
+            fi
+            if [[ -n "${seen[$post]:-}" ]]; then
+                # An earlier spelling reappears: a link cycle.
+                status=y
+                break
+            fi
+            seen["$post"]=1
+            if (( left == 0 )); then
+                # The walk budget is exhausted with a live link left:
+                # the caller treats this as a chain that did not
+                # converge, not as a cycle.
+                status=p
+                break
+            fi
+            left=$((left - 1))
+            resolved=$((resolved + 1))
+            prefix="$parent"
+            n=${#newparts[@]}
+            parts=("${newparts[@]}")
+            i=0
+            continue
+        fi
+        i=$((i + 1))
+    done
+    # Dot-process the components the walk stopped short of (a stale or
+    # budget-blocked walk leaves the suffix unprocessed); link resolution
+    # already happened left-to-right, so only dot cleanup remains.
+    for ((j = i + 1; j < n; j++)); do
+        comp="${parts[j]}"
+        if [[ -z "$comp" || "$comp" == "." ]]; then
+            continue
+        fi
+        if [[ "$comp" == ".." ]]; then
+            if [[ "$prefix" == "/" ]]; then
+                :
+            elif [[ "$prefix" == */* ]]; then
+                prefix="${prefix%/*}"
+                [[ -z "$prefix" ]] && prefix="/"
+            elif [[ -n "$prefix" ]]; then
+                prefix=""
+            fi
+            continue
+        fi
+        if [[ -z "$prefix" || "$prefix" == "." ]]; then
+            if [[ "$absolute" -eq 1 ]]; then prefix="/$comp"; else prefix="$comp"; fi
+        else
+            prefix+="/$comp"
         fi
     done
     if [[ -z "$prefix" ]]; then
-        # No link in the prefix chain: the spelling is already canonical.
-        printf '%s' "$path"
-        return
+        if [[ "$absolute" -eq 1 ]]; then prefix="/"; else prefix="."; fi
     fi
-    [[ "$prefix" == "." ]] && prefix="/"
-    printf '%s' "$prefix"
+    # A walk that spent its whole budget on resolutions ends one link
+    # short of canonical: report it as not converged, matching the
+    # pass-based bound it replaced.
+    if [[ "$status" == "c" && "$left" -eq 0 && "$resolved" -gt 0 ]]; then
+        status=p
+    fi
+    printf '%sx%s' "$prefix" "$status"
 }
 
 # String-only path spelling normalisation: drop trailing slashes (keep the
@@ -181,19 +314,25 @@ collapse_path_dots() {
 }
 
 # Normalise a target's spelling before mount-table matching: strip trailing
-# slashes and resolve any symlink component, so "alias -> real" or "real/"
-# matches the same mount-table entries as "real" and takes the same branch.
-# Each pass resolves at most one link and re-normalises dots, which keeps
-# relative readlink targets (and the "x/.." spellings they produce) in
-# canonical form; the lstat-only probes never follow a component.
+# slashes and resolve the path with filesystem semantics
+# (resolve_symlink_prefix), so "alias -> real" or "real/" matches the same
+# mount-table entries as "real" and takes the same branch.
+# The walk emits <spelling>x<status>: command substitution strips trailing
+# newlines, so the sentinel keeps a destination that ends in a newline
+# intact through every $(...) boundary; this function strips both markers
+# and repeats the walk until the spelling stops moving. The status byte
+# carries the walk's own verdict: y = a link cycle inside the walk,
+# p = the 40-link walk budget exhausted with a live link left, c =
+# converged, s = a stale link (the spelling is kept either way).
 #
 # The 40-pass bound stops the loop; it does not by itself detect cycles.
-# A spelling that repeats is a genuine link cycle and keeps the original
-# spelling with the "cycle detected" diagnostic; a chain that is still
-# moving at the bound without any repeated spelling gets the distinct
-# "did not converge" diagnostic and the same keep-the-original fallback.
+# A spelling that repeats (inside a walk, or across passes) is a genuine
+# link cycle and keeps the original spelling with the "cycle detected"
+# diagnostic; a chain that is still moving at the bound without any
+# repeated spelling gets the distinct "did not converge" diagnostic and
+# the same keep-the-original fallback.
 canonical_target() {
-    local target="$1" pass canon prev original
+    local target="$1" pass raw status canon prev original
     while [[ "$target" == */ && "$target" != "/" ]]; do
         target="${target%/}"
     done
@@ -205,10 +344,21 @@ canonical_target() {
     # Bounded iteration idiom: the counter only caps the passes.
     # shellcheck disable=SC2034
     for pass in {1..40}; do
-        canon="$(resolve_symlink_prefix "$target")"
-        canon="$(collapse_path_dots "$canon")"
+        raw="$(resolve_symlink_prefix "$target")"
+        status="${raw: -1}"
+        raw="${raw%?}"
+        canon="${raw%x}"
+        if [[ "$status" == "y" ]]; then
+            # A spelling repeated inside the walk: a link cycle.
+            break
+        fi
         if [[ "$canon" == "$target" ]]; then
             converged=1
+            break
+        fi
+        if [[ "$status" == "p" ]]; then
+            # The walk's link budget is exhausted with a live link left:
+            # a chain that did not converge, not a cycle.
             break
         fi
         if [[ -n "$prev" && "$canon" == "$prev" ]]; then
@@ -224,14 +374,14 @@ canonical_target() {
         target="$canon"
     done
     if [[ "$converged" -eq 0 ]]; then
-        if [[ -n "$prev" && "$canon" == "$prev" ]] || [[ -n "${seen[$canon]:-}" ]]; then
+        if [[ "$status" == "y" ]] || [[ -n "$prev" && "$canon" == "$prev" ]] || [[ -n "${seen[$canon]:-}" ]]; then
             echo "[cont-init.d] Symlink cycle detected for $original; using the original spelling" >&2
         else
             echo "[cont-init.d] Symlink resolution did not converge for $original within 40 passes; using the original spelling" >&2
         fi
         target="$original"
     fi
-    printf '%s' "$target"
+    printf '%sx' "$target"
 }
 
 # Print every decoded network mountpoint strictly under directory, from one
@@ -332,7 +482,11 @@ configure_target_ownership() {
     # Aliases and trailing slashes must still use the canonical spelling for
     # detection and traversal. All metadata lookups here share the deadline
     # with enumeration and chown, including targets not found in mountinfo.
+    # canonical_target emits <spelling>x: command substitution strips
+    # trailing newlines, so the sentinel keeps a destination that ends in
+    # a newline intact through the assignment; strip exactly that one.
     directory="$(canonical_target "$directory")"
+    directory="${directory%x}"
     if has_network_mount "$directory" "$mountinfo"; then
         mount_status=0
     else

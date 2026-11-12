@@ -16,6 +16,25 @@ chown() { echo "Unbounded chown must not run" >&2; exit 1; }
 # shellcheck disable=SC1091
 source "$root/docker/root/etc/cont-init.d/30-config"
 
+# canonical_target emits the resolved spelling with exactly one trailing
+# "x" sentinel so $(...) cannot strip newlines that are part of the
+# spelling; strip exactly that one (a spelling may legitimately end in
+# "x" itself, so only one sentinel is ever removed here).
+ct() {
+    local r
+    r="$(canonical_target "$1")"
+    r="${r%x}"
+    printf '%s' "$r"
+}
+# A spelling that ends in a newline cannot cross a $(...) capture at all,
+# so compare those byte-exact through NUL-terminated files instead.
+ctn() {
+    local r
+    r="$(canonical_target "$1")"
+    r="${r%x}"
+    printf '%s\0' "$r"
+}
+
 mount_entry() {
     printf '20 10 0:1 / %s rw shared:1 - %s server rw\n' "$1" "$2"
 }
@@ -37,13 +56,17 @@ mount_entry /downloads ext4 > "$tmp/mountinfo"
 if has_network_mount /downloads "$tmp/mountinfo"; then fail "local storage treated as network"; fi
 
 # A local FUSE overlay (the rootless container runtime's own root
-# filesystem) must stay local at any depth, while the fuse.* mounts above
+# filesystem) must stay local at any depth in both of its spellings - the
+# helper name and the kernel-reported "fuse.fuse-overlayfs" (the fuse
+# module prefixes the helper's name) - while the fuse.* mounts above
 # remain network.
-for mount in / /downloads /downloads/nested; do
-    mount_entry "$mount" fuse-overlayfs > "$tmp/mountinfo"
-    if has_network_mount /downloads "$tmp/mountinfo"; then
-        fail "fuse-overlayfs at $mount treated as network"
-    fi
+for fstype in fuse-overlayfs fuse.fuse-overlayfs; do
+    for mount in / /downloads /downloads/nested; do
+        mount_entry "$mount" "$fstype" > "$tmp/mountinfo"
+        if has_network_mount /downloads "$tmp/mountinfo"; then
+            fail "$fstype at $mount treated as network"
+        fi
+    done
 done
 
 # The kernel's other escapes decode the same way. The backslash case also
@@ -132,21 +155,21 @@ ln -s a "$tmp/resolve/pt/lnk"
 ln -s one "$tmp/resolve/one/one"
 ln -s y "$tmp/resolve/two/x"
 ln -s x "$tmp/resolve/two/y"
-[[ "$(canonical_target "$tmp/resolve/alias/b/c")" == "$tmp/resolve/real/b/c" ]] \
+[[ "$(ct "$tmp/resolve/alias/b/c")" == "$tmp/resolve/real/b/c" ]] \
     || fail "symlink prefix resolution dropped the path suffix"
-[[ "$(canonical_target "$tmp/resolve/pt/lnk/../b")" == "$tmp/resolve/pt/b" ]] \
+[[ "$(ct "$tmp/resolve/pt/lnk/../b")" == "$tmp/resolve/pt/b" ]] \
     || fail "parent symlink did not resolve to the parent of the link location"
-[[ "$(canonical_target "$tmp/resolve/pt/a/../b")" == "$tmp/resolve/pt/b" ]] \
+[[ "$(ct "$tmp/resolve/pt/a/../b")" == "$tmp/resolve/pt/b" ]] \
     || fail "plain 'a/../b' spelling did not collapse"
-[[ "$(canonical_target "$tmp/resolve/plain/")" == "$tmp/resolve/plain" ]] \
+[[ "$(ct "$tmp/resolve/plain/")" == "$tmp/resolve/plain" ]] \
     || fail "trailing slash was not stripped"
-canonical_target "$tmp/resolve/one/one" > "$tmp/oneout" 2> "$tmp/oneerr"
+ct "$tmp/resolve/one/one" > "$tmp/oneout" 2> "$tmp/oneerr"
 [[ "$(cat "$tmp/oneout")" == "$tmp/resolve/one/one" ]] \
     || fail "1-cycle target must stay a fixed point and keep its spelling"
 if grep -q 'cycle' "$tmp/oneerr"; then
     fail "1-cycle raised the cycle diagnostic"
 fi
-canonical_target "$tmp/resolve/two/x/z" > "$tmp/twout" 2> "$tmp/twoerr"
+ct "$tmp/resolve/two/x/z" > "$tmp/twout" 2> "$tmp/twoerr"
 [[ "$(cat "$tmp/twout")" == "$tmp/resolve/two/x/z" ]] \
     || fail "2-cycle must keep the original spelling, got: $(cat "$tmp/twout")"
 grep -q 'Symlink cycle detected' "$tmp/twoerr" || fail "2-cycle did not raise the cycle diagnostic"
@@ -155,7 +178,7 @@ grep -q 'Symlink cycle detected' "$tmp/twoerr" || fail "2-cycle did not raise th
 # above covers the other branch.
 mkdir -p "$tmp/resolve/absreal"
 ln -s "$tmp/resolve/absreal" "$tmp/resolve/absalias"
-[[ "$(canonical_target "$tmp/resolve/absalias/sub")" == "$tmp/resolve/absreal/sub" ]] \
+[[ "$(ct "$tmp/resolve/absalias/sub")" == "$tmp/resolve/absreal/sub" ]] \
     || fail "absolute symlink target did not replace the prefix"
 
 # A relative input keeps the caller's cwd as its root: a relative link in
@@ -165,14 +188,14 @@ touch "$tmp/resolve2/real/b"
 ln -s real "$tmp/resolve2/rel"
 (
     cd "$tmp/resolve2"
-    [[ "$(canonical_target rel/sub)" == "real/sub" ]]
+    [[ "$(ct rel/sub)" == "real/sub" ]]
 ) || fail "relative input with a relative link joined against / instead of the caller cwd"
 
 # A decoded newline inside a link target must not truncate the components
 # that follow it.
 mkdir -p "$tmp/resolve/nl/real"$'\n'"end"
 ln -s "real"$'\n'"end" "$tmp/resolve/nl/lnk"
-[[ "$(canonical_target "$tmp/resolve/nl/lnk/sub")" == "$tmp/resolve/nl/real"$'\n'"end/sub" ]] \
+[[ "$(ct "$tmp/resolve/nl/lnk/sub")" == "$tmp/resolve/nl/real"$'\n'"end/sub" ]] \
     || fail "newline in a link target dropped the following components"
 
 # collapse_path_dots handles the relative "x/.." forms whose pop target has
@@ -188,7 +211,7 @@ mkdir -p "$tmp/resolve/four/d"
 ln -s d "$tmp/resolve/four/c"
 ln -s c "$tmp/resolve/four/b"
 ln -s b "$tmp/resolve/four/a"
-canonical_target "$tmp/resolve/four/a/f" > "$tmp/fourout" 2> "$tmp/fourerr"
+ct "$tmp/resolve/four/a/f" > "$tmp/fourout" 2> "$tmp/fourerr"
 [[ "$(cat "$tmp/fourout")" == "$tmp/resolve/four/d/f" ]] \
     || fail "3-link acyclic chain did not converge, got: $(cat "$tmp/fourout")"
 if [[ -s "$tmp/fourerr" ]]; then
@@ -204,7 +227,7 @@ for i in $(seq 1 41); do
     ln -s "$prev_link" "$tmp/resolve/long/l$i"
     prev_link="l$i"
 done
-canonical_target "$tmp/resolve/long/l41/x" > "$tmp/longout" 2> "$tmp/longerr"
+ct "$tmp/resolve/long/l41/x" > "$tmp/longout" 2> "$tmp/longerr"
 [[ "$(cat "$tmp/longout")" == "$tmp/resolve/long/l41/x" ]] \
     || fail "non-converging chain must keep the original spelling, got: $(cat "$tmp/longout")"
 grep -q 'did not converge' "$tmp/longerr" || fail "cap exhaustion was not reported with the convergence diagnostic"
@@ -465,5 +488,83 @@ bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/dirinfo2" > "$tmp/epout
 [[ ! -s "$OWNERSHIP_CALLS" ]] || fail "entrypoint: directory mountinfo was traversed (fail-open)"
 [[ "$(grep -c "Cannot read mount information from $tmp/dirinfo2" "$tmp/epout")" -eq 5 ]] \
     || fail "entrypoint: directory mountinfo did not name the table for every target"
+
+# The rootless runtime's local fuse-overlayfs root (in either of its
+# spellings) must not prevent the default local targets from being owned.
+for fstype in fuse-overlayfs fuse.fuse-overlayfs; do
+    mount_entry / "$fstype" > "$tmp/mountinfo"
+    : > "$OWNERSHIP_CALLS"
+    bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" > "$tmp/epout" 2>&1
+    for t in /data /downloads /transfers /blackhole /opt; do
+        grep -Fxq -- "-R -- 1000:1000 $t" "$OWNERSHIP_CALLS" || fail "entrypoint: $fstype at / prevented ownership of $t"
+    done
+    [[ "$(wc -l < "$OWNERSHIP_CALLS")" -eq 5 ]] || fail "entrypoint: $fstype at / changed the owned target count"
+    if grep -q 'Skipping ownership changes' "$tmp/epout"; then
+        fail "entrypoint: $fstype at / was treated as a network mount"
+    fi
+done
+
+# A trailing newline in a link target must survive every $(...) boundary
+# in the path flow (readlink, the resolver, the final target assignment):
+# the recorded chown operand is the intended directory, and the existing
+# sibling directory is left untouched.
+mkdir -p "$tmp/tl/trailing" "$tmp/tl/trailing"$'\n'
+touch "$tmp/tl/trailing/sib" "$tmp/tl/trailing"$'\n'"/intended"
+ln -s "$tmp/tl/trailing"$'\n' "$tmp/tl/alias"
+ctn "$tmp/tl/alias" > "$tmp/ctout"
+printf '%s\0' "$tmp/tl/trailing"$'\n' > "$tmp/ctexp"
+cmp -s "$tmp/ctexp" "$tmp/ctout" \
+    || fail "trailing-newline alias did not keep the trailing newline"
+cat > "$tmp/bin/chown" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\0' "$*" >> "$OWNERSHIP_CALLS"
+exit "${CHOWN_RESULT:-0}"
+STUB
+chmod +x "$tmp/bin/chown"
+: > "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" "$tmp/tl/alias" > "$tmp/epout" 2>&1
+mapfile -d '' -t epcalls < "$OWNERSHIP_CALLS"
+[[ "${#epcalls[@]}" -eq 1 ]] || fail "entrypoint: trailing-newline alias split into ${#epcalls[@]} chown calls"
+[[ "${epcalls[0]:-}" == "-R -- 1000:1000 $tmp/tl/trailing"$'\n' ]] \
+    || fail "entrypoint: trailing-newline alias chowned the wrong directory"
+if [[ "${epcalls[0]:-}" == "-R -- 1000:1000 $tmp/tl/trailing" ]]; then
+    fail "entrypoint: trailing-newline alias chowned the sibling directory"
+fi
+
+# The same trailing-newline destination behind a network mount must be
+# excluded, and the local sibling stays untouched.
+mkdir -p "$tmp/tl2/trailing" "$tmp/tl2/trailing"$'\n'
+mount_entry "$tmp/tl2/trailing\\012" cifs > "$tmp/mountinfo"
+ln -s "$tmp/tl2/trailing"$'\n' "$tmp/tl2/alias"
+: > "$OWNERSHIP_CALLS"
+bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" "$tmp/tl2/alias" > "$tmp/epout" 2>&1
+grep -q 'Skipping ownership changes for network mount' "$tmp/epout" \
+    || fail "entrypoint: trailing-newline network alias was not skipped"
+grep -Fq "network mount $tmp/tl2/trailing" "$tmp/epout" \
+    || fail "entrypoint: skip line lost the trailing newline of the mountpoint"
+[[ ! -s "$OWNERSHIP_CALLS" ]] || fail "entrypoint: trailing-newline network alias reached chown"
+
+# Symlinks and ".." must resolve in filesystem order: a ".." that follows
+# a link resolves against the link's destination, not its spelling.
+# real/pivot -> ../else/nested; link -> real; alias ->
+# link/pivot/../data must land on else/data (collapsing the ".." before
+# resolving the pivot would land on real/data).
+mkdir -p "$tmp/fs3/real/data" "$tmp/fs3/else/data" "$tmp/fs3/else/nested"
+ln -s ../else/nested "$tmp/fs3/real/pivot"
+ln -s real "$tmp/fs3/link"
+ln -s link/pivot/../data "$tmp/fs3/alias"
+[[ "$(ct "$tmp/fs3/alias")" == "$tmp/fs3/else/data" ]] \
+    || fail "filesystem-order resolution: '..' collapsed before the pivot link resolved, got: $(ct "$tmp/fs3/alias")"
+: > "$tmp/mountinfo"
+: > "$OWNERSHIP_CALLS"
+bash "$root/docker/root/etc/cont-init.d/30-config" "$tmp/mountinfo" "$tmp/fs3/alias" > "$tmp/epout" 2>&1
+mapfile -d '' -t epcalls < "$OWNERSHIP_CALLS"
+[[ "${#epcalls[@]}" -eq 1 ]] || fail "entrypoint: filesystem-order target split into ${#epcalls[@]} chown calls"
+[[ "${epcalls[0]:-}" == "-R -- 1000:1000 $tmp/fs3/else/data" ]] \
+    || fail "entrypoint: filesystem-order target chowned the wrong destination"
+if [[ "${epcalls[0]:-}" == "-R -- 1000:1000 $tmp/fs3/real/data" ]]; then
+    fail "entrypoint: filesystem-order target chowned the spelling-side destination"
+fi
 
 echo "Container permission regressions passed"
