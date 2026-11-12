@@ -68,12 +68,22 @@ func TestCleanUpDownloadDirPeriodLogsCompletion(t *testing.T) {
 
 	const entry = "Cleaning download directory - deleting files older than 4 days"
 	const done = "Startup download directory cleanup finished"
-	if strings.HasPrefix(entry, done) {
-		t.Fatalf("completion entry must be distinct, never a prefix of the entry line (the startup stall hook matches it)")
-	}
 	out := buf.String()
 	if !strings.Contains(out, entry) {
 		t.Fatalf("entry log missing:\n%s", out)
+	}
+	// Assert against the captured entry line, not the const pair (which
+	// cannot see drift in the service strings): if the completion text
+	// ever appears inside the entry line, a prose matcher on the entry
+	// could also match a completion. The startup stall hook itself
+	// matches the marker field, not prose (cmd/premiumizearrd/startup_test.go).
+	entryIdx := strings.Index(out, entry)
+	entryLine := out[strings.LastIndexByte(out[:entryIdx], '\n')+1:]
+	if nl := strings.IndexByte(entryLine, '\n'); nl >= 0 {
+		entryLine = entryLine[:nl]
+	}
+	if strings.Contains(entryLine, done) {
+		t.Fatalf("completion text appears inside the entry line:\n%s", entryLine)
 	}
 	doneIdx := strings.Index(out, done)
 	if doneIdx < 0 {

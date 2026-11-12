@@ -1,59 +1,77 @@
 #!/usr/bin/with-contenv bash
 # shellcheck shell=bash
 
-# Decode the mount table's mountpoint field (field 5) once and print every
-# decoded network mountpoint it contains. The decode plus fstype
-# classification lives here a single time: has_network_mount and
-# network_mounts_under both filter this stream with their own tail, so the
-# two consumers classify "network" identically by construction — a one-sided
-# fstype or decode edit can no longer make detection and the exclusion set
-# disagree about the same mount.
+# Decode the mount table's mountpoint field (field 5), classify the
+# record's fstype, and apply the caller's filter in one awk pass,
+# before anything is printed. The decode (the kernel escapes
+# space/tab/newline/backslash as \040/\011/\012/\134 in the root and
+# mountpoint fields), the network-fstype test, and the covering/any/
+# under filter all run inside the same record, so a mountpoint that
+# contains a newline stays one record end to end, a record without a
+# " - " fstype separator cannot inherit the previous record's fstype,
+# and has_network_mount and network_mounts_under classify "network"
+# identically by construction. fuse-overlayfs is excluded: under
+# rootless container runtimes it is the local root filesystem, not a
+# network mount. Matches are NUL-terminated: the container's awk is
+# busybox, where printf "%s\0" truncates at the NUL, while
+# printf "%s%c", m, 0 writes a real NUL on busybox, gawk and mawk
+# alike; consumers read the stream back with mapfile -d ''.
 network_mount_lines() {
-    awk '
+    local mountinfo="${1:-/proc/self/mountinfo}"
+    local target="$2" scope="${3:-any}"
+    # Pass target/scope through the environment, not awk -v: -v
+    # re-processes escape sequences in the value, so a target
+    # containing a literal backslash escape would decode differently
+    # from the mountinfo field it is compared against and never match.
+    TARGET="$target" SCOPE="$scope" awk '
+        BEGIN {
+            target = ENVIRON["TARGET"]
+            scope = ENVIRON["SCOPE"]
+        }
         {
             mount = $5
             gsub(/\\040/, " ", mount)
             gsub(/\\011/, "\t", mount)
             gsub(/\\012/, "\n", mount)
             gsub(/\\134/, "\\", mount)
-            for (i = 7; i <= NF; i++) {
+            type = ""
+            for (i = 6; i <= NF; i++) {
                 if ($i == "-") {
                     type = $(i + 1)
                     break
                 }
             }
-            if (type ~ /^(cifs|smb3|nfs|nfs4|9p|ceph|glusterfs|fuse.*)$/) {
-                print mount
+            is_network = (type ~ /^(cifs|smb3|nfs|nfs4|9p|ceph|glusterfs)$/ ||
+                (type ~ /^fuse/ && type != "fuse-overlayfs"))
+            if (!is_network)
+                next
+            if (scope == "under") {
+                if (index(mount, target "/") == 1)
+                    printf "%s%c", mount, 0
+            } else if (scope == "covering") {
+                if (mount == "/" || mount == target || index(target, mount "/") == 1)
+                    printf "%s%c", mount, 0
+            } else if (mount == "/" || mount == target ||
+                index(target, mount "/") == 1 ||
+                index(mount, target "/") == 1) {
+                printf "%s%c", mount, 0
             }
         }
-    ' "${1:-/proc/self/mountinfo}"
+    ' "$mountinfo"
 }
 
 # Read the kernel's mount table without stat-ing the potentially stalled mount.
 # By default include nested mounts; "covering" only checks the target itself
 # and its ancestors so local files around a nested mount can still be owned.
+# Status 2 means the table cannot be read (missing, or a directory, which a
+# bare -r test would accept): the caller must skip ownership instead of
+# treating the target as local.
 has_network_mount() {
     local mountinfo="${2:-/proc/self/mountinfo}"
-    [[ -r "$mountinfo" ]] || return 2
-    # Pass target/scope through the environment, not awk -v: -v re-processes
-    # escape sequences in the value, so a target containing a literal
-    # backslash escape would decode differently from the mountinfo field it
-    # is compared against and never match.
-    network_mount_lines "$mountinfo" |
-        TARGET="$1" SCOPE="${3:-any}" awk '
-            BEGIN {
-                target = ENVIRON["TARGET"]
-                scope = ENVIRON["SCOPE"]
-            }
-            {
-                if ($0 == "/" || $0 == target ||
-                    index(target, $0 "/") == 1 ||
-                    (scope == "any" && index($0, target "/") == 1)) {
-                    found = 1
-                }
-            }
-            END { exit !found }
-        '
+    [[ -f "$mountinfo" && -r "$mountinfo" ]] || return 2
+    local matches=()
+    mapfile -d '' -t matches < <(network_mount_lines "$mountinfo" "$1" "${3:-any}")
+    [[ "${#matches[@]}" -gt 0 ]]
 }
 
 # Resolve the first symlink prefix of a path, one link per pass: an
@@ -69,7 +87,12 @@ resolve_symlink_prefix() {
     local path="$1" prefix link parent absolute=0
     [[ "$path" == /* ]] && absolute=1
     local -a parts=()
-    IFS='/' read -ra parts <<< "$path"
+    # Split on NUL, not newline: a decoded readlink target may carry a
+    # newline (the kernel escapes it in the mount table), which a
+    # here-string would truncate at and append its own newline into the
+    # last component of. read -d '' returns 1 at end-of-input without a
+    # NUL; the guard swallows that under set -e.
+    IFS='/' read -r -d '' -a parts < <(printf '%s' "$path") || true
     prefix=""
     local i
     for ((i = 0; i < ${#parts[@]}; i++)); do
@@ -89,7 +112,14 @@ resolve_symlink_prefix() {
                 prefix="$link"
             else
                 parent="${prefix%/*}"
-                [[ -z "$parent" || "$parent" == "$prefix" ]] && parent="/"
+                # A relative target joins to the prefix's parent
+                # directory, rooted where the input itself is rooted: an
+                # absolute prefix joins against /, a relative prefix
+                # against the caller's cwd, so a relative input never
+                # re-roots onto /.
+                if [[ -z "$parent" || "$parent" == "$prefix" ]]; then
+                    if [[ "$absolute" -eq 1 ]]; then parent="/"; else parent="."; fi
+                fi
                 prefix="$parent/$link"
             fi
             local j suffix=""
@@ -116,16 +146,26 @@ resolve_symlink_prefix() {
 }
 
 # String-only path spelling normalisation: drop trailing slashes (keep the
-# root itself), collapse "x/.." and drop "." so a relative readlink target
-# lands in canonical form without touching the filesystem.
+# root itself), collapse "x/.." — including the bare "a/.." and "/a/.."
+# forms whose pop target has no slash of its own — and drop "." so a
+# relative readlink target lands in canonical form without touching the
+# filesystem.
 collapse_path_dots() {
     local path="$1" comp out="" absolute=0
     [[ "$path" == /* ]] && absolute=1
-    IFS='/' read -ra parts <<< "$path"
+    local -a parts=()
+    # Same NUL split as resolve_symlink_prefix: a decoded readlink target
+    # may carry a newline a here-string would truncate at.
+    IFS='/' read -r -d '' -a parts < <(printf '%s' "$path") || true
     for comp in "${parts[@]}"; do
         case "$comp" in
             '' | .) ;;
-            ..) if [[ "$out" == */* ]]; then out="${out%/*}"; fi ;;
+            ..) if [[ "$out" == */* ]]; then
+                    out="${out%/*}"
+                elif [[ -n "$out" ]]; then
+                    out=""
+                fi
+                ;;
             *) if [[ -z "$out" ]]; then
                     if [[ "$absolute" -eq 1 ]]; then out="/$comp"; else out="$comp"; fi
                 else
@@ -145,11 +185,13 @@ collapse_path_dots() {
 # matches the same mount-table entries as "real" and takes the same branch.
 # Each pass resolves at most one link and re-normalises dots, which keeps
 # relative readlink targets (and the "x/.." spellings they produce) in
-# canonical form; the lstat-only probes never follow a component. When the
-# spelling still moves after the 40-pass cap — the kernel's own
-# symlink-resolution bound — the prefix chain cycles (x -> y -> x, ...) and
-# the original spelling is kept with a distinct diagnostic instead of
-# acting on a cap-terminated in-cycle spelling, which may not exist.
+# canonical form; the lstat-only probes never follow a component.
+#
+# The 40-pass bound stops the loop; it does not by itself detect cycles.
+# A spelling that repeats is a genuine link cycle and keeps the original
+# spelling with the "cycle detected" diagnostic; a chain that is still
+# moving at the bound without any repeated spelling gets the distinct
+# "did not converge" diagnostic and the same keep-the-original fallback.
 canonical_target() {
     local target="$1" pass canon prev original
     while [[ "$target" == */ && "$target" != "/" ]]; do
@@ -157,27 +199,36 @@ canonical_target() {
     done
     original="$target"
     prev=""
+    local -A seen=()
+    seen["$original"]=1
+    local converged=0
     # Bounded iteration idiom: the counter only caps the passes.
     # shellcheck disable=SC2034
     for pass in {1..40}; do
         canon="$(resolve_symlink_prefix "$target")"
         canon="$(collapse_path_dots "$canon")"
         if [[ "$canon" == "$target" ]]; then
+            converged=1
             break
         fi
         if [[ -n "$prev" && "$canon" == "$prev" ]]; then
             # Two spellings keep alternating: a two-link cycle.
             break
         fi
+        if [[ -n "${seen[$canon]:-}" ]]; then
+            # A longer cycle: an earlier spelling reappears.
+            break
+        fi
+        seen["$target"]=1
         prev="$target"
         target="$canon"
     done
-    if [[ "$canon" != "$target" ]]; then
-        # The loop left a moving spelling: a two-link cycle caught above, or
-        # a longer cycle / link chain that ran out of passes. Keep the
-        # original spelling; the diagnostic goes to stderr so it never
-        # lands in the command-substituted value.
-        echo "[cont-init.d] Symlink cycle detected for $original; using the original spelling" >&2
+    if [[ "$converged" -eq 0 ]]; then
+        if [[ -n "$prev" && "$canon" == "$prev" ]] || [[ -n "${seen[$canon]:-}" ]]; then
+            echo "[cont-init.d] Symlink cycle detected for $original; using the original spelling" >&2
+        else
+            echo "[cont-init.d] Symlink resolution did not converge for $original within 40 passes; using the original spelling" >&2
+        fi
         target="$original"
     fi
     printf '%s' "$target"
@@ -186,15 +237,11 @@ canonical_target() {
 # Print every decoded network mountpoint strictly under directory, from one
 # pass over the mount table. The ownership pass skips and batches
 # against this precomputed set instead of re-reading the table per entry.
-# The decode+classify work is shared with has_network_mount via
-# network_mount_lines; only the strictly-below filter is local.
+# Decode, classify, and filter all run in the shared classifier
+# (network_mount_lines, mode "under"), so a mountpoint containing a
+# newline stays one NUL-terminated element for the caller's mapfile.
 network_mounts_under() {
-    local target="$1"
-    network_mount_lines "${2:-/proc/self/mountinfo}" |
-        TARGET="$target" awk '
-            BEGIN { target = ENVIRON["TARGET"] }
-            { if (index($0, target "/") == 1) print }
-        '
+    network_mount_lines "${2:-/proc/self/mountinfo}" "$1" under
 }
 
 # Only invoked in a subprocess under the per-target timeout. Cost is one
@@ -225,7 +272,7 @@ own_local_tree() {
         skip=0
         nested=0
         for mount in "${NETWORK_MOUNTS[@]}"; do
-            if [[ "$entry" == "$mount" ]]; then
+            if [[ "$mount" == "$entry" ]]; then
                 echo "[cont-init.d] Skipping ownership changes for network mount $entry; configure UID/GID on the host"
                 skip=1
                 break
@@ -254,17 +301,31 @@ configure_target_ownership() {
     local mountinfo="${3:-/proc/self/mountinfo}"
     local mount_status
     local nested=false
+    local NETWORK_MOUNTS=()
 
     # Check the literal spelling first, without touching the target. A known
-    # network mount needs no symlink probes, which can themselves stall.
-    if has_network_mount "$directory" "$mountinfo" covering; then
+    # network mount needs no symlink probes, which can themselves stall. The
+    # fast path is only sound for spellings without ".." components: with
+    # them the resolved destination can sit outside the mount the raw
+    # spelling appears to be under, so those targets fall through to
+    # canonical resolution before any skip decision.
+    local -a raw_parts=()
+    IFS='/' read -r -d '' -a raw_parts < <(printf '%s' "$directory") || true
+    local comp raw_has_dotdot=0
+    for comp in "${raw_parts[@]}"; do
+        if [[ "$comp" == ".." ]]; then
+            raw_has_dotdot=1
+            break
+        fi
+    done
+    if [[ "$raw_has_dotdot" -eq 0 ]] && has_network_mount "$directory" "$mountinfo" covering; then
         echo "[cont-init.d] Skipping ownership changes for network mount $directory; configure UID/GID on the host"
         return 0
     else
         mount_status=$?
     fi
     if [[ "$mount_status" -ne 1 ]]; then
-        echo "[cont-init.d] Cannot read mount information; skipping ownership changes for $directory"
+        echo "[cont-init.d] Cannot read mount information from $mountinfo; skipping ownership changes for $directory"
         return 0
     fi
 
@@ -285,22 +346,27 @@ configure_target_ownership() {
             mount_status=$?
         fi
         if [[ "$mount_status" -ne 1 ]]; then
-            echo "[cont-init.d] Cannot read mount information; skipping ownership changes for $directory"
+            echo "[cont-init.d] Cannot read mount information from $mountinfo; skipping ownership changes for $directory"
             return 0
         fi
         nested=true
     elif [[ "$mount_status" -ne 1 ]]; then
-        echo "[cont-init.d] Cannot read mount information; skipping ownership changes for $directory"
+        echo "[cont-init.d] Cannot read mount information from $mountinfo; skipping ownership changes for $directory"
         return 0
     fi
 
     echo "[cont-init.d] Setting ownership of $directory to $owner"
     if [[ "$nested" == true ]]; then
-        shopt -s dotglob nullglob
-        # Byte-wise glob order keeps the batched chown operand order stable.
-        export LC_ALL=C
-        mapfile -t NETWORK_MOUNTS < <(network_mounts_under "$directory" "$mountinfo")
-        own_local_tree "$directory" "$owner"
+        # The walk's shopts, LC_ALL export, and mount set must not leak
+        # into a sourcing caller, so the branch runs in a subshell; the
+        # walk's output and exit status pass through unchanged.
+        (
+            shopt -s dotglob nullglob
+            # Byte-wise glob order keeps the batched chown operand order stable.
+            export LC_ALL=C
+            mapfile -d '' -t NETWORK_MOUNTS < <(network_mounts_under "$directory" "$mountinfo")
+            own_local_tree "$directory" "$owner"
+        )
     else
         chown -R -- "$owner" "$directory"
     fi
@@ -321,12 +387,16 @@ configure_permissions() {
     fi
 
     for directory in "$@"; do
-        # coreutils timeout is installed in the image. The kill deadline also
-        # terminates the supervisor if a child is stuck in uninterruptible I/O.
-        # Start supervision before any filesystem probes, including mount
-        # checks and path resolution, and share one deadline for the target.
+        # coreutils timeout is installed in the image. The TERM deadline
+        # bounds interruptible stalls in the supervised pass (mount
+        # checks, path resolution, enumeration, chown); a child already
+        # stuck in uninterruptible I/O cannot be signalled away, so the
+        # kill-after value only bounds how long the supervisor waits for
+        # the forced stop, and the runtime's startup timeout is the
+        # backstop behind both. Start supervision before any filesystem
+        # probes, and share one deadline for the target.
         if ! timeout --kill-after=2s 10s bash "$script" --ownership "$directory" "$owner" "$mountinfo"; then
-            echo "[cont-init.d] Ownership change failed or timed out for $directory; continuing startup (check host permissions)"
+            echo "[cont-init.d] Ownership change failed or timed out for $directory (mount table: $mountinfo); continuing startup (check host permissions)"
         fi
     done
     return 0
