@@ -25,6 +25,7 @@ type ConfigChangeResponse struct {
 var numericConfigFields = []string{
 	"PollBlackholeIntervalMinutes",
 	"SimultaneousDownloads",
+	"MaxActivePremiumizeTransfers",
 	"DownloadSpeedLimit",
 	"ArrHistoryUpdateIntervalSeconds",
 	"ErroredTransferDeleteGracePeriodSeconds",
@@ -71,13 +72,13 @@ func numericConfigFieldFor(key string) (string, bool) {
 }
 
 // validateConfigPayload rejects a top-level JSON null payload, an incomplete
-// payload (a missing config field would be silently zeroed by the
-// whole-struct replace), and any payload carrying an explicit JSON null for a
-// numeric field (encoding/json treats null as a no-op for non-pointer
-// fields, so a cleared UI input would otherwise be silently saved as 0).
-// All of these cases were reported as a success before (issue #89). An
-// explicit 0 (a value the user typed) is still valid, e.g. speed limit
-// 0 = unlimited.
+// payload for required config fields (missing fields would be silently zeroed
+// by whole-struct replace), and explicit JSON null for numeric fields.
+// MaxActivePremiumizeTransfers stays optional here for older API clients; a
+// missing value stores 0 (cap disabled) like any other as-is value, and the
+// next config load normalizes it back to the default.
+// An explicit 0 remains valid for settings where 0 has a meaning, such as an
+// unlimited download speed.
 func validateConfigPayload(body []byte) error {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -91,6 +92,11 @@ func validateConfigPayload(body []byte) error {
 	}
 	var missing []string
 	for key := range configJSONKeySet {
+		// Keep the new cap optional for older API clients; a missing value
+		// stores 0, which the config load normalizes to the default.
+		if key == "MaxActivePremiumizeTransfers" {
+			continue
+		}
 		if _, present := raw[key]; !present {
 			missing = append(missing, key)
 		}
@@ -104,6 +110,7 @@ func validateConfigPayload(body []byte) error {
 			return fmt.Errorf("field %q is null; numeric fields must be numbers, not empty", field)
 		}
 	}
+
 	return nil
 }
 

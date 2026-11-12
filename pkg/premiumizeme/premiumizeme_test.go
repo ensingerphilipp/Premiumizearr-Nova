@@ -172,3 +172,96 @@ func TestRequestErrorsRedactsAPIKey(t *testing.T) {
 		}
 	}
 }
+
+// TestGetTransfersErrorCarriesHTTPStatus pins the error content of
+// GetTransfers across non-2xx and malformed 200 responses: a non-2xx status
+// code must surface in the returned error with its status line and code
+// (instead of an empty error, which used to end the one-shot pause warning
+// with a bare colon), an unparseable 200 body must return the decode error,
+// and a 200 body with a non-success status word keeps its plain status-word
+// error.
+func TestGetTransfersErrorCarriesHTTPStatus(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		body          string
+		wantErrExact  string
+		wantErrSubstr []string
+	}{
+		{
+			name:          "502 non-JSON body",
+			status:        http.StatusBadGateway,
+			body:          "<html><body>502 Bad Gateway</body></html>",
+			wantErrSubstr: []string{"transfer list request failed", "502 Bad Gateway", "502"},
+		},
+		{
+			name:          "500 empty body",
+			status:        http.StatusInternalServerError,
+			body:          "",
+			wantErrSubstr: []string{"transfer list request failed", "500 Internal Server Error", "500"},
+		},
+		{
+			name:          "200 non-success status word",
+			status:        http.StatusOK,
+			body:          `{"status":"error"}`,
+			wantErrExact:  "error",
+			wantErrSubstr: []string{"error"},
+		},
+		{
+			name:          "200 malformed JSON",
+			status:        http.StatusOK,
+			body:          "{not-json",
+			wantErrSubstr: []string{"invalid character"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+				w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			client := NewPremiumizemeClient("test-api-key")
+			client.APIBaseURL = server.URL + "/api/"
+
+			_, err := client.GetTransfers()
+			if err == nil {
+				t.Fatalf("GetTransfers: err = nil, want an error")
+			}
+			if tt.wantErrExact != "" && err.Error() != tt.wantErrExact {
+				t.Fatalf("GetTransfers: error = %q, want exact %q", err.Error(), tt.wantErrExact)
+			}
+			for _, substr := range tt.wantErrSubstr {
+				if !strings.Contains(err.Error(), substr) {
+					t.Fatalf("GetTransfers: error = %q, want it to contain %q", err.Error(), substr)
+				}
+			}
+		})
+	}
+}
+
+// TestGetTransfersSuccessReturnsTransfers guards the happy path: a 200
+// response with a success status word returns the decoded transfers without
+// an error.
+func TestGetTransfersSuccessReturnsTransfers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"status":"success","transfers":[{"id":"t1","status":"queued"},{"id":"t2","status":"running"},{"id":"t3","status":"done"}]}`))
+	}))
+	defer server.Close()
+
+	client := NewPremiumizemeClient("test-api-key")
+	client.APIBaseURL = server.URL + "/api/"
+
+	transfers, err := client.GetTransfers()
+	if err != nil {
+		t.Fatalf("GetTransfers: unexpected error: %v", err)
+	}
+	if len(transfers) != 3 {
+		t.Fatalf("GetTransfers: got %d transfers, want 3", len(transfers))
+	}
+	if transfers[0].Status != "queued" || transfers[1].Status != "running" || transfers[2].Status != "done" {
+		t.Fatalf("GetTransfers: statuses = %q, %q, %q; want queued, running, done", transfers[0].Status, transfers[1].Status, transfers[2].Status)
+	}
+}

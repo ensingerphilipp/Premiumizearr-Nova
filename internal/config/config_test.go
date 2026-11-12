@@ -105,6 +105,63 @@ func TestLoadConfigFromDiskKeepsSetArrs(t *testing.T) {
 	}
 }
 
+// TestLoadConfigFromDiskBackfillsMaxActiveTransfers is the acceptance test
+// for review finding R1-11: a config file without a positive
+// MaxActivePremiumizeTransfers value — the key missing, or a 0 stored via
+// the web route before load-time normalization landed — is normalized to
+// the published default of 20 on load, and the backfilled value is written
+// back to the file, mirroring the grace-period backfill tests above.
+func TestLoadConfigFromDiskBackfillsMaxActiveTransfers(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "missing key", value: ""},
+		{name: "explicit zero", value: "0"},
+		{name: "explicit negative", value: "-3"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			file := "PremiumizemeAPIKey: xxxxxxxxx\n"
+			if test.value != "" {
+				file += "MaxActivePremiumizeTransfers: " + test.value + "\n"
+			}
+			writeConfigFile(t, dir, file)
+
+			cfg, err := loadConfigFromDisk(dir)
+			if err != nil {
+				t.Fatalf("loadConfigFromDisk() error = %v, want nil", err)
+			}
+			if cfg.MaxActivePremiumizeTransfers != DefaultMaxActivePremiumizeTransfers {
+				t.Fatalf("MaxActivePremiumizeTransfers = %d, want %d (backfilled default)", cfg.MaxActivePremiumizeTransfers, DefaultMaxActivePremiumizeTransfers)
+			}
+
+			rewritten := readConfigFile(t, dir)
+			if !strings.Contains(rewritten, "MaxActivePremiumizeTransfers: 20") {
+				t.Fatalf("config file does not contain the backfilled default:\n%s", rewritten)
+			}
+		})
+	}
+}
+
+// TestLoadConfigFromDiskKeepsSetMaxActiveTransfers verifies that an
+// explicitly set positive MaxActivePremiumizeTransfers is preserved on
+// load instead of being overwritten by the default.
+func TestLoadConfigFromDiskKeepsSetMaxActiveTransfers(t *testing.T) {
+	dir := t.TempDir()
+	writeConfigFile(t, dir, "PremiumizemeAPIKey: xxxxxxxxx\nMaxActivePremiumizeTransfers: 25\n")
+
+	cfg, err := loadConfigFromDisk(dir)
+	if err != nil {
+		t.Fatalf("loadConfigFromDisk() error = %v, want nil", err)
+	}
+	if cfg.MaxActivePremiumizeTransfers != 25 {
+		t.Fatalf("MaxActivePremiumizeTransfers = %d, want 25 (the explicitly set value)", cfg.MaxActivePremiumizeTransfers)
+	}
+}
+
 // TestUpdateConfigNormalizesNilArrs verifies that an API update body that
 // omits Arrs (which JSON decodes as a nil slice) is normalized to an empty
 // non-nil slice, so GET /api/config cannot be left serving "Arrs": null.
