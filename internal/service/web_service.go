@@ -164,6 +164,10 @@ func (s *WebServerService) Start() {
 		rt.HandleFunc("/api/transfers", s.TransfersHandler)
 		rt.HandleFunc("/api/downloads", s.DownloadsHandler)
 		rt.HandleFunc("/api/blackhole", s.BlackholeHandler)
+		// No method filter: non-POST requests must reach the handler,
+		// which answers 405, instead of falling through to the SPA
+		// catch-all (review finding R1-2).
+		rt.HandleFunc("/api/blackhole/poll", s.PollBlackholeHandler)
 		rt.HandleFunc("/api/config", s.ConfigHandler)
 		rt.HandleFunc("/api/testArr", s.TestArrHandler)
 	}

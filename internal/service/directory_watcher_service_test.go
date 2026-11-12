@@ -107,6 +107,11 @@ func TestProcessUploadCycleQuotaBehavior(t *testing.T) {
 			if !test.wantTransfer && service.Queue.Len() != 1 {
 				t.Fatalf("queue length while quota was exhausted = %d, want 1", service.Queue.Len())
 			}
+			// R1-8: a successfully processed path is released from in-flight
+			// (Done), so a file re-dropped at the same path can be queued.
+			if test.wantTransfer && !service.Queue.AddIfAbsent(filePath) {
+				t.Fatalf("successfully processed path %q is still in-flight and cannot be requeued", filePath)
+			}
 			if test.wantAccountError && !strings.Contains(logs.String(), "Could not check Premiumize fair-use quota") {
 				t.Fatalf("account error was not logged: %s", logs.String())
 			}
