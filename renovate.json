@@ -1,5 +1,5 @@
 {
-  "extends": ["config:base"],
+  "extends": ["config:recommended"],
   "labels": ["dependencies"],
   "prBodyColumns": ["package", "from", "to", "changelog"],
   "packageRules": [
