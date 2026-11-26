@@ -56,19 +56,19 @@ if ! printf '%s\n%s\n' "1.24.2" "${LOCAL_GO#go}" | sort -V -C; then
   fail "local Go ${LOCAL_GO} is older than 1.24.2. Verification uses the locally provisioned toolchain (GOTOOLCHAIN=local) and never downloads one; install Go >= 1.24.2 (go.mod 'go 1.23.0' / 'toolchain go1.24.2' stays as-is)."
 fi
 
-# Node: project standard is Node 22 (ARCHITECTURE.md, approved decision 1).
+# Node: project standard is Node 26 (ARCHITECTURE.md, approved decision 1).
 if ! command -v node >/dev/null 2>&1; then
-  fail "node not found. The project standard is Node 22 (e.g. install via nvm: 'nvm install 22 && nvm use 22')."
+  fail "node not found. The project standard is Node 26 (e.g. install via nvm: 'nvm install 26 && nvm use 26')."
 fi
 NODE_VERSION="$(node -p 'process.versions.node')"
 NODE_MAJOR="${NODE_VERSION%%.*}"
 echo "node:                    ${NODE_VERSION}"
-if [[ "${NODE_MAJOR}" != "22" ]]; then
-  fail "Node ${NODE_VERSION} found; the project standard is Node 22. Install/activate Node 22 (e.g. 'nvm install 22 && nvm use 22')."
+if [[ "${NODE_MAJOR}" != "26" ]]; then
+  fail "Node ${NODE_VERSION} found; the project standard is Node 26. Install/activate Node 26 (e.g. 'nvm install 26 && nvm use 26')."
 fi
 
 if ! command -v npm >/dev/null 2>&1; then
-  fail "npm not found. Install it together with Node 22."
+  fail "npm not found. Install it together with Node 26."
 fi
 echo "npm:                     $(npm --version)"
 
