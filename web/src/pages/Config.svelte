@@ -39,6 +39,7 @@
     Arrs: [],
   };
   const ERR_SAVE = "Error Saving Config";
+  const ERR_LOAD = "Error Loading Config";
   const ERR_TEST = "Error Testing *arr client";
 
   // Numeric inputs that must hold a finite number before saving. A cleared
@@ -98,6 +99,11 @@
       })
       .catch((error) => {
         console.error("Error: ", error);
+        errorTitle = ERR_LOAD;
+        errorMessage =
+          "Failed to load the config from the daemon (it may be unreachable or restarting). " +
+          "Reload the page to retry. Inputs stay disabled to avoid overwriting the config with defaults.";
+        errorModal = true;
       });
   }
 

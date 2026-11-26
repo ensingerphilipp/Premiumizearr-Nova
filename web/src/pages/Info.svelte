@@ -167,7 +167,7 @@
   function dataToRows(data) {
       if (!data) return [];
 
-      let dlSpeed = 0;
+      dlSpeed = 0;
 
       return data.map(d => {
           let speed = parseDLSpeedFromMessage(d.message);
