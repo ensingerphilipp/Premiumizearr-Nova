@@ -18,7 +18,7 @@ import (
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/service"
 	log "github.com/sirupsen/logrus"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v3"
 )
 
 // Stall cleanup at its entry point to simulate an uninterruptible filesystem
