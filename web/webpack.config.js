@@ -57,9 +57,9 @@ module.exports = {
 	devtool: 'source-map',
 	devServer: {
 		hot: true,
-		proxy: {	
-			'/api': 'http://127.0.0.1:8182'
-		}
+		proxy: [
+			{ context: ['/api'], target: 'http://127.0.0.1:8182' }
+		]
 	},
 	optimization: {
 		minimizer: [new EsbuildPlugin({ target: "es2020" })],
