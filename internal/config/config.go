@@ -10,7 +10,7 @@ import (
 	"os"
 	"path"
 
-	"go.yaml.in/yaml/v3"
+	"go.yaml.in/yaml/v4"
 )
 
 // LoadOrCreateConfig - Loads the config from disk or creates a new one

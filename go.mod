@@ -10,7 +10,6 @@ require (
 	github.com/gorilla/mux v1.8.1
 	github.com/orandin/lumberjackrus v1.0.1
 	github.com/sirupsen/logrus v1.10.2
-	go.yaml.in/yaml/v3 v3.0.5
 	go.yaml.in/yaml/v4 v4.0.0
 	golift.io/starr v1.4.1
 )
