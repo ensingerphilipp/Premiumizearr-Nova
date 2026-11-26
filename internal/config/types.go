@@ -2,6 +2,9 @@ package config
 
 import "errors"
 
+// DefaultMaxActivePremiumizeTransfers is the number of active transfers reserved for PremiumizeArr by default.
+const DefaultMaxActivePremiumizeTransfers = 20
+
 var (
 	ErrInvalidConfigFile      = errors.New("invalid Config File")
 	ErrFailedToFindConfigFile = errors.New("failed to find config file")
@@ -48,10 +51,15 @@ type Config struct {
 
 	WebRoot string `yaml:"WebRoot" json:"WebRoot"`
 
-	SimultaneousDownloads int  `yaml:"SimultaneousDownloads" json:"SimultaneousDownloads"`
-	DownloadSpeedLimit    int  `yaml:"DownloadSpeedLimit" json:"DownloadSpeedLimit"`
-	EnableTlsCheck        bool `yaml:"EnableTlsCheck" json:"EnableTlsCheck"`
-	TransferOnlyMode      bool `yaml:"TransferOnlyMode" json:"TransferOnlyMode"`
+	SimultaneousDownloads int `yaml:"SimultaneousDownloads" json:"SimultaneousDownloads"`
+	// MaxActivePremiumizeTransfers caps blackhole submissions at this many
+	// total queued/running transfers on the account; transfers added outside
+	// the blackhole count against the limit too. Missing or non-positive
+	// values in config files are reset to the default during config loading.
+	MaxActivePremiumizeTransfers int  `yaml:"MaxActivePremiumizeTransfers" json:"MaxActivePremiumizeTransfers"`
+	DownloadSpeedLimit           int  `yaml:"DownloadSpeedLimit" json:"DownloadSpeedLimit"`
+	EnableTlsCheck               bool `yaml:"EnableTlsCheck" json:"EnableTlsCheck"`
+	TransferOnlyMode             bool `yaml:"TransferOnlyMode" json:"TransferOnlyMode"`
 
 	ArrHistoryUpdateIntervalSeconds int `yaml:"ArrHistoryUpdateIntervalSeconds" json:"ArrHistoryUpdateIntervalSeconds"`
 

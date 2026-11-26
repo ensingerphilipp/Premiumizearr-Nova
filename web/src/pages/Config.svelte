@@ -32,6 +32,7 @@
     BindPort: "",
     WebRoot: "",
     SimultaneousDownloads: 0,
+    MaxActivePremiumizeTransfers: 20,
     DownloadSpeedLimit: 100,
     EnableTlsCheck: false,
     TransferOnlyMode: false,
@@ -39,6 +40,27 @@
   };
   const ERR_SAVE = "Error Saving Config";
   const ERR_TEST = "Error Testing *arr client";
+
+  // Numeric inputs that must hold a finite number before saving. A cleared
+  // type="number" input binds null, which the backend decodes into the zero
+  // value and would silently save 0 (issue #89). The grace period input is
+  // exempt: clearing it is the documented way to reset it to the default.
+  // Server-side counterpart: numericConfigFields in
+  // internal/service/web_service_config_routes.go.
+  const numericFields = [
+    ["ArrHistoryUpdateIntervalSeconds", "Arr Update History Interval (seconds)"],
+    ["PollBlackholeIntervalMinutes", "Poll Blackhole Interval Minutes"],
+    ["SimultaneousDownloads", "Simultaneous Downloads"],
+    ["MaxActivePremiumizeTransfers", "Maximum Active Premiumize Transfers"],
+    ["DownloadSpeedLimit", "SpeedLimit per Download in Megabytes / s"],
+  ];
+
+  function invalidNumericFields() {
+    return numericFields.filter(([key]) => {
+      const value = config[key];
+      return value === null || value === undefined || value === "" || !Number.isFinite(Number(value));
+    });
+  }
 
   let arrTesting = [];
   let arrTestIcons = [];
@@ -66,6 +88,12 @@
         }
 
         config = data;
+        // Defensively normalize a non-array Arrs: the server is now fixed
+        // to always emit an array, and this guards against a future
+        // regression or a malformed payload.
+        if (!Array.isArray(config.Arrs)) {
+          config.Arrs = [];
+        }
         inputDisabled = false;
       })
       .catch((error) => {
@@ -74,6 +102,15 @@
   }
 
   function submit() {
+    const invalidFields = invalidNumericFields();
+    if (invalidFields.length > 0) {
+      errorTitle = ERR_SAVE;
+      errorMessage =
+        "The following fields must contain a number: " +
+        invalidFields.map(([, label]) => label).join(", ");
+      errorModal = true;
+      return;
+    }
     inputDisabled = true;
     // The grace period input is a DOM string; the strict Go config
     // decoder rejects strings, so coerce it to an integer before
@@ -351,6 +388,14 @@
           disabled={inputDisabled}
           bind:toggled={config.EnableTlsCheck}
           labelText="Check TLS-Certificate at Download (enabling can break certain CDNs)"
+        />
+        <TextInput
+          type="number"
+          min={1}
+          disabled={inputDisabled}
+          labelText="Maximum Active Premiumize Transfers"
+          helperText="Counts every active transfer on the account, including manually added ones - keep it below your Premiumize limit for headroom for manual transfers."
+          bind:value={config.MaxActivePremiumizeTransfers}
         />
         <TextInput
           type="number"
