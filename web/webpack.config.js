@@ -11,11 +11,9 @@ module.exports = {
 		'bundle': ['./src/main.js']
 	},
 	resolve: {
-		alias: {
-			svelte: path.dirname(require.resolve('svelte/package.json'))
-		},
 		extensions: ['.mjs', '.js', '.svelte'],
-		mainFields: ['svelte', 'browser', 'module', 'main']
+		conditionNames: ['svelte', 'browser', '...'],
+		mainFields: ['svelte', 'browser', '...']
 	},
 	output: {
 		path: path.join(__dirname, '/dist'),
@@ -64,6 +62,6 @@ module.exports = {
 		}
 	},
 	optimization: {
-		minimizer: [new EsbuildPlugin({ target: "es2015" })],
+		minimizer: [new EsbuildPlugin({ target: "es2020" })],
 	},
 };
