@@ -10,7 +10,7 @@ import (
 	"os"
 	"path"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v3"
 )
 
 // LoadOrCreateConfig - Loads the config from disk or creates a new one
@@ -90,7 +90,7 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 	}
 
 	log.Trace("Loading to interface")
-	var configInterface map[interface{}]interface{}
+	var configInterface map[string]interface{}
 	err = yaml.Unmarshal(file, &configInterface)
 	if err != nil {
 		log.Errorf("Failed to unmarshal config file: %+v", err)
