@@ -1,5 +1,5 @@
 {
-  "extends": ["config:recommended"],
+  "extends": ["config:recommended", "security:gomodIndirectSecurityUpdates"],
   "labels": ["dependencies"],
   "prBodyColumns": ["package", "from", "to", "changelog"],
   "packageRules": [
