@@ -1,5 +1,5 @@
 const MiniCssExtractPlugin = require('mini-css-extract-plugin');
-const { ESBuildMinifyPlugin } = require("esbuild-loader");
+const { EsbuildPlugin } = require("esbuild-loader");
 const path = require('path');
 const CopyWebpackPlugin = require('copy-webpack-plugin');
 const { optimizeImports } = require("carbon-preprocess-svelte");
@@ -62,6 +62,6 @@ module.exports = {
 		}
 	},
 	optimization: {
-		minimizer: [new ESBuildMinifyPlugin({ target: "es2020" })],
+		minimizer: [new EsbuildPlugin({ target: "es2020" })],
 	},
 };
