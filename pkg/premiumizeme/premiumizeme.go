@@ -141,15 +141,18 @@ func (pm *Premiumizeme) GetTransfers() ([]Transfer, error) {
 	}
 
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ret, fmt.Errorf("transfer list request failed: %s (%d)", resp.Status, resp.StatusCode)
+	}
+
 	res := ListTransfersResponse{}
-	err = json.NewDecoder(resp.Body).Decode(&res)
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return ret, err
+	}
 
 	if res.Status != "success" {
 		return ret, fmt.Errorf("%s", res.Status)
-	}
-
-	if err != nil {
-		return ret, err
 	}
 
 	log.Tracef("Received %d transfers", len(res.Transfers))
