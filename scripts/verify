@@ -79,22 +79,38 @@ if [[ -z "${CC_BIN}" ]]; then
 fi
 echo "C compiler:              ${CC_BIN}"
 
+# curl: required by the web dev-server smoke check (serves bundle.js over HTTP).
+if ! command -v curl >/dev/null 2>&1; then
+  fail "curl not found. The web dev-server smoke check fetches bundle.js over HTTP (e.g. 'apt-get install curl')."
+fi
+echo "curl:                    $(curl --version | head -1)"
+
 # --- Mandatory checks (the gate fails on the first failure) ------------------
 
-step "Check 1/6: gofmt clean (tracked Go files)"
-UNFORMATTED="$(git ls-files -z '*.go' | xargs -0 -r gofmt -l)"
+step "Check 1/12: gofmt clean, incl. -s simplifications (tracked Go files)"
+UNFORMATTED="$(git ls-files -z '*.go' | xargs -0 -r gofmt -s -l)"
 if [[ -n "${UNFORMATTED}" ]]; then
   printf '%s\n' "${UNFORMATTED}" | sed 's/^/    /'
-  fail "tracked Go files are not gofmt-clean. Run 'gofmt -w' on them."
+  fail "tracked Go files are not gofmt/simplify-clean. Run 'gofmt -s -w' on them."
 fi
-echo "all tracked Go files gofmt-clean"
+echo "all tracked Go files gofmt -s clean"
 
-step "Check 2/6: go vet"
+step "Check 2/12: go vet"
 if ! go vet ./...; then
   fail "go vet ./... reported findings. Fix them per their intended behavior; no suppressions or -vet=off (see PROJECT.md)."
 fi
 
-step "Check 3/6: production-style Go build"
+step "Check 3/12: go mod verify (module checksums against go.sum)"
+if ! go mod verify; then
+  fail "go mod verify failed: module checksums do not match go.sum (possible module-cache tampering)."
+fi
+
+step "Check 4/12: go mod tidy drift (go.mod/go.sum vs. real imports)"
+if ! go mod tidy -diff; then
+  fail "go mod tidy -diff reported changes: go.mod/go.sum are out of sync with the real imports. Run 'go mod tidy' and commit the result."
+fi
+
+step "Check 5/12: production-style Go build"
 BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "${BUILD_DIR}"' EXIT
 if ! CGO_ENABLED=0 go build -tags 'netgo osusergo' -ldflags '-extldflags "-static"' -o "${BUILD_DIR}/premiumizearrd" ./cmd/premiumizearrd; then
@@ -102,20 +118,69 @@ if ! CGO_ENABLED=0 go build -tags 'netgo osusergo' -ldflags '-extldflags "-stati
 fi
 echo "built ${BUILD_DIR}/premiumizearrd"
 
-step "Check 4/6: go test -race"
+step "Check 6/12: release cross-compile check (linux/arm64)"
+if ! CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags 'netgo osusergo' -ldflags '-extldflags "-static"' -o "${BUILD_DIR}/premiumizearrd-linux-arm64" ./cmd/premiumizearrd; then
+  fail "linux/arm64 cross-compile failed (a release target built by goreleaser; caught here before the release)."
+fi
+echo "built ${BUILD_DIR}/premiumizearrd-linux-arm64"
+
+step "Check 7/12: go test -race"
 if ! go test -race ./...; then
   fail "go test -race ./... failed."
 fi
 
-step "Check 5/6: web dependencies (npm ci, locked graph)"
+step "Check 8/12: config file validation (CI workflows, goreleaser, config.yaml, renovate.json)"
+if ! go run ./scripts/configlint .github/workflows/*.yml .goreleaser.yaml .prerelease.goreleaser.yaml config.yaml renovate.json; then
+  fail "config file validation failed: at least one YAML/JSON config file has a syntax error."
+fi
+
+step "Check 9/12: web dependencies (npm ci, locked graph)"
 if ! (cd web && npm ci); then
   fail "npm ci failed in web/ (package-lock.json must be in sync with package.json)."
 fi
 
-step "Check 6/6: web production build"
+step "Check 10/12: npm audit (full dependency tree, high and above)"
+if ! (cd web && npm audit --audit-level=high); then
+  fail "npm audit reported high/critical vulnerabilities. Resolve them (update via Renovate/OSV or replace the dependency)."
+fi
+
+step "Check 11/12: web production build"
 if ! (cd web && npm run build); then
   fail "web production build failed (npm run build)."
 fi
+
+step "Check 12/12: web dev-server smoke (npm run dev serves bundle.js)"
+DEV_LOG="$(mktemp)"
+DEV_PID=""
+cleanup() {
+  # Also fires on interruption: never leave the dev server running on port
+  # 8080, where a later smoke run would pass against a stale server.
+  if [[ -n "${DEV_PID}" ]]; then
+    kill -TERM -- "-${DEV_PID}" 2>/dev/null || true
+    kill -TERM "${DEV_PID}" 2>/dev/null || true
+  fi
+  rm -rf "${BUILD_DIR}" "${DEV_LOG}"
+}
+trap cleanup EXIT
+setsid bash -c 'cd web && npm run dev' >"${DEV_LOG}" 2>&1 &
+DEV_PID=$!
+BUNDLE_OK=0
+for _ in $(seq 1 30); do
+  if curl -fsS --max-time 3 -o /dev/null http://127.0.0.1:8080/bundle.js; then
+    BUNDLE_OK=1
+    break
+  fi
+  sleep 1
+done
+kill -TERM -- "-${DEV_PID}" 2>/dev/null || true
+kill -TERM "${DEV_PID}" 2>/dev/null || true
+wait "${DEV_PID}" 2>/dev/null || true
+DEV_PID=""
+if [[ "${BUNDLE_OK}" -ne 1 ]]; then
+  tail -20 "${DEV_LOG}"
+  fail "web dev-server smoke failed: http://127.0.0.1:8080/bundle.js not reachable within 30s of 'npm run dev'."
+fi
+echo "dev server served bundle.js over HTTP"
 
 echo ""
 echo "VERIFY: PASS — all checks green"

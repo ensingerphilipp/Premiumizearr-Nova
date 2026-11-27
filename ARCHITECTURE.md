@@ -132,9 +132,9 @@ serves the SPA from ./static + JSON API. No authentication by design.
 
 - `Makefile`: `make web` (`npm i` + webpack), `make build` (static:
   `CGO_ENABLED=0`, tags `netgo osusergo`).
-- goreleaser (`.goreleaser.yaml`, `.prerelease.goreleaser.yaml`): linux/windows
+- goreleaser (`.goreleaser.yaml`, `.prerelease.goreleaser.yaml`): linux
   amd64/arm64 archives, deb (nfpms), GHCR Docker images (linuxserver alpine
-  base, s6), manifests.
+  base, s6), manifests. There is no Windows build.
 - CI: `build.yml` (release/snapshot via goreleaser on tags/PRs) — **separate
   from the verify job**.
 - `verify.yml` — PR-triggered, runs `scripts/verify` (below); the
@@ -182,21 +182,42 @@ checks; never downloads or installs toolchains (verification exports
   always uses the locally provisioned toolchain and never downloads one; the
   local Go version is reported and must be >= 1.24.2 (go.mod's `go 1.23.0` /
   `toolchain go1.24.2` is never edited to make this pass).
-- Node major == 22; npm present.
+- Node major == 26; npm present.
 - C compiler resolvable (`cc`/`gcc`/`clang`) — required for `go test -race`.
+- `curl` present — required for the web dev-server smoke check.
 
 **Mandatory checks, in order (any failure fails the gate):**
 
-1. gofmt clean over tracked Go files:
-   `git ls-files -z '*.go' | xargs -0 gofmt -l` → must be empty (offenders
-   listed).
+1. gofmt clean (incl. `-s` simplifications) over tracked Go files:
+   `git ls-files -z '*.go' | xargs -0 -r gofmt -s -l` → must be empty
+   (offenders listed).
 2. `go vet ./...` clean.
-3. Production-style build:
+3. `go mod verify` clean (module checksums match `go.sum`; supply-chain
+   tamper check).
+4. `go mod tidy -diff` clean (`go.mod`/`go.sum` in sync with real imports;
+   `go.mod` is never modified by the gate).
+5. Production-style build:
    `CGO_ENABLED=0 go build -tags 'netgo osusergo' -ldflags '-extldflags
    "-static"' ./cmd/premiumizearrd` → temp dir.
-4. `go test -race ./...` clean.
-5. `cd web && npm ci` (locked dependency graph).
-6. `cd web && npm run build` (production webpack build).
+6. Release cross-compile check for `linux/arm64`: a full static build
+   (`CGO_ENABLED=0`, no CGO) of a goreleaser release target, caught before
+   the release. There is no Windows build.
+7. `go test -race ./...` clean.
+8. Config file validation via `go run ./scripts/configlint` (uses only
+   existing `go.mod` dependencies; every YAML document in a stream is
+   decoded): all `.github/workflows/*.yml`, `.goreleaser.yaml`,
+   `.prerelease.goreleaser.yaml`, `config.yaml`, `renovate.json` must parse
+   as YAML/JSON.
+9. `cd web && npm ci` (locked dependency graph).
+10. `cd web && npm audit --audit-level=high` clean (no high/critical
+    CVEs anywhere in the dependency tree — the UI's bundled packages live
+    in devDependencies, so the audit covers the full tree).
+11. `cd web && npm run build` (production webpack build).
+12. Web dev-server smoke: `npm run dev` is started on its own session, the
+    gate fetches `http://127.0.0.1:8080/bundle.js` via `curl --max-time 3`
+    within 30s, and the dev-server process tree is terminated afterwards
+    (also via the EXIT trap on interruption) (catches a broken
+    dev workflow that the production build does not exercise).
 
 ## Known risks & limitations (verified, not yet fixed)
 

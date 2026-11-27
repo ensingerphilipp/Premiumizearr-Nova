@@ -11,7 +11,6 @@ builds:
       - CGO_ENABLED=0
     goos:
       - linux
-      - windows
     main: ./cmd/premiumizearrd
     ldflags:
       - '-extldflags "-static"'
@@ -23,17 +22,8 @@ builds:
       - arm64
     goarm:
       - 8
-    ignore:
-      - goos: windows
-        goarch: arm64
-      - goos: windows
-        goarch: arm
-
 archives:
-  - format_overrides:
-      - goos: windows
-        format: zip
-    wrap_in_directory: true
+  - wrap_in_directory: true
     files:
       - README.md
       - LICENSE

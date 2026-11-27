@@ -120,13 +120,10 @@ func TestPollBlackholeHandlerReportsScanError(t *testing.T) {
 	}
 }
 
-func TestBlackholeHandlerRendersBaseNameAcrossPathSeparators(t *testing.T) {
+func TestBlackholeHandlerRendersBaseName(t *testing.T) {
 	directoryWatcher := NewDirectoryWatcherService()
 	directoryWatcher.Queue = stringqueue.NewStringQueue()
-	// Poll-mode queue keys are OS-native: forward slashes on Linux,
-	// backslashes on Windows (filepath.Join at the scan site).
 	directoryWatcher.Queue.Add("/bh/movie.nzb")
-	directoryWatcher.Queue.Add(`C:\bh\movie.nzb`)
 	webServer := WebServerService{directoryWatcherService: &directoryWatcher}
 
 	request := httptest.NewRequest(http.MethodGet, "/api/blackhole", nil)
@@ -144,9 +141,7 @@ func TestBlackholeHandlerRendersBaseNameAcrossPathSeparators(t *testing.T) {
 	for _, file := range body.BlackholeFiles {
 		got = append(got, file.Name)
 	}
-	// R1-9: both separators must render the file name only; Linux display
-	// stays unchanged.
-	want := []string{"movie.nzb", "movie.nzb"}
+	want := []string{"movie.nzb"}
 	if len(got) != len(want) {
 		t.Fatalf("displayed names = %v, want %v", got, want)
 	}

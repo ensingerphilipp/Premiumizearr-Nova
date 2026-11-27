@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"path"
 	"sort"
-	"strings"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
@@ -101,10 +100,7 @@ func (s *WebServerService) BlackholeHandler(w http.ResponseWriter, r *http.Reque
 		resp.Status = "Not Initialized"
 	} else {
 		for i, n := range s.directoryWatcherService.Queue.GetQueue() {
-			// Queue keys are OS-native (filepath.Join on Windows yields
-			// backslashes); normalize before the slash-only Base so the
-			// UI shows the file name on every platform (review finding R1-9).
-			name := path.Base(strings.ReplaceAll(n, "\\", "/"))
+			name := path.Base(n)
 			resp.BlackholeFiles = append(resp.BlackholeFiles, BlackholeFile{
 				ID:   i,
 				Name: name,

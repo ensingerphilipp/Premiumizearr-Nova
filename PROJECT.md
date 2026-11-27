@@ -26,7 +26,8 @@ It is a continuation of Jackdallas' Premiumizearr, licensed under GNU GPL v3.
 1. Reliable transfer pipeline: no lost blackhole files, no orphaned or
    incomplete downloads, no download lockups.
 2. Maintained deployments: the Docker image is the primary, supported method;
-   binary/deb/Windows artifacts are built but documented as unsupported.
+   binary/deb artifacts are built but documented as unsupported. There is no
+   Windows build.
 3. A working web UI and API for status and configuration.
 4. A deterministic verification gate (`scripts/verify`) that is green and
    enforced as a required CI check.
@@ -43,7 +44,7 @@ planning/approval before work begins:
 - Net-new product features without an approved objective, GitHub issue, or
   approved planning decision. Agents must not invent product features.
 - Major dependency upgrades (including changes to the Go `go` directive, Node
-  24, Svelte major versions, *arr client library changes).
+  28, Svelte major versions, *arr client library changes).
 - Architecture changes (service boundaries, config propagation, state model).
 - Security-model changes (authentication, secret storage) and persistence
   changes (today: `config.yaml` + in-memory runtime state only).
@@ -89,9 +90,9 @@ Invariants:
   (`setup-go 1.24.2`), and verification all run on Go 1.24.2. Do not rewrite
   `go.mod` or raise the go directive merely to align numbers; a floor change
   is an explicit future maintenance decision (HITL).
-- Node standard: **22**. Pinned explicitly wherever the toolchain is used (CI
+- Node standard: **26**. Pinned explicitly wherever the toolchain is used (CI
   via `actions/setup-node`); never rely on runner preinstalled defaults. A move
-  to Node 24 is normal maintenance, decided later.
+  to Node 28 is normal maintenance, decided later.
 - `scripts/verify` exports `GOTOOLCHAIN=local` and requires the locally
   provisioned Go to be >= 1.24.2; it never downloads or installs toolchains.
 

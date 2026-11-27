@@ -185,7 +185,6 @@ wget https://github.com/ensingerphilipp/premiumizearr-nova/releases/download/x.x
 sudo dpkg -i premiumizearr_x.x.x.x_linux_amd64.deb
 ```
 
-### Windows Installation
+### Windows
 
-1. [Download the Windows Release here](https://github.com/ensingerphilipp/premiumizearr-nova/releases/)
-2. Follow the Setup Instructions and try to match them to Windows Commandline where possible
+There is no Windows build. Premiumizearr-Nova is released for Linux only (binary, deb, Docker); on Windows use the Docker image.
