@@ -1,13 +1,16 @@
 // Command configlint validates YAML and JSON configuration files that the
-// repository depends on (CI workflows, renovate.json, config.yaml). It is the
-// verification helper behind the "config file validation" gate check and uses
-// only dependencies already present in go.mod, so the gate contract
-// ("npm dependencies are the only downloads") is preserved.
+// repository depends on (CI workflows, goreleaser configs, renovate.json,
+// config.yaml). It is the verification helper behind the "config file
+// validation" gate check and uses only dependencies already present in
+// go.mod, so the gate contract ("npm dependencies are the only downloads")
+// is preserved.
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 
 	"go.yaml.in/yaml/v4"
@@ -20,8 +23,20 @@ func validate(path string) error {
 	}
 	switch {
 	case hasSuffix(path, ".yml"), hasSuffix(path, ".yaml"):
+		// Decode every YAML document in the stream; a syntax error in any
+		// later "---" document must fail the check, and Unmarshal alone would
+		// silently stop after the first one.
+		decoder := yaml.NewDecoder(bytes.NewReader(data))
 		var out any
-		return yaml.Unmarshal(data, &out)
+		for {
+			err := decoder.Decode(&out)
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+		}
 	case hasSuffix(path, ".json"):
 		var out any
 		return json.Unmarshal(data, &out)

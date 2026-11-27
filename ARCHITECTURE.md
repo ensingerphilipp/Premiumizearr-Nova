@@ -182,7 +182,7 @@ checks; never downloads or installs toolchains (verification exports
   always uses the locally provisioned toolchain and never downloads one; the
   local Go version is reported and must be >= 1.24.2 (go.mod's `go 1.23.0` /
   `toolchain go1.24.2` is never edited to make this pass).
-- Node major == 22; npm present.
+- Node major == 26; npm present.
 - C compiler resolvable (`cc`/`gcc`/`clang`) — required for `go test -race`.
 - `curl` present — required for the web dev-server smoke check.
 
@@ -199,19 +199,24 @@ checks; never downloads or installs toolchains (verification exports
 5. Production-style build:
    `CGO_ENABLED=0 go build -tags 'netgo osusergo' -ldflags '-extldflags
    "-static"' ./cmd/premiumizearrd` → temp dir.
-6. Release cross-compile check for `linux/arm64` (a goreleaser release
-   target; pure type-check build, no CGO). There is no Windows build.
+6. Release cross-compile check for `linux/arm64`: a full static build
+   (`CGO_ENABLED=0`, no CGO) of a goreleaser release target, caught before
+   the release. There is no Windows build.
 7. `go test -race ./...` clean.
 8. Config file validation via `go run ./scripts/configlint` (uses only
-   existing `go.mod` dependencies): all `.github/workflows/*.yml`,
-   `config.yaml`, `renovate.json` must parse as YAML/JSON.
+   existing `go.mod` dependencies; every YAML document in a stream is
+   decoded): all `.github/workflows/*.yml`, `.goreleaser.yaml`,
+   `.prerelease.goreleaser.yaml`, `config.yaml`, `renovate.json` must parse
+   as YAML/JSON.
 9. `cd web && npm ci` (locked dependency graph).
-10. `cd web && npm audit --omit=dev --audit-level=high` clean (no
-    high/critical CVEs in runtime dependencies).
+10. `cd web && npm audit --audit-level=high` clean (no high/critical
+    CVEs anywhere in the dependency tree — the UI's bundled packages live
+    in devDependencies, so the audit covers the full tree).
 11. `cd web && npm run build` (production webpack build).
 12. Web dev-server smoke: `npm run dev` is started on its own session, the
-    gate fetches `http://127.0.0.1:8080/bundle.js` via `curl` within 30s, and
-    the dev-server process tree is terminated afterwards (catches a broken
+    gate fetches `http://127.0.0.1:8080/bundle.js` via `curl --max-time 3`
+    within 30s, and the dev-server process tree is terminated afterwards
+    (also via the EXIT trap on interruption) (catches a broken
     dev workflow that the production build does not exercise).
 
 ## Known risks & limitations (verified, not yet fixed)

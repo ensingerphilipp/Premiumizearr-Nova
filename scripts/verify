@@ -129,8 +129,8 @@ if ! go test -race ./...; then
   fail "go test -race ./... failed."
 fi
 
-step "Check 8/12: config file validation (CI workflows, config.yaml, renovate.json)"
-if ! go run ./scripts/configlint .github/workflows/build.yml .github/workflows/codeql-analysis.yml .github/workflows/pr_artifact_comment.yml .github/workflows/verify.yml config.yaml renovate.json; then
+step "Check 8/12: config file validation (CI workflows, goreleaser, config.yaml, renovate.json)"
+if ! go run ./scripts/configlint .github/workflows/*.yml .goreleaser.yaml .prerelease.goreleaser.yaml config.yaml renovate.json; then
   fail "config file validation failed: at least one YAML/JSON config file has a syntax error."
 fi
 
@@ -139,9 +139,9 @@ if ! (cd web && npm ci); then
   fail "npm ci failed in web/ (package-lock.json must be in sync with package.json)."
 fi
 
-step "Check 10/12: npm audit (runtime deps, high and above)"
-if ! (cd web && npm audit --omit=dev --audit-level=high); then
-  fail "npm audit reported high/critical vulnerabilities in runtime dependencies. Resolve them (update via Renovate/OSV or replace the dependency)."
+step "Check 10/12: npm audit (full dependency tree, high and above)"
+if ! (cd web && npm audit --audit-level=high); then
+  fail "npm audit reported high/critical vulnerabilities. Resolve them (update via Renovate/OSV or replace the dependency)."
 fi
 
 step "Check 11/12: web production build"
@@ -151,12 +151,22 @@ fi
 
 step "Check 12/12: web dev-server smoke (npm run dev serves bundle.js)"
 DEV_LOG="$(mktemp)"
-trap 'rm -rf "${BUILD_DIR}" "${DEV_LOG}"' EXIT
+DEV_PID=""
+cleanup() {
+  # Also fires on interruption: never leave the dev server running on port
+  # 8080, where a later smoke run would pass against a stale server.
+  if [[ -n "${DEV_PID}" ]]; then
+    kill -TERM -- "-${DEV_PID}" 2>/dev/null || true
+    kill -TERM "${DEV_PID}" 2>/dev/null || true
+  fi
+  rm -rf "${BUILD_DIR}" "${DEV_LOG}"
+}
+trap cleanup EXIT
 setsid bash -c 'cd web && npm run dev' >"${DEV_LOG}" 2>&1 &
 DEV_PID=$!
 BUNDLE_OK=0
 for _ in $(seq 1 30); do
-  if curl -fsS -o /dev/null http://127.0.0.1:8080/bundle.js; then
+  if curl -fsS --max-time 3 -o /dev/null http://127.0.0.1:8080/bundle.js; then
     BUNDLE_OK=1
     break
   fi
@@ -165,6 +175,7 @@ done
 kill -TERM -- "-${DEV_PID}" 2>/dev/null || true
 kill -TERM "${DEV_PID}" 2>/dev/null || true
 wait "${DEV_PID}" 2>/dev/null || true
+DEV_PID=""
 if [[ "${BUNDLE_OK}" -ne 1 ]]; then
   tail -20 "${DEV_LOG}"
   fail "web dev-server smoke failed: http://127.0.0.1:8080/bundle.js not reachable within 30s of 'npm run dev'."
