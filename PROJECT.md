@@ -113,8 +113,6 @@ a new change from verification.
 
 **CI hygiene (existing workflows):**
 
-- Explicit `setup-node` (Node 22) in the release `build.yml` (today it relies
-  on the runner preinstalled Node).
 - EOL action pins: `actions/checkout@v2`, `codeql-action@v2`,
   `github-script@v5`, `goreleaser-action@v2`.
 - ubuntu-24.x runner (open renovate branch).

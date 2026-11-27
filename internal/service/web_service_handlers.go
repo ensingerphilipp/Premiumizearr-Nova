@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"path"
 	"sort"
+	"strings"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
+	log "github.com/sirupsen/logrus"
 )
 
 type TransfersResponse struct {
@@ -36,6 +38,10 @@ type BlackholeFile struct {
 type BlackholeResponse struct {
 	BlackholeFiles []BlackholeFile `json:"data"`
 	Status         string          `json:"status"`
+}
+
+type BlackholePollResponse struct {
+	Queued int `json:"queued"`
 }
 
 type Download struct {
@@ -96,10 +102,14 @@ func (s *WebServerService) BlackholeHandler(w http.ResponseWriter, r *http.Reque
 		resp.Status = "Not Initialized"
 	} else {
 		for i, n := range s.directoryWatcherService.Queue.GetQueue() {
-			name := path.Base(n)
+			// Queue keys are OS-native (filepath.Join on Windows yields
+			// backslashes); normalize before the slash-only Base so the
+			// UI shows the file name on every platform (review finding R1-9).
+			normalized := strings.ReplaceAll(n, "\\", "/")
+			name := path.Base(normalized)
 			arr := ""
-			if path.Dir(n) != path.Clean(s.config.BlackholeDirectory) {
-				arr = path.Base(path.Dir(n))
+			if s.config != nil && path.Dir(normalized) != path.Clean(strings.ReplaceAll(s.config.BlackholeDirectory, "\\", "/")) {
+				arr = path.Base(path.Dir(normalized))
 			}
 			resp.BlackholeFiles = append(resp.BlackholeFiles, BlackholeFile{
 				ID:   i,
@@ -118,6 +128,34 @@ func (s *WebServerService) BlackholeHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	w.Write(data)
+}
+
+func (s *WebServerService) PollBlackholeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.directoryWatcherService == nil || s.directoryWatcherService.Queue == nil {
+		http.Error(w, "Directory watcher is not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	queued, err := s.directoryWatcherService.ScanNow()
+	if err != nil {
+		// The endpoint is unauthenticated: the body stays generic so a
+		// failed scan cannot leak the configured directory path or OS
+		// error state; the wrapped error is logged instead
+		// (review finding R1-4).
+		log.Errorf("blackhole scan failed: %s", err)
+		http.Error(w, "blackhole scan failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(BlackholePollResponse{Queued: queued}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 type TestArrResponse struct {

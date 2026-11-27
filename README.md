@@ -39,6 +39,8 @@ Next Steps:
 
 New blackhole submissions pause automatically when the Premiumize fair-use quota is exhausted and no booster points are available. Existing cloud transfers are not affected. Source files remain in the blackhole directory and are processed automatically after quota replenishment or booster activation.
 
+Blackhole submissions are capped at 20 active Premiumize transfers by default. The cap counts every active transfer on the account, including downloads added manually, so it is a shared pool: keep the cap below your Premiumize limit if you want headroom for manual transfers. Set `MaxActivePremiumizeTransfers` in the configuration to choose a different cap.
+
 ## Install
 
 ### Docker
@@ -67,6 +69,22 @@ docker run -d --name premiumizearr \
 ```
 
 If you wish to increase logging (which you'll be asked to do if you submit an issue) you can add `-e PREMIUMIZEARR_LOG_LEVEL=trace` to the command
+
+For CIFS/SMB, NFS, or FUSE mounts, set permissions or UID/GID mapping on the host
+so the container's `PUID`/`PGID` can read and write the mounted folders. Container
+startup skips ownership changes on detected network mounts. When a network mount
+is nested inside a local directory, startup still sets ownership of the local
+directory and its local contents while excluding the network subtree. Ownership
+work has a 10-second timeout for each target directory (including path resolution,
+mount checks, and any selective traversal), followed by a 2-second forced-stop
+deadline; a failure is logged and startup continues. To manage all ownership on
+the host, add `-e PREMIUMIZEARR_SKIP_CHOWN=true` to skip these changes entirely.
+
+The four-day download cleanup runs after the HTTP listener starts and before
+the transfer loop begins downloading. A stalled downloads mount can still pause
+that worker until the filesystem recovers, while the web UI remains available.
+Keep `/data` (configuration and logs) and the application files on responsive
+storage, since they are needed to start the daemon.
 
 > Note: The /data mount is where the `config.yaml` and log files are kept
 > You might need to run the docker command with UID GID 1000 on the host as well

@@ -1,7 +1,11 @@
 {
-  "extends": ["config:base"],
+  "extends": ["config:recommended", "security:gomodIndirectSecurityUpdates"],
   "labels": ["dependencies"],
   "prBodyColumns": ["package", "from", "to", "changelog"],
+  "minimumReleaseAge": "14 days",
+  "vulnerabilityAlerts": {
+    "minimumReleaseAge": "0 days"
+  },
   "packageRules": [
     {
       "matchUpdateTypes": ["major"],
@@ -9,8 +13,14 @@
       "automerge": false
     },
     {
-      "matchUpdateTypes": ["minor", "patch"],
+      "matchUpdateTypes": ["minor"],
       "automerge": false
+    },
+    {
+      "description": "Automerge patch updates once they pass CI and meet the minimum release age",
+      "matchUpdateTypes": ["patch"],
+      "automerge": true,
+      "platformAutomerge": true
     }
   ],
   "prHourlyLimit": 5,
