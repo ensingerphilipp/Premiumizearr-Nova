@@ -132,9 +132,9 @@ serves the SPA from ./static + JSON API. No authentication by design.
 
 - `Makefile`: `make web` (`npm i` + webpack), `make build` (static:
   `CGO_ENABLED=0`, tags `netgo osusergo`).
-- goreleaser (`.goreleaser.yaml`, `.prerelease.goreleaser.yaml`): linux/windows
+- goreleaser (`.goreleaser.yaml`, `.prerelease.goreleaser.yaml`): linux
   amd64/arm64 archives, deb (nfpms), GHCR Docker images (linuxserver alpine
-  base, s6), manifests.
+  base, s6), manifests. There is no Windows build.
 - CI: `build.yml` (release/snapshot via goreleaser on tags/PRs) — **separate
   from the verify job**.
 - `verify.yml` — PR-triggered, runs `scripts/verify` (below); the
@@ -200,8 +200,7 @@ checks; never downloads or installs toolchains (verification exports
    `CGO_ENABLED=0 go build -tags 'netgo osusergo' -ldflags '-extldflags
    "-static"' ./cmd/premiumizearrd` → temp dir.
 6. Release cross-compile check for `linux/arm64` (a goreleaser release
-   target; pure type-check build, no CGO). Windows targets are excluded for
-   now (known broken build; tracked separately).
+   target; pure type-check build, no CGO). There is no Windows build.
 7. `go test -race ./...` clean.
 8. Config file validation via `go run ./scripts/configlint` (uses only
    existing `go.mod` dependencies): all `.github/workflows/*.yml`,

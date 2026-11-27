@@ -26,7 +26,8 @@ It is a continuation of Jackdallas' Premiumizearr, licensed under GNU GPL v3.
 1. Reliable transfer pipeline: no lost blackhole files, no orphaned or
    incomplete downloads, no download lockups.
 2. Maintained deployments: the Docker image is the primary, supported method;
-   binary/deb/Windows artifacts are built but documented as unsupported.
+   binary/deb artifacts are built but documented as unsupported. There is no
+   Windows build.
 3. A working web UI and API for status and configuration.
 4. A deterministic verification gate (`scripts/verify`) that is green and
    enforced as a required CI check.
