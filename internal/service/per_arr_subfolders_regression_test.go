@@ -15,7 +15,7 @@ import (
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/directory_watcher"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/stringqueue"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v4"
 )
 
 // pmeCall records one request the test pme stub received.

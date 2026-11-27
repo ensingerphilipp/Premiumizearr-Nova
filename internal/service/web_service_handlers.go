@@ -3,11 +3,13 @@ package service
 import (
 	"encoding/json"
 	"net/http"
-	"path/filepath"
+	"path"
 	"sort"
+	"strings"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
 	"github.com/ensingerphilipp/premiumizearr-nova/pkg/premiumizeme"
+	log "github.com/sirupsen/logrus"
 )
 
 type TransfersResponse struct {
@@ -36,6 +38,10 @@ type BlackholeFile struct {
 type BlackholeResponse struct {
 	BlackholeFiles []BlackholeFile `json:"data"`
 	Status         string          `json:"status"`
+}
+
+type BlackholePollResponse struct {
+	Queued int `json:"queued"`
 }
 
 type Download struct {
@@ -103,22 +109,24 @@ func (s *WebServerService) BlackholeHandler(w http.ResponseWriter, r *http.Reque
 		blackholeDir := ""
 		enabled := false
 		var arrs []config.ArrConfig
-		if mu := config.UpdateMu(); mu != nil {
-			mu.RLock()
-			blackholeDir = s.config.BlackholeDirectory
-			enabled = s.config.EnableArrSubfolders
-			arrs = append([]config.ArrConfig(nil), s.config.Arrs...)
-			mu.RUnlock()
-		} else {
-			blackholeDir = s.config.BlackholeDirectory
-			enabled = s.config.EnableArrSubfolders
-			arrs = append([]config.ArrConfig(nil), s.config.Arrs...)
+		if s.config != nil {
+			if mu := config.UpdateMu(); mu != nil {
+				mu.RLock()
+				blackholeDir = s.config.BlackholeDirectory
+				enabled = s.config.EnableArrSubfolders
+				arrs = append([]config.ArrConfig(nil), s.config.Arrs...)
+				mu.RUnlock()
+			} else {
+				blackholeDir = s.config.BlackholeDirectory
+				enabled = s.config.EnableArrSubfolders
+				arrs = append([]config.ArrConfig(nil), s.config.Arrs...)
+			}
 		}
 		for i, n := range s.directoryWatcherService.Queue.GetQueue() {
-			// filepath (not path): fsnotify event names carry the platform
-			// separator (backslashes on Windows), and Clean/Dir/Base
-			// normalize both styles on both platforms.
-			name := filepath.Base(n)
+			// Queue keys are OS-native (filepath.Join on Windows yields
+			// backslashes); normalize before the slash-only Base so the
+			// UI shows the file name on every platform (review finding R1-9).
+			name := path.Base(strings.ReplaceAll(n, "\\", "/"))
 			// The Arr is derived with the same shared classification the
 			// upload routing uses: only a file directly inside a currently
 			// configured Arr subfolder under the current blackhole root
@@ -143,6 +151,34 @@ func (s *WebServerService) BlackholeHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	w.Write(data)
+}
+
+func (s *WebServerService) PollBlackholeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.directoryWatcherService == nil || s.directoryWatcherService.Queue == nil {
+		http.Error(w, "Directory watcher is not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	queued, err := s.directoryWatcherService.ScanNow()
+	if err != nil {
+		// The endpoint is unauthenticated: the body stays generic so a
+		// failed scan cannot leak the configured directory path or OS
+		// error state; the wrapped error is logged instead
+		// (review finding R1-4).
+		log.Errorf("blackhole scan failed: %s", err)
+		http.Error(w, "blackhole scan failed", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(BlackholePollResponse{Queued: queued}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 type TestArrResponse struct {

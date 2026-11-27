@@ -1,5 +1,5 @@
 const MiniCssExtractPlugin = require('mini-css-extract-plugin');
-const { ESBuildMinifyPlugin } = require("esbuild-loader");
+const { EsbuildPlugin } = require("esbuild-loader");
 const path = require('path');
 const CopyWebpackPlugin = require('copy-webpack-plugin');
 const { optimizeImports } = require("carbon-preprocess-svelte");
@@ -11,11 +11,9 @@ module.exports = {
 		'bundle': ['./src/main.js']
 	},
 	resolve: {
-		alias: {
-			svelte: path.dirname(require.resolve('svelte/package.json'))
-		},
 		extensions: ['.mjs', '.js', '.svelte'],
-		mainFields: ['svelte', 'browser', 'module', 'main']
+		conditionNames: ['svelte', 'browser', '...'],
+		mainFields: ['svelte', 'browser', '...']
 	},
 	output: {
 		path: path.join(__dirname, '/dist'),
@@ -59,11 +57,11 @@ module.exports = {
 	devtool: 'source-map',
 	devServer: {
 		hot: true,
-		proxy: {	
-			'/api': 'http://127.0.0.1:8182'
-		}
+		proxy: [
+			{ context: ['/api'], target: 'http://127.0.0.1:8182' }
+		]
 	},
 	optimization: {
-		minimizer: [new ESBuildMinifyPlugin({ target: "es2015" })],
+		minimizer: [new EsbuildPlugin({ target: "es2020" })],
 	},
 };

@@ -3,6 +3,7 @@ package premiumizeme
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -141,15 +142,18 @@ func (pm *Premiumizeme) GetTransfers() ([]Transfer, error) {
 	}
 
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ret, fmt.Errorf("transfer list request failed: %s (%d)", resp.Status, resp.StatusCode)
+	}
+
 	res := ListTransfersResponse{}
-	err = json.NewDecoder(resp.Body).Decode(&res)
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return ret, err
+	}
 
 	if res.Status != "success" {
 		return ret, fmt.Errorf("%s", res.Status)
-	}
-
-	if err != nil {
-		return ret, err
 	}
 
 	log.Tracef("Received %d transfers", len(res.Transfers))
@@ -195,7 +199,7 @@ func (pm *Premiumizeme) ListFolder(folderID string) ([]Item, error) {
 	}
 
 	if res.Status != "success" {
-		return ret, fmt.Errorf(res.Message)
+		return ret, errors.New(res.Message)
 	}
 
 	return res.Content, nil
@@ -293,7 +297,7 @@ func (pm *Premiumizeme) CreateTransfer(filePath string, parentID string) error {
 	}
 
 	if res.Status != "success" {
-		return fmt.Errorf(res.Message)
+		return errors.New(res.Message)
 	}
 
 	log.Tracef("Transfer created: %+v", res)
@@ -339,7 +343,7 @@ func (pm *Premiumizeme) DeleteFolder(folderID string) error {
 	}
 
 	if res.Status != "success" {
-		return fmt.Errorf(res.Message)
+		return errors.New(res.Message)
 	}
 
 	log.Tracef("Folder deleted: %+v", res)
@@ -386,7 +390,7 @@ func (pm *Premiumizeme) MoveItem(itemID string, folderID string) error {
 	}
 
 	if res.Status != "success" {
-		return fmt.Errorf(res.Message)
+		return errors.New(res.Message)
 	}
 
 	log.Tracef("Item moved: %+v", res)
@@ -434,7 +438,7 @@ func (pm *Premiumizeme) CreateFolder(folderName string, parentID *string) (strin
 	}
 
 	if res.Status != "success" {
-		return "", fmt.Errorf(res.Message)
+		return "", errors.New(res.Message)
 	}
 
 	log.Tracef("Folder created: %+v", res)

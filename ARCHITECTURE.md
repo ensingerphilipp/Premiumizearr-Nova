@@ -76,7 +76,9 @@ serves the SPA from ./static + JSON API. No authentication by design.
 - Failed items get a 30-minute in-memory cooldown; on success the Premiumize
   folder is deleted.
 - `CleanUpDownloadDirPeriod` deletes files older than 4 days from the
-  downloads directory at startup.
+  downloads directory after the HTTP listener starts, before the first
+  transfer poll and any new downloads. A stalled cleanup can pause the
+  transfer worker while the web UI remains available.
 - `TransferOnlyMode` disables this pipeline entirely.
 
 ### *arr integration
@@ -142,9 +144,9 @@ serves the SPA from ./static + JSON API. No authentication by design.
 
 ## Approved technical decisions
 
-1. **Node standard: 22.** Pinned explicitly wherever the toolchain is used
+1. **Node standard: 26.** Pinned explicitly wherever the toolchain is used
    (CI via `actions/setup-node`); never rely on runner preinstalled defaults.
-   Node 24 later as normal maintenance.
+   Upgraded from Node 22 (EOL April 2027) to Node 26 LTS as normal maintenance.
 2. **Go toolchain split (intentional).** `go.mod` declares `go 1.23.0`
    (minimum project floor) + `toolchain go1.24.2` (the project Go toolchain:
    dev on Go 1.24.2, CI pins `setup-go 1.24.2`, verification runs with
@@ -246,7 +248,7 @@ checks; never downloads or installs toolchains (verification exports
 - Native Go downloader replacing wget.
 - Dead-code removal after public-API assessment.
 - ldflags version injection (single source of truth for the version string).
-- Node 24; ubuntu-24.x runner; Svelte 5 (open renovate branches).
+- ubuntu-24.x runner; Svelte 5 (open renovate branches).
 - Field-level validation for `POST /api/config`.
 - Secret hygiene: config file permissions (e.g. 0600), no-secrets-in-logs,
   dangerous-defaults review — each proposed separately.

@@ -12,9 +12,10 @@
 
   let updating = false;
   let status = "";
+  let fetchFailed = false;
   $: rows=[]
   $: console.log("Rows updated:", rows);
-  $: statusIndicator = updating ? "active" : "finished";
+  $: statusIndicator = updating ? "active" : fetchFailed ? "error" : "finished";
 
   function UpdateFromAPI() {
     if (updating) {
@@ -24,7 +25,12 @@
     updating = true;
     console.log("Fetching data from API:", APIpath); // Debugging log
     fetch(CalculateAPIPath(APIpath))
-      .then((res) => res.json())
+      .then((res) => {
+        if (!res.ok) {
+          throw new Error("HTTP " + res.status);
+        }
+        return res.json();
+      })
       .then((data) => {
         console.log("API response:", data);
         if (data.data && data.data.length > 0) {
@@ -35,10 +41,13 @@
         }
         console.log("Updated rows in APITable:", rows);
         status = data.status;
+        fetchFailed = false;
         updating = false;
       })
       .catch((err) => {
         console.error("Error fetching data:", err);
+        fetchFailed = true;
+        status = "";
         updating = false;
       }).finally(() => {
         updating = false; // Always reset updating flag
@@ -69,7 +78,7 @@
     <InlineLoading status={statusIndicator} description="Update status" />
   </p>
   <p>
-    Message: {status}
+    Message: {fetchFailed ? "Update failed — showing the last known data. Check that the daemon is reachable, then reload." : status}
   </p>
   <p>
     <DataTable sortable {headers} {rows} rowKey="name" />

@@ -11,7 +11,7 @@ import (
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/utils"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v4"
 )
 
 // TestUpdateConfigConcurrentSavesPersistCompleteConfigs is the regression

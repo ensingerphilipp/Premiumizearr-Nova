@@ -284,12 +284,43 @@ func TestWebRootAPIRoutes(t *testing.T) {
 					t.Errorf("GET %s body missing %s:\n%s", apiURL, want, body)
 				}
 			}
+			assertAPIPoll := func(apiURL string) {
+				t.Helper()
+				resp, err := client.Post(apiURL, "application/json", nil)
+				if err != nil {
+					t.Fatalf("POST %s: %v", apiURL, err)
+				}
+				defer resp.Body.Close()
+				// The test server has no directory watcher, so the registered
+				// endpoint must answer 503 instead of serving the SPA page.
+				if resp.StatusCode != http.StatusServiceUnavailable {
+					t.Fatalf("POST %s status = %d, want %d", apiURL, resp.StatusCode, http.StatusServiceUnavailable)
+				}
+			}
+			assertAPIPollMethodNotAllowed := func(apiURL string) {
+				t.Helper()
+				resp, err := client.Get(apiURL)
+				if err != nil {
+					t.Fatalf("GET %s: %v", apiURL, err)
+				}
+				defer resp.Body.Close()
+				// R1-2: without a mux method filter a non-POST poll request
+				// reaches the handler's 405 branch; with one it would fall
+				// through to the SPA catch-all (200 index.html).
+				if resp.StatusCode != http.StatusMethodNotAllowed {
+					t.Fatalf("GET %s status = %d, want %d", apiURL, resp.StatusCode, http.StatusMethodNotAllowed)
+				}
+			}
 
 			// Root registrations are the existing contract.
 			assertAPIConfig(base + "/api/config")
+			assertAPIPoll(base + "/api/blackhole/poll")
+			assertAPIPollMethodNotAllowed(base + "/api/blackhole/poll")
 			// The UI under /<webRoot>/ calls the API relative to the page.
 			if prefix != "" {
 				assertAPIConfig(base + prefix + "/api/config")
+				assertAPIPoll(base + prefix + "/api/blackhole/poll")
+				assertAPIPollMethodNotAllowed(base + prefix + "/api/blackhole/poll")
 			}
 		})
 	}

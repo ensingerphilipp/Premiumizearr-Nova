@@ -92,12 +92,11 @@ func newFakeArrServer(t *testing.T, apiVersion string, records []fakeHistoryReco
 	})
 
 	failPath := "/api/" + apiVersion + "/history/failed"
-	// Sonarr and Radarr (API v3) use POST /history/failed/{id}; Lidarr (API
-	// v1) POSTs the id in the request body.
-	idInPath := apiVersion == "v3"
-	if idInPath {
-		failPath += "/"
-	}
+	// Sonarr, Radarr (API v3) and Lidarr (API v1) all use POST
+	// /history/failed/{id}. starr v1.4 aligned Lidarr with the other *arrs;
+	// older starr versions posted the Lidarr id in the form-encoded body.
+	idInPath := true
+	failPath += "/"
 	mux.HandleFunc(failPath, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("unexpected %s on %s", r.Method, r.URL.Path)

@@ -10,7 +10,7 @@ import (
 	"os"
 	"path"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v4"
 )
 
 // LoadOrCreateConfig - Loads the config from disk or creates a new one
@@ -108,7 +108,7 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 	}
 
 	log.Trace("Loading to interface")
-	var configInterface map[interface{}]interface{}
+	var configInterface map[string]interface{}
 	err = yaml.Unmarshal(file, &configInterface)
 	if err != nil {
 		log.Errorf("Failed to unmarshal config file: %+v", err)
@@ -185,6 +185,12 @@ func loadConfigFromDisk(altConfigLocation string) (Config, error) {
 		updated = true
 	}
 
+	if configInterface["MaxActivePremiumizeTransfers"] == nil || config.MaxActivePremiumizeTransfers <= 0 {
+		log.Info("MaxActivePremiumizeTransfers not set to a positive value, setting to 20")
+		config.MaxActivePremiumizeTransfers = DefaultMaxActivePremiumizeTransfers
+		updated = true
+	}
+
 	config.altConfigLocation = altConfigLocation
 
 	if updated {
@@ -222,6 +228,7 @@ func defaultConfig() Config {
 		BindPort:                                "8182",
 		WebRoot:                                 "",
 		SimultaneousDownloads:                   5,
+		MaxActivePremiumizeTransfers:            DefaultMaxActivePremiumizeTransfers,
 		DownloadSpeedLimit:                      100,
 		EnableTlsCheck:                          false,
 		TransferOnlyMode:                        false,

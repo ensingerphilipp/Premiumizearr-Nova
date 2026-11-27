@@ -32,6 +32,7 @@
     BindPort: "",
     WebRoot: "",
     SimultaneousDownloads: 0,
+    MaxActivePremiumizeTransfers: 20,
     DownloadSpeedLimit: 100,
     EnableTlsCheck: false,
     TransferOnlyMode: false,
@@ -39,6 +40,7 @@
     Arrs: [],
   };
   const ERR_SAVE = "Error Saving Config";
+  const ERR_LOAD = "Error Loading Config";
   const ERR_TEST = "Error Testing *arr client";
   
   // Numeric inputs that must hold a finite number before saving. A cleared
@@ -52,6 +54,7 @@
     ["ArrHistoryUpdateIntervalSeconds", "Arr Update History Interval (seconds)"],
     ["PollBlackholeIntervalMinutes", "Poll Blackhole Interval Minutes"],
     ["SimultaneousDownloads", "Simultaneous Downloads"],
+    ["MaxActivePremiumizeTransfers", "Maximum Active Premiumize Transfers"],
     ["DownloadSpeedLimit", "SpeedLimit per Download in Megabytes / s"],
   ];
 
@@ -106,6 +109,11 @@
       })
       .catch((error) => {
         console.error("Error: ", error);
+        errorTitle = ERR_LOAD;
+        errorMessage =
+          "Failed to load the config from the daemon (it may be unreachable or restarting). " +
+          "Reload the page to retry. Inputs stay disabled to avoid overwriting the config with defaults.";
+        errorModal = true;
       });
   }
 
@@ -417,6 +425,14 @@
           disabled={inputDisabled}
           bind:toggled={config.EnableArrSubfolders}
           labelText="Use per-Arr subfolders (Blackhole/Downloads/premiumize.me), based on each Arr's Name"
+        />
+        <TextInput
+          type="number"
+          min={1}
+          disabled={inputDisabled}
+          labelText="Maximum Active Premiumize Transfers"
+          helperText="Counts every active transfer on the account, including manually added ones - keep it below your Premiumize limit for headroom for manual transfers."
+          bind:value={config.MaxActivePremiumizeTransfers}
         />
         <TextInput
           type="number"
