@@ -184,19 +184,36 @@ checks; never downloads or installs toolchains (verification exports
   `toolchain go1.24.2` is never edited to make this pass).
 - Node major == 22; npm present.
 - C compiler resolvable (`cc`/`gcc`/`clang`) — required for `go test -race`.
+- `curl` present — required for the web dev-server smoke check.
 
 **Mandatory checks, in order (any failure fails the gate):**
 
-1. gofmt clean over tracked Go files:
-   `git ls-files -z '*.go' | xargs -0 gofmt -l` → must be empty (offenders
-   listed).
+1. gofmt clean (incl. `-s` simplifications) over tracked Go files:
+   `git ls-files -z '*.go' | xargs -0 -r gofmt -s -l` → must be empty
+   (offenders listed).
 2. `go vet ./...` clean.
-3. Production-style build:
+3. `go mod verify` clean (module checksums match `go.sum`; supply-chain
+   tamper check).
+4. `go mod tidy -diff` clean (`go.mod`/`go.sum` in sync with real imports;
+   `go.mod` is never modified by the gate).
+5. Production-style build:
    `CGO_ENABLED=0 go build -tags 'netgo osusergo' -ldflags '-extldflags
    "-static"' ./cmd/premiumizearrd` → temp dir.
-4. `go test -race ./...` clean.
-5. `cd web && npm ci` (locked dependency graph).
-6. `cd web && npm run build` (production webpack build).
+6. Release cross-compile check for `linux/arm64` (a goreleaser release
+   target; pure type-check build, no CGO). Windows targets are excluded for
+   now (known broken build; tracked separately).
+7. `go test -race ./...` clean.
+8. Config file validation via `go run ./scripts/configlint` (uses only
+   existing `go.mod` dependencies): all `.github/workflows/*.yml`,
+   `config.yaml`, `renovate.json` must parse as YAML/JSON.
+9. `cd web && npm ci` (locked dependency graph).
+10. `cd web && npm audit --omit=dev --audit-level=high` clean (no
+    high/critical CVEs in runtime dependencies).
+11. `cd web && npm run build` (production webpack build).
+12. Web dev-server smoke: `npm run dev` is started on its own session, the
+    gate fetches `http://127.0.0.1:8080/bundle.js` via `curl` within 30s, and
+    the dev-server process tree is terminated afterwards (catches a broken
+    dev workflow that the production build does not exercise).
 
 ## Known risks & limitations (verified, not yet fixed)
 
