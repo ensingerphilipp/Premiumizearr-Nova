@@ -175,13 +175,12 @@ func (pm *Premiumizeme) ListFolder(folderID string) ([]Item, error) {
 	q.Set("id", folderID)
 	url.RawQuery = q.Encode()
 
-	client := &http.Client{}
 	request, err := http.NewRequest("GET", url.String(), nil)
 	if err != nil {
 		return ret, err
 	}
 
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return ret, pm.redactRequestError(err)
 	}
@@ -220,7 +219,7 @@ func (pm *Premiumizeme) GetFolders() ([]Item, error) {
 	var ret []Item
 	req, _ := http.NewRequest("GET", url.String(), nil)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := pm.httpClient().Do(req)
 	if err != nil {
 		return ret, pm.redactRequestError(err)
 	}
@@ -320,13 +319,12 @@ func (pm *Premiumizeme) DeleteFolder(folderID string) error {
 	q.Set("id", folderID)
 	url.RawQuery = q.Encode()
 
-	client := &http.Client{}
 	request, err := http.NewRequest("DELETE", url.String(), nil)
 	if err != nil {
 		return err
 	}
 
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return pm.redactRequestError(err)
 	}
@@ -368,13 +366,12 @@ func (pm *Premiumizeme) MoveItem(itemID string, folderID string) error {
 	q.Set("id", folderID)
 	url.RawQuery = q.Encode()
 
-	client := &http.Client{}
 	request, err := http.NewRequest("POST", url.String(), nil)
 	if err != nil {
 		return err
 	}
 
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return pm.redactRequestError(err)
 	}
@@ -418,13 +415,12 @@ func (pm *Premiumizeme) CreateFolder(folderName string, parentID *string) (strin
 	}
 	url.RawQuery = q.Encode()
 
-	client := &http.Client{}
 	request, err := http.NewRequest("POST", url.String(), nil)
 	if err != nil {
 		return "", err
 	}
 
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return "", pm.redactRequestError(err)
 	}
@@ -685,8 +681,7 @@ func (pm *Premiumizeme) generateZip(ID string, srcType SRCType) (string, error) 
 	request.Header.Add("Content-Length", strconv.Itoa(len(data.Encode())))
 
 	//Fire request
-	client := &http.Client{}
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return "", pm.redactRequestError(err)
 	}
@@ -732,13 +727,12 @@ func (pm *Premiumizeme) GenerateFileLink(ID string) (string, error) {
 	q.Set("id", ID)
 	url.RawQuery = q.Encode()
 
-	client := &http.Client{}
 	request, err := http.NewRequest("GET", url.String(), nil)
 	if err != nil {
 		return "", err
 	}
 
-	resp, err := client.Do(request)
+	resp, err := pm.httpClient().Do(request)
 	if err != nil {
 		return "", pm.redactRequestError(err)
 	}

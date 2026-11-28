@@ -33,6 +33,7 @@ func (s *WebServerService) TransfersHandler(w http.ResponseWriter, r *http.Reque
 type BlackholeFile struct {
 	ID   int    `json:"id"`
 	Name string `json:"name"`
+	Arr  string `json:"arr"`
 }
 type BlackholeResponse struct {
 	BlackholeFiles []BlackholeFile `json:"data"`
@@ -100,14 +101,43 @@ func (s *WebServerService) BlackholeHandler(w http.ResponseWriter, r *http.Reque
 	if s.directoryWatcherService == nil || s.directoryWatcherService.Queue == nil {
 		resp.Status = "Not Initialized"
 	} else {
+		// The config swap lock read: the web save goroutine replaces the
+		// whole config struct in place, and the Arr classification must
+		// derive from one consistent config state (BlackholeDirectory,
+		// EnableArrSubfolders, Arrs) read under the same mutex's read lock
+		// as the swap.
+		blackholeDir := ""
+		enabled := false
+		var arrs []config.ArrConfig
+		if s.config != nil {
+			if mu := config.UpdateMu(); mu != nil {
+				mu.RLock()
+				blackholeDir = s.config.BlackholeDirectory
+				enabled = s.config.EnableArrSubfolders
+				arrs = append([]config.ArrConfig(nil), s.config.Arrs...)
+				mu.RUnlock()
+			} else {
+				blackholeDir = s.config.BlackholeDirectory
+				enabled = s.config.EnableArrSubfolders
+				arrs = append([]config.ArrConfig(nil), s.config.Arrs...)
+			}
+		}
 		for i, n := range s.directoryWatcherService.Queue.GetQueue() {
 			// Queue keys are OS-native (filepath.Join on Windows yields
 			// backslashes); normalize before the slash-only Base so the
 			// UI shows the file name on every platform (review finding R1-9).
 			name := path.Base(strings.ReplaceAll(n, "\\", "/"))
+			// The Arr is derived with the same shared classification the
+			// upload routing uses: only a file directly inside a currently
+			// configured Arr subfolder under the current blackhole root
+			// reports an Arr. Root files, feature-off files, arbitrary
+			// subfolders, nested files, and leftovers of a previous
+			// blackhole location report an empty Arr (finding S-23).
+			arr := configuredBlackholeSlug(n, blackholeDir, enabled, arrs)
 			resp.BlackholeFiles = append(resp.BlackholeFiles, BlackholeFile{
 				ID:   i,
 				Name: name,
+				Arr:  arr,
 			})
 		}
 
