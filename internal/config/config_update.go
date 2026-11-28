@@ -185,6 +185,13 @@ func WaitReconfigIdle() {
 //
 // The returned error is a config persistence failure; the in-memory swap
 // is kept because the new state is valid and already committed.
+// updateApplyMu serializes concurrent UpdateConfig calls: each call
+// persists its candidate before publishing it, and serialization keeps the
+// disk write order equal to the publish order (without it, two saves
+// could interleave so the newest state ends up on disk while a stale one
+// is swapped into memory, or vice versa).
+var updateApplyMu sync.Mutex
+
 func (c *Config) UpdateConfig(_newConfig Config) error {
 	// An update body that omits Arrs decodes as a nil slice, which the API
 	// would then serve back as "Arrs": null; normalize to an empty slice so
@@ -200,38 +207,43 @@ func (c *Config) UpdateConfig(_newConfig Config) error {
 	// rewrite too).
 	mu := UpdateMu()
 
-	var oldConfig Config
-	if mu != nil {
-		mu.Lock()
-		// The private fields are carried over while the swap lock is held:
-		// they are read from the live struct, and an unlocked read would
-		// race a concurrent swap.
-		_newConfig.appCallback = c.appCallback
-		_newConfig.altConfigLocation = c.altConfigLocation
-		oldConfig = *c
-		*c = _newConfig
-		mu.Unlock()
-	} else {
-		_newConfig.appCallback = c.appCallback
-		_newConfig.altConfigLocation = c.altConfigLocation
-		oldConfig = *c
-		*c = _newConfig
-	}
+	updateApplyMu.Lock()
+	defer updateApplyMu.Unlock()
 
-	// Persist under the same read lock: Save marshals every field of *c,
-	// and a concurrent swap must not interleave with the field-wise read or
-	// a mixed config.yaml (new value for one field, old for another) is
-	// written to disk. The persistence error is returned to the caller so
-	// the web endpoint can report the failed save instead of claiming
-	// success (finding C-4f); the in-memory swap is kept - the new state
-	// is valid and already committed.
+	// Snapshot the old state and build the candidate WITHOUT publishing
+	// it: the private fields are read under the swap lock, and an unlocked
+	// read would race a concurrent swap.
+	var oldConfig Config
+	candidate := _newConfig
 	if mu != nil {
 		mu.RLock()
-		defer mu.RUnlock()
+		candidate.appCallback = c.appCallback
+		candidate.altConfigLocation = c.altConfigLocation
+		oldConfig = *c
+		mu.RUnlock()
+	} else {
+		candidate.appCallback = c.appCallback
+		candidate.altConfigLocation = c.altConfigLocation
+		oldConfig = *c
 	}
-	if err := c.Save(); err != nil {
+
+	// Persist the candidate BEFORE publishing it to readers and notifying
+	// the services. On a failed save nothing is swapped and no
+	// reconfiguration is queued, so the API and the services stay on the
+	// same (previous) state instead of diverging: a published-but-unsaved
+	// swap would leave the web API serving a new path that the watcher and
+	// the transfer manager were never reconfigured for.
+	if err := c.persist(candidate); err != nil {
 		log.Errorf("Failed to save config: %v", err)
 		return err
+	}
+
+	if mu != nil {
+		mu.Lock()
+		*c = candidate
+		mu.Unlock()
+	} else {
+		*c = candidate
 	}
 
 	// Reconfiguration is asynchronous: service callbacks (watcher path

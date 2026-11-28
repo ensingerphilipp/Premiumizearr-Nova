@@ -70,8 +70,16 @@ func LoadOrCreateConfig(altConfigLocation string, _appCallback AppCallback) (Con
 
 // Save - Saves the config to disk
 func (c *Config) Save() error {
+	return c.persist(*c)
+}
+
+// persist marshals cfg - not necessarily the live *c state - and writes it
+// to this config's file location. The file path comes from the live struct
+// (altConfigLocation); the content comes from the caller's candidate, so a
+// pending update can be persisted before it is published to readers.
+func (c *Config) persist(cfg Config) error {
 	log.Trace("Marshaling & saving config")
-	data, err := yaml.Marshal(*c)
+	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		log.Error(err)
 		return err

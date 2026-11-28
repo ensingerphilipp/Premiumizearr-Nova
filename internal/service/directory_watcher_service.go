@@ -229,10 +229,10 @@ func (dw *DirectoryWatcherService) Start() {
 				time.Sleep(time.Duration(interval) * time.Minute)
 				directory := dw.getBlackholeDirectory()
 				log.Infof("Running directory scan of %s", directory)
-				// The root scan alone covers the Arr subfolders: checkFile
-				// fans a scan out into each configured subfolder it meets,
-				// so a separate per-subfolder scan pass here would just
-				// re-scan the same directories (finding S-2).
+				// The root scan alone covers the Arr subfolders: it scans
+				// each configured subfolder's direct files synchronously, so
+				// a separate per-subfolder scan pass here would just re-scan
+				// the same directories (finding S-2).
 				dw.scanDirectory(directory)
 				log.Infof("Scan complete, next scan in %d minutes", interval)
 			}
@@ -466,7 +466,16 @@ func (dw *DirectoryWatcherService) ScanNow() (int, error) {
 func (dw *DirectoryWatcherService) getBlackholeDirectory() string {
 	dw.mu.RLock()
 	defer dw.mu.RUnlock()
-	return dw.blackholeDirectory
+	if dw.blackholeDirectory != "" {
+		return dw.blackholeDirectory
+	}
+	// Pre-Init callers (tests construct the service without Init) still
+	// get the live config value; Init and the config callback keep the
+	// cache authoritative afterwards.
+	if dw.config != nil {
+		return dw.config.BlackholeDirectory
+	}
+	return ""
 }
 
 func (dw *DirectoryWatcherService) scanDirectory(p string) {
@@ -482,9 +491,57 @@ func (dw *DirectoryWatcherService) directoryScan(p string) (int, error) {
 		return 0, fmt.Errorf("error scanning blackhole directory: %w", err)
 	}
 
+	// A directory is an Arr drop zone only when it is a DIRECT child of the
+	// blackhole root; deeper directories are never recursed into.
+	blackholeRoot := filepath.Clean(dw.getBlackholeDirectory())
+	atRoot := filepath.Clean(p) == blackholeRoot
+
 	queued := 0
 	for _, file := range files {
 		filePath := filepath.Join(p, file.Name())
+		if file.IsDir() {
+			if atRoot && dw.isConfiguredArrSlug(file.Name()) {
+				dw.watchArrFolder(filePath)
+				// Synchronous and counted: a manual scan (ScanNow / the
+				// poll endpoint) must report the subfolder's files in its
+				// queue count, not only the root files.
+				sub, err := dw.scanSlugDir(filePath)
+				if err != nil {
+					log.Error(err)
+				}
+				queued += sub
+			} else {
+				log.Errorf("Directory created in blackhole %s ignoring (Warning premiumizearrd does not look in subfolders!)", filePath)
+			}
+			continue
+		}
+		if dw.checkFile(filePath) == 1 && dw.queueFile(filePath) {
+			queued++
+		}
+	}
+
+	return queued, nil
+}
+
+// scanSlugDir scans the DIRECT children of one configured Arr drop-zone
+// subfolder and returns how many of them were queued. Subdirectories are
+// never recursed into, regardless of their name: the drop-zone contract
+// is exactly one level (a nested directory named like another slug is not
+// itself a drop zone and its files must not be queued), matching the
+// documented blackhole limitation for everything below the drop zone.
+func (dw *DirectoryWatcherService) scanSlugDir(dir string) (int, error) {
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return 0, fmt.Errorf("error scanning Arr subfolder %s: %w", dir, err)
+	}
+
+	queued := 0
+	for _, file := range files {
+		if file.IsDir() {
+			log.Errorf("Directory in Arr subfolder %s ignoring (per-Arr subfolders do not look in subfolders)", filepath.Join(dir, file.Name()))
+			continue
+		}
+		filePath := filepath.Join(dir, file.Name())
 		if dw.checkFile(filePath) == 1 && dw.queueFile(filePath) {
 			queued++
 		}
@@ -503,7 +560,10 @@ func (dw *DirectoryWatcherService) checkFile(path string) int {
 	}
 
 	if fi.IsDir() {
-		if dw.isConfiguredArrSlug(filepath.Base(path)) {
+		// A directory event is an Arr drop zone only when the directory is
+		// a DIRECT child of the current blackhole root: deeper directories
+		// (e.g. a nested dir named like another slug) are not drop zones.
+		if filepath.Dir(filepath.Clean(path)) == filepath.Clean(dw.getBlackholeDirectory()) && dw.isConfiguredArrSlug(filepath.Base(path)) {
 			log.Tracef("Directory %s is a configured Arr subfolder, handled separately", path)
 			// (Re)establish the subfolder's own watch - fsnotify re-Add of an
 			// already-watched path is idempotent - and rescan it, so a
@@ -511,7 +571,11 @@ func (dw *DirectoryWatcherService) checkFile(path string) int {
 			// delete+recreate, failed AddWatchPath) self-heals in watch mode
 			// and files that landed while it was down get queued.
 			dw.watchArrFolder(path)
-			go dw.directoryScan(path)
+			go func() {
+				if _, err := dw.scanSlugDir(path); err != nil {
+					log.Error(err)
+				}
+			}()
 			return 0
 		}
 		log.Errorf("Directory created in blackhole %s ignoring (Warning premiumizearrd does not look in subfolders!)", path)
@@ -620,25 +684,23 @@ func configuredBlackholeSlug(filePath, blackholeDir string, enabled bool, arrs [
 	}
 	dir := filepath.Clean(filepath.Dir(filePath))
 	cleanBlackhole := filepath.Clean(blackholeDir)
-	if dir == cleanBlackhole {
+	// Direct-child test via filepath.Rel, not a separator-prefix check:
+	// with a blackhole at a filesystem root ("/") a prefix check would
+	// build "//" and never match its own children, misrouting direct Arr
+	// files to the main destination. Rel also covers the working-directory
+	// case ("." -> bare child names) without a special case. rel is exactly
+	// one level below the blackhole when it contains no separator; ".."
+	// prefixes escape the blackhole and are outside it.
+	rel, err := filepath.Rel(cleanBlackhole, dir)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return ""
 	}
-	// The parent directory must be directly inside the current blackhole.
-	// A blackhole set to the working directory has direct children that are
-	// bare directory names (no separator).
-	inside := strings.HasPrefix(dir, cleanBlackhole+string(filepath.Separator))
-	if cleanBlackhole == "." {
-		inside = !strings.ContainsRune(dir, filepath.Separator)
-	}
-	if !inside {
+	if strings.ContainsRune(rel, filepath.Separator) {
+		// Deeper than one level: a nested directory is not an Arr
+		// subfolder even when its own name matches a configured slug.
 		return ""
 	}
-	// Exactly one level below the root: a nested directory is not an Arr
-	// subfolder even when its own name matches a configured slug.
-	if filepath.Dir(dir) != cleanBlackhole {
-		return ""
-	}
-	slug := filepath.Base(dir)
+	slug := rel
 	for _, arr := range arrs {
 		if arr.Name == slug {
 			return slug

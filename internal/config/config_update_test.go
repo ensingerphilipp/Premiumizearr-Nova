@@ -6,6 +6,7 @@ import (
 	"path"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -244,12 +245,18 @@ func TestUpdateConfigReconfigurationIsSerializedLatestState(t *testing.T) {
 }
 
 // TestUpdateConfigSaveFailurePropagates is the regression test for finding
-// C-4 (f): a config save failure is returned to the caller (the web
-// endpoint reports it) instead of claiming success; the in-memory swap is
-// kept because the new state is valid and already committed.
+// C-4 (f) and the failed-save consistency blocker: a config save failure
+// is returned to the caller (the web endpoint reports it) instead of
+// claiming success, AND the candidate is not published - the live config
+// and the persisted file both stay on the previous state and no service
+// reconfiguration is queued, so the API and the services cannot diverge
+// onto different states.
 func TestUpdateConfigSaveFailurePropagates(t *testing.T) {
+	var reconfigs int32
 	loc := t.TempDir()
-	cfg, err := LoadOrCreateConfig(loc, func(oldConfig, newConfig Config) {})
+	cfg, err := LoadOrCreateConfig(loc, func(oldConfig, newConfig Config) {
+		atomic.AddInt32(&reconfigs, 1)
+	})
 	if err != nil {
 		t.Fatalf("LoadOrCreateConfig: %v", err)
 	}
@@ -269,9 +276,11 @@ func TestUpdateConfigSaveFailurePropagates(t *testing.T) {
 	if err == nil {
 		t.Fatal("UpdateConfig returned nil error for an unwritable save location")
 	}
-	// The in-memory swap is kept: the new state is valid and committed.
-	if cfg.BlackholeDirectory != "blackhole-after" {
-		t.Fatalf("in-memory BlackholeDirectory = %q, want blackhole-after", cfg.BlackholeDirectory)
+	// The candidate is not published: the live config keeps the previous
+	// state (a published-but-unsaved swap would leave the API serving a
+	// new state the services were never reconfigured for).
+	if cfg.BlackholeDirectory != "blackhole-before" {
+		t.Fatalf("in-memory BlackholeDirectory = %q, want blackhole-before (failed save must not publish the candidate)", cfg.BlackholeDirectory)
 	}
 	// The previous file was not overwritten by the failed save.
 	data, err := os.ReadFile(path.Join(loc, "config.yaml"))
@@ -285,7 +294,26 @@ func TestUpdateConfigSaveFailurePropagates(t *testing.T) {
 	if persisted.BlackholeDirectory != "blackhole-before" {
 		t.Fatalf("failed save still wrote the new value: BlackholeDirectory=%q", persisted.BlackholeDirectory)
 	}
+	// No reconfiguration was queued for the failed update: the services
+	// were not notified of a state that was never published.
 	WaitReconfigIdle()
+	if got := atomic.LoadInt32(&reconfigs); got != 0 {
+		t.Fatalf("service reconfigurations after a failed save = %d, want 0", got)
+	}
+
+	// A successful save after the failure publishes the candidate and
+	// notifies the services exactly once.
+	cfg.altConfigLocation = loc
+	if err := (&cfg).UpdateConfig(newCfg); err != nil {
+		t.Fatalf("UpdateConfig after restoring the save location: %v", err)
+	}
+	WaitReconfigIdle()
+	if cfg.BlackholeDirectory != "blackhole-after" {
+		t.Fatalf("in-memory BlackholeDirectory = %q, want blackhole-after after a successful save", cfg.BlackholeDirectory)
+	}
+	if got := atomic.LoadInt32(&reconfigs); got != 1 {
+		t.Fatalf("service reconfigurations after a successful save = %d, want 1", got)
+	}
 }
 
 // TestLoadOrCreateConfigRejectsEmptyBlackholeWithFeatureOn is the
